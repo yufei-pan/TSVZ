@@ -10,9 +10,49 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.57'
+version = '2.62'
+
+
+def pretty_format_table(data):
+	if not data:
+		return
+	if type(data) == str:
+		data = data.strip('\n').split('\n')
+	elif type(data) != list:
+		data = list(data)
+	num_cols = len(data[0])
+	col_widths = [0] * num_cols
+	# Calculate the maximum width of each column
+	for c in range(num_cols):
+		col_items = [str(row[c]) for row in data]
+		col_widths[c] = max(len(item) for item in col_items)
+	# Build the row format string
+	row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
+	# Print the header
+	header = data[0]
+	outTable = []
+	outTable.append(row_format.format(*header))
+	outTable.append('-+-'.join('-' * width for width in col_widths))
+	for row in data[1:]:
+		outTable.append(row_format.format(*row))
+	return '\n'.join(outTable) + '\n'
 
 def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True):
+    """
+    Process a line of text and update the task dictionary.
+
+    Parameters:
+    line (str): The line of text to process.
+    taskDic (dict): The dictionary to update with the processed line.
+    correctColumnNum (int): The expected number of columns in the line.
+    verbose (bool, optional): Whether to print verbose output. Defaults to False.
+    teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
+    strict (bool, optional): Whether to strictly enforce the correct number of columns. Defaults to True.
+
+    Returns:
+    tuple: A tuple containing the updated correctColumnNum and the processed lineCache.
+
+    """
     line = line.decode().strip(' ').strip('\x00')
     # we throw away the lines that start with '#'
     if not line :
@@ -123,14 +163,79 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
     # Return empty list if no valid line found
     return last_valid_line
 
+def formatHeader(header,verbose = False,teeLogger = None):
+    """
+    Format the header string.
+
+    Parameters:
+    - header (str or list): The header string or list to format.
+    - verbose (bool, optional): Whether to print verbose output. Defaults to False.
+    - teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
+
+    Returns:
+        str: The formatted header string.
+    """
+    if type(header) != str:
+        try:
+            header = '\t'.join(header)
+        except:
+            if verbose:
+                __teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
+            header = ''
+    header = header.strip()
+    if header:
+        if not header.endswith('\n'):
+            header += '\n'
+    else:
+        header = ''
+    return header
+
+def __teePrintOrNot(message,level = 'info',teeLogger = None):
+    """
+    Prints the given message or logs it using the provided teeLogger.
+
+    Parameters:
+        message (str): The message to be printed or logged.
+        level (str, optional): The log level. Defaults to 'info'.
+        teeLogger (object, optional): The logger object used for logging. Defaults to None.
+
+    Returns:
+        None
+    """
+    try:
+        if teeLogger:
+            teeLogger.teelog(message,level)
+        else:
+            print(message)
+    except Exception as e:
+        print(message)
 
 def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True):
-    if taskDic is None:
-        taskDic = OrderedDict()
+    """
+    Read a TSV (Tab-Separated Values) file and return the data as a dictionary.
 
-    header = header.strip() if type(header) == str else '\t'.join(header)
-    if not header.endswith('\n'):
-        header += '\n'
+    Parameters:
+    - fileName (str): The path to the TSV file.
+    - teeLogger (Logger, optional): The logger object to log messages. Defaults to None.
+    - header (str or list, optional): The header of the TSV file. If a string, it should be a tab-separated list of column names. If a list, it should contain the column names. Defaults to ''.
+    - createIfNotExist (bool, optional): Whether to create the file if it doesn't exist. Defaults to False.
+    - lastLineOnly (bool, optional): Whether to read only the last valid line of the file. Defaults to False.
+    - verifyHeader (bool, optional): Whether to verify the header of the file. Defaults to True.
+    - verbose (bool, optional): Whether to print verbose output. Defaults to False.
+    - taskDic (OrderedDict, optional): The dictionary to store the data. Defaults to an empty OrderedDict.
+    - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
+    - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
+
+    Returns:
+    - OrderedDict: The dictionary containing the data from the TSV file.
+
+    Raises:
+    - Exception: If the file is not found or there is a data format error.
+
+    """
+    if taskDic is None:
+        taskDic = {}
+    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
     if not os.path.isfile(fileName):
         if createIfNotExist:
             with open(fileName, mode ='w',encoding=encoding)as file:
@@ -150,7 +255,8 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
                 #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
                 if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
                     __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
-                    raise Exception("Data format error! Header mismatch")
+                    if strict:
+                        raise Exception("Data format error! Header mismatch")
             correctColumnNum = len(header.strip().split('\t'))
             if verbose:
                 __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -165,21 +271,24 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
             correctColumnNum, lineCache = processLine(line,taskDic,correctColumnNum,verbose = verbose,teeLogger = teeLogger,strict = strict)
     return taskDic
 
-
-
-def __teePrintOrNot(message,level = 'info',teeLogger = None):
-    try:
-        if teeLogger:
-            teeLogger.teelog(message,level)
-        else:
-            print(message)
-    except Exception as e:
-        print(message)
-
-
-def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8'):
-    if not header.endswith('\n'):
-        header += '\n'
+def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True):
+    """
+    Append a line of data to a TSV file.
+    Parameters:
+    - fileName (str): The path of the TSV file.
+    - lineToAppend (str or list): The line of data to append. If it is a string, it will be split by tabs ('\t') to form a list.
+    - teeLogger (optional): A logger object for logging messages.
+    - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
+    - createIfNotExist (bool, optional): If True, the file will be created if it does not exist. If False and the file does not exist, an exception will be raised.
+    - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
+    - verbose (bool, optional): If True, additional information will be printed during the execution.
+    - encoding (str, optional): The encoding of the file.
+    - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+    Raises:
+    - Exception: If the file does not exist and createIfNotExist is False.
+    - Exception: If the existing header does not match the provided header.
+    """
+    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
     if not os.path.isfile(fileName):
         if createIfNotExist:
             with open(fileName, mode ='w',encoding=encoding)as file:
@@ -203,7 +312,8 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
                 #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
                 if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
                     __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
-                    raise Exception("Data format error! Header mismatch")
+                    if strict:
+                        raise Exception("Data format error! Header mismatch")
             correctColumnNum = len(header.strip().split('\t'))
             if verbose:
                 __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -222,7 +332,38 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
         if verbose:
             __teePrintOrNot(f"Appended {lineToAppend} to {fileName}",teeLogger=teeLogger)
 
-
+def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8'):
+    """
+    Clear the contents of a TSV file. Will create if not exist.
+    Parameters:
+    - fileName (str): The path of the TSV file.
+    - teeLogger (optional): A logger object for logging messages.
+    - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
+    - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
+    - verbose (bool, optional): If True, additional information will be printed during the execution.
+    - encoding (str, optional): The encoding of the file.
+    """
+    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
+    if not os.path.isfile(fileName):
+        with open(fileName, mode ='w',encoding=encoding)as file:
+            file.write(header)
+    else:
+        with open(fileName, mode ='r+',encoding=encoding)as file:
+            if header.strip() and verifyHeader:
+                line = file.readline().strip()
+                if verbose:
+                    __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
+                    __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
+                #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
+                if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
+                    __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
+                    raise Exception("Data format error! Header mismatch")
+                # if the header is correct, only keep the header
+                file.truncate()
+            else:
+                file.write(header)
+    if verbose:
+        __teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
 
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class TSVZed(OrderedDict):
@@ -240,7 +381,7 @@ class TSVZed(OrderedDict):
         self.version = version
         self._fileName = fileName
         self.teeLogger = teeLogger
-        self.header = header.strip() if type(header) == str else '\t'.join(header)
+        self.header = formatHeader(header,verbose = verbose,teeLogger = self.teeLogger)
         self.correctColumnNum = -1
         self.createIfNotExist = createIfNotExist
         self.verifyHeader = verifyHeader
@@ -610,3 +751,42 @@ memoryOnly:{self.memoryOnly}
             raise e  # Re-raise the exception for external handling
         finally:
             self.writeLock.release()  # Ensure the thread lock is always released
+
+
+def __main__():
+    import argparse
+    parser = argparse.ArgumentParser(description='TSVZed: A TSV file manager')
+    parser.add_argument('filename', type=str, help='The TSV file to read')
+    parser.add_argument('operation', type=str,nargs='?', choices=['read','append','delete','clear'], help='The operation to perform. Default: read', default='read')
+    parser.add_argument('line', type=str, nargs='*', help='The line to append to the TSV file. it follows as : \{key\} \{value1\} \{value2\} ... if a key without value be inserted, the value will get deleted.')
+    parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the TSV file. seperate using \\t')
+    parser.add_argument('-f', '--force', action='store_true', help='Force the operation. Ignore checks for column numbers / headers')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
+    parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version} by {author}')
+    args = parser.parse_args()
+
+    header = args.header.replace('\\t','\t') if args.header else ''
+
+    if args.operation == 'read':
+        # check if the file exist
+        if not os.path.isfile(args.filename):
+            print(f"File not found: {args.filename}")
+            return
+        # read the file
+        data = readTSV(args.filename, verifyHeader = False, verbose=args.verbose,strict= not args.force)
+        print(pretty_format_table(data.values()))
+    elif args.operation == 'append':
+        appendTSV(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force)
+    elif args.operation == 'delete':
+        appendTSV(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force)
+    elif args.operation == 'clear':
+        clearTSV(args.filename, header=header, verbose=args.verbose, verifyHeader=not args.force)
+    else:
+        print("Invalid operation")
+        return
+    
+if __name__ == '__main__':
+    __main__()
+
+
+    
