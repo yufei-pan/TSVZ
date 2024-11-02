@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os
+import os , sys
 from collections import OrderedDict , deque
 import time
 import atexit
@@ -10,7 +10,8 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.62'
+version = '2.65'
+author = 'pan@zopyr.us'
 
 
 def pretty_format_table(data):
@@ -36,6 +37,26 @@ def pretty_format_table(data):
 	for row in data[1:]:
 		outTable.append(row_format.format(*row))
 	return '\n'.join(outTable) + '\n'
+
+def __teePrintOrNot(message,level = 'info',teeLogger = None):
+    """
+    Prints the given message or logs it using the provided teeLogger.
+
+    Parameters:
+        message (str): The message to be printed or logged.
+        level (str, optional): The log level. Defaults to 'info'.
+        teeLogger (object, optional): The logger object used for logging. Defaults to None.
+
+    Returns:
+        None
+    """
+    try:
+        if teeLogger:
+            teeLogger.teelog(message,level)
+        else:
+            print(message,flush=True)
+    except Exception as e:
+        print(message,flush=True)
 
 def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True):
     """
@@ -183,32 +204,66 @@ def formatHeader(header,verbose = False,teeLogger = None):
                 __teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
             header = ''
     header = header.strip()
-    if header:
-        if not header.endswith('\n'):
-            header += '\n'
-    else:
-        header = ''
+    # if header:
+    #     if not header.endswith('\n'):
+    #         header += '\n'
+    # else:
+    #     header = ''
     return header
 
-def __teePrintOrNot(message,level = 'info',teeLogger = None):
+def lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False):
     """
-    Prints the given message or logs it using the provided teeLogger.
+    Verify if a line contains the header.
 
     Parameters:
-        message (str): The message to be printed or logged.
-        level (str, optional): The log level. Defaults to 'info'.
-        teeLogger (object, optional): The logger object used for logging. Defaults to None.
+    - header (str): The header string to verify.
+    - line (str): The line to verify against the header.
+    - verbose (bool, optional): Whether to print verbose output. Defaults to False.
+    - teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
+    - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to False.
 
     Returns:
-        None
+    bool: True if the header matches the line, False otherwise.
     """
-    try:
-        if teeLogger:
-            teeLogger.teelog(message,level)
+    if verbose:
+        __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
+        __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
+    if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
+        __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
+        if strict:
+            raise Exception("Data format error! Header mismatch")
+        return False
+    return True
+
+def verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = None,header = '',encoding = 'utf8',strict = True):
+    """
+    Verify the existence of a TSV file.
+
+    Parameters:
+    - fileName (str): The path of the TSV file.
+    - createIfNotExist (bool, optional): Whether to create the file if it doesn't exist. Defaults to True.
+    - teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
+    - header (str, optional): The header line to verify against. Defaults to ''.
+    - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
+    - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
+
+    Returns:
+    bool: True if the file exists, False otherwise.
+    """
+    if not fileName.endswith('.tsv'):
+        __teePrintOrNot(f'Warning: Filename {fileName} does not end with .tsv','warning',teeLogger=teeLogger)
+    if not os.path.isfile(fileName):
+        if createIfNotExist:
+            with open(fileName, mode ='w',encoding=encoding)as file:
+                file.write(header+'\n')
+            __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
+            return True
+        elif strict:
+            __teePrintOrNot('File not found','error',teeLogger=teeLogger)
+            raise Exception("File not found")
         else:
-            print(message)
-    except Exception as e:
-        print(message)
+            return False
+    return True
 
 def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True):
     """
@@ -236,32 +291,17 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     if taskDic is None:
         taskDic = {}
     header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not os.path.isfile(fileName):
-        if createIfNotExist:
-            with open(fileName, mode ='w',encoding=encoding)as file:
-                file.write(header)
-            __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
-            verifyHeader = True
-        else:
-            __teePrintOrNot('File not found','error',teeLogger=teeLogger)
-            raise Exception("File not found")
+    if not verifyTSVExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict):
+        return taskDic
     with open(fileName, mode ='rb')as file:
+        correctColumnNum = -1
         if header.strip():
             if verifyHeader:
                 line = file.readline().decode().strip()
-                if verbose:
-                    __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
-                    __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
-                #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
-                if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
-                    __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
-                    if strict:
-                        raise Exception("Data format error! Header mismatch")
-            correctColumnNum = len(header.strip().split('\t'))
-            if verbose:
-                __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-        else:
-            correctColumnNum = -1
+                if lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                    correctColumnNum = len(header.strip().split('\t'))
+                    if verbose:
+                        __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         if lastLineOnly:
             lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict)
             if lineCache:
@@ -289,36 +329,20 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
     - Exception: If the existing header does not match the provided header.
     """
     header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not os.path.isfile(fileName):
-        if createIfNotExist:
-            with open(fileName, mode ='w',encoding=encoding)as file:
-                file.write(header)
-            __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
-            verifyHeader = True
-        else:
-            __teePrintOrNot('File not found','error',teeLogger=teeLogger)
-            raise Exception("File not found")
-    
+    if not verifyTSVExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict):
+        return
     if type(lineToAppend) == str:
         lineToAppend = lineToAppend.strip().split('\t')
     
     with open(fileName, mode ='r+b')as file:
+        correctColumnNum = len(lineToAppend)
         if header.strip():
             if verifyHeader:
                 line = file.readline().decode().strip()
-                if verbose:
-                    __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
-                    __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
-                #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
-                if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
-                    __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
-                    if strict:
-                        raise Exception("Data format error! Header mismatch")
-            correctColumnNum = len(header.strip().split('\t'))
-            if verbose:
-                __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-        else:
-            correctColumnNum = len(lineToAppend)
+                if lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                    correctColumnNum = len(header.strip().split('\t'))
+                    if verbose:
+                        __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         # truncate / fill the lineToAppend to the correct number of columns
         if len(lineToAppend) < correctColumnNum:
             lineToAppend += ['']*(correctColumnNum-len(lineToAppend))
@@ -332,7 +356,7 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
         if verbose:
             __teePrintOrNot(f"Appended {lineToAppend} to {fileName}",teeLogger=teeLogger)
 
-def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8'):
+def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False):
     """
     Clear the contents of a TSV file. Will create if not exist.
     Parameters:
@@ -342,28 +366,29 @@ def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose 
     - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
     - verbose (bool, optional): If True, additional information will be printed during the execution.
     - encoding (str, optional): The encoding of the file.
+    - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
     """
     header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not os.path.isfile(fileName):
-        with open(fileName, mode ='w',encoding=encoding)as file:
-            file.write(header)
+    if not verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False):
+        raise Exception("Something catastrophic happened! File still not found after creation")
     else:
         with open(fileName, mode ='r+',encoding=encoding)as file:
             if header.strip() and verifyHeader:
                 line = file.readline().strip()
-                if verbose:
-                    __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
-                    __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
-                #assert line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')), "Data format error!"
-                if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
-                    __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
-                    raise Exception("Data format error! Header mismatch")
-                # if the header is correct, only keep the header
+                if not lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                    __teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
                 file.truncate()
             else:
-                file.write(header)
+                file.write(header+'\n')
     if verbose:
         __teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
+
+def getFileUpdateTimeNs(fileName):
+    try:
+        return os.stat(fileName).st_mtime_ns
+    except:
+        __teePrintOrNot(f"Failed to get file update time for {fileName}",'error')
+        return time.time_ns()
 
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class TSVZed(OrderedDict):
@@ -372,13 +397,15 @@ class TSVZed(OrderedDict):
             if self.teeLogger:
                 self.teeLogger.teelog(message,level)
             else:
-                print(message)
+                print(message,flush=True)
         except Exception as e:
-            print(message)
+            print(message,flush=True)
 
     def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = None):
         super().__init__()
         self.version = version
+        self.externalFileUpdateTime = getFileUpdateTimeNs(fileName)
+        self.lastUpdateTime = self.externalFileUpdateTime
         self._fileName = fileName
         self.teeLogger = teeLogger
         self.header = formatHeader(header,verbose = verbose,teeLogger = self.teeLogger)
@@ -389,6 +416,8 @@ class TSVZed(OrderedDict):
         self.rewrite_on_exit = rewrite_on_exit
         self.rewrite_interval = rewrite_interval
         self.monitor_external_changes = monitor_external_changes
+        if not monitor_external_changes:
+            self.__teePrintOrNot(f"Warning: External changes monitoring disabled for {self._fileName}. Will overwrite external changes.",'warning')
         self.verbose = verbose
         if append_check_delay < 0:
             append_check_delay = 0.00001
@@ -429,6 +458,8 @@ class TSVZed(OrderedDict):
         #super().update(loadedData)
         if self.verbose:
             self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
+        self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+        self.lastUpdateTime = self.externalFileUpdateTime
         self.memoryOnly = mo
         return self
     
@@ -472,6 +503,7 @@ class TSVZed(OrderedDict):
         if self.verbose:
             self.__teePrintOrNot(f"Appending {key} to the appendQueue")
         self.appendQueue.append('\t'.join(value))
+        self.lastUpdateTime = time.time_ns()
         # if not self.appendThread.is_alive():
         #     self.commitAppendToFile()
         # else:
@@ -489,6 +521,7 @@ class TSVZed(OrderedDict):
         if self.memoryOnly:
             return
         self.__appendEmptyLine(key)
+        self.lastUpdateTime = time.time_ns()
         
     def __appendEmptyLine(self,key):
         self.dirty = True
@@ -512,6 +545,7 @@ class TSVZed(OrderedDict):
         if self.memoryOnly:
             return self
         self.clear_file()
+        self.lastUpdateTime = self.externalFileUpdateTime
         return self
 
     def clear_file(self):
@@ -532,6 +566,7 @@ class TSVZed(OrderedDict):
             self.dirty = False
             self.deSynced = False
         except Exception as e:
+            self.release_file_obj(file)
             self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
             import traceback
             self.__teePrintOrNot(traceback.format_exc(),'error')
@@ -579,6 +614,7 @@ memoryOnly:{self.memoryOnly}
         key, value = super().popitem(last)
         if not self.memoryOnly:
             self.__appendEmptyLine(key)
+        self.lastUpdateTime = time.time_ns()
         return key, value
     
     __marker = object()
@@ -596,6 +632,7 @@ memoryOnly:{self.memoryOnly}
         value = super().pop(key)
         if not self.memoryOnly:
             self.__appendEmptyLine(key)
+        self.lastUpdateTime = time.time_ns()
         return value
     
     def move_to_end(self, key, last=True):
@@ -610,6 +647,7 @@ memoryOnly:{self.memoryOnly}
             self.__teePrintOrNot(f"rewrite_on_exit set to True")
         if self.verbose:
             self.__teePrintOrNot(f"Warning: Trying to move Key {key} moved to {'end' if last else 'beginning'} Need to resync for changes to apply to disk")
+        self.lastUpdateTime = time.time_ns()
         return self
     
     @classmethod
@@ -623,23 +661,29 @@ memoryOnly:{self.memoryOnly}
 
 
     def rewrite(self,force = False,reloadInternalFromFile = None):
-        if not self.dirty and not force:
-            return False
         if not self.deSynced and not force:
+            if not self.dirty:
+                return False
             if self.rewrite_interval == 0 or time.time() - os.path.getmtime(self._fileName) < self.rewrite_interval:
                 return False
         try:
-            if self.verbose:
-                self.__teePrintOrNot(f"Rewriting {self._fileName}")
+
             if reloadInternalFromFile is None:
                 reloadInternalFromFile = self.monitor_external_changes
-            if reloadInternalFromFile:
+            if reloadInternalFromFile and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
                 # this will be needed if more than 1 process is accessing the file
                 self.commitAppendToFile()
                 self.reload()
-            self.mapToFile()
-            if self.verbose:
-                self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
+            if self.memoryOnly:
+                if self.verbose:
+                    self.__teePrintOrNot(f"Memory only mode. Map to file skipped.")
+                return False
+            if self.dirty:
+                if self.verbose:
+                    self.__teePrintOrNot(f"Rewriting {self._fileName}")
+                self.mapToFile()
+                if self.verbose:
+                    self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
             if not self.appendThread.is_alive():
                 self.commitAppendToFile()
             # else:
@@ -652,8 +696,10 @@ memoryOnly:{self.memoryOnly}
             self.deSynced = True
             return False
         
-    def mapToFile(self):
+    def oldMapToFile(self):
         try:
+            if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+                self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
             file = self.get_file_obj('w')
             if self.header:
                 file.write(self.header+'\n')
@@ -666,14 +712,83 @@ memoryOnly:{self.memoryOnly}
             self.dirty = False
             self.deSynced = False
         except Exception as e:
-            self.__teePrintOrNot(f"Failed to write at dumpToFile() to {self._fileName}: {e}",'error')
+            self.release_file_obj(file)
+            self.__teePrintOrNot(f"Failed to write at oldMapToFile() to {self._fileName}: {e}",'error')
             import traceback
             self.__teePrintOrNot(traceback.format_exc(),'error')
             self.deSynced = True
         return self
+    
+    def mapToFile(self):
+        try:
+            if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+                self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
+            file = self.get_file_obj('r+')
+            overWrite = False
+            line = file.readline()
+            aftPos = file.tell()
+            if self.header and not lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
+                file.seek(0)
+                file.write(self.header+'\n')
+                # if the header is not the same length as the line, we need to overwrite the file
+                if aftPos != file.tell():
+                    overWrite = True
+                if self.verbose:
+                    self.__teePrintOrNot(f"Header {self.header} written to {self._fileName}")
+            for value in self.values():
+                strToWrite = '\t'.join(value)+'\n'
+                if overWrite:
+                    if self.verbose:
+                        self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
+                    file.write(strToWrite)
+                    continue
+                pos = file.tell()
+                line = file.readline()
+                aftPos = file.tell()
+                if not line or pos == aftPos:
+                    if self.verbose:
+                        self.__teePrintOrNot(f"End of file reached. Appending {value} to {self._fileName}")
+                    file.write(strToWrite)
+                    overWrite = True
+                    continue
+                if line != strToWrite:
+                    if self.verbose:
+                        self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
+                    file.seek(pos)
+                    # fill the string with space to write to the correct length
+                    file.write(strToWrite.rstrip('\n').ljust(len(line)-1)+'\n')
+                    if aftPos != file.tell():
+                        overWrite = True
+            file.truncate()
+            self.release_file_obj(file)
+            if self.verbose:
+                self.__teePrintOrNot(f"{len(self)} records written to {self._fileName}")
+                self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
+            self.dirty = False
+            self.deSynced = False
+        except Exception as e:
+            self.release_file_obj(file)
+            self.__teePrintOrNot(f"Failed to write at mapToFile() to {self._fileName}: {e}",'error')
+            import traceback
+            self.__teePrintOrNot(traceback.format_exc(),'error')
+            self.deSynced = True
+        return self
+    
+    def checkExternalChanges(self):
+        if self.deSynced:
+            return self
+        realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+        if self.externalFileUpdateTime < realExternalFileUpdateTime:
+            self.deSynced = True
+            self.__teePrintOrNot(f"External changes detected in {self._fileName}")
+        elif self.externalFileUpdateTime > realExternalFileUpdateTime:
+            self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
+            self.externalFileUpdateTime = realExternalFileUpdateTime
+        return self
 
     def _appendWorker(self):
         while not self.shutdownEvent.is_set():
+            self.checkExternalChanges()
             self.rewrite()
             self.commitAppendToFile()
             time.sleep(self.append_check_delay)
@@ -685,6 +800,11 @@ memoryOnly:{self.memoryOnly}
 
     def commitAppendToFile(self):
         if self.appendQueue:
+            if self.memoryOnly:
+                self.appendQueue.clear()
+                if self.verbose:
+                    self.__teePrintOrNot(f"Memory only mode. Append queue cleared.") 
+                return self
             try:
                 if self.verbose:
                     self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
@@ -698,6 +818,7 @@ memoryOnly:{self.memoryOnly}
                     self.__teePrintOrNot(f"Records commited to {self._fileName}")
                     self.__teePrintOrNot(f"After size of {self._fileName}: {os.path.getsize(self._fileName)}")
             except Exception as e:
+                self.release_file_obj(file)
                 self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._fileName}: {e}",'error')
                 import traceback
                 self.__teePrintOrNot(traceback.format_exc(),'error')
@@ -732,12 +853,20 @@ memoryOnly:{self.memoryOnly}
             if self.verbose:
                 self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
         except Exception as e:
-            self.writeLock.release()  # Release the thread lock in case of an error
-            raise e  # Re-raise the exception to handle it outside or notify the user
+            try:
+                self.writeLock.release()  # Release the thread lock in case of an error
+            except Exception as e:
+                self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
+            self.__teePrintOrNot(f"Failed to open file {self._fileName}: {e}",'error')
         return file
 
     def release_file_obj(self,file):
+        # if write lock is already released, return
+        if not self.writeLock.locked():
+            return
         try:
+            file.flush()  # Ensure the file is flushed before unlocking
+            os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
             if os.name == 'posix':
                 fcntl.lockf(file, fcntl.LOCK_UN)
             elif os.name == 'nt':
@@ -748,9 +877,13 @@ memoryOnly:{self.memoryOnly}
             if self.verbose:
                 self.__teePrintOrNot(f"File {file.name} unlocked / released")
         except Exception as e:
-            raise e  # Re-raise the exception for external handling
+            self.__teePrintOrNot(f"Failed to release file {file.name}: {e}",'error')
         finally:
-            self.writeLock.release()  # Ensure the thread lock is always released
+            try:
+                self.writeLock.release()  # Ensure the thread lock is always released
+            except Exception as e:
+                self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
+        self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 
 
 def __main__():
@@ -758,7 +891,7 @@ def __main__():
     parser = argparse.ArgumentParser(description='TSVZed: A TSV file manager')
     parser.add_argument('filename', type=str, help='The TSV file to read')
     parser.add_argument('operation', type=str,nargs='?', choices=['read','append','delete','clear'], help='The operation to perform. Default: read', default='read')
-    parser.add_argument('line', type=str, nargs='*', help='The line to append to the TSV file. it follows as : \{key\} \{value1\} \{value2\} ... if a key without value be inserted, the value will get deleted.')
+    parser.add_argument('line', type=str, nargs='*', help='The line to append to the TSV file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
     parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the TSV file. seperate using \\t')
     parser.add_argument('-f', '--force', action='store_true', help='Force the operation. Ignore checks for column numbers / headers')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
