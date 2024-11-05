@@ -10,7 +10,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.65'
+version = '2.66'
 author = 'pan@zopyr.us'
 
 
@@ -877,12 +877,15 @@ memoryOnly:{self.memoryOnly}
             if self.verbose:
                 self.__teePrintOrNot(f"File {file.name} unlocked / released")
         except Exception as e:
-            self.__teePrintOrNot(f"Failed to release file {file.name}: {e}",'error')
-        finally:
             try:
                 self.writeLock.release()  # Ensure the thread lock is always released
             except Exception as e:
                 self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
+            self.__teePrintOrNot(f"Failed to release file {file.name}: {e}",'error')
+        try:
+            self.writeLock.release()  # Ensure the thread lock is always released
+        except Exception as e:
+            self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
         self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 
 
