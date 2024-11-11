@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='TSVZ',
-    version='2.66',  
+    version='2.67',  
     py_modules=['TSVZ'],  # List of module names (without .py)
     description='An simple in memory wrapper around a TSV file to function as a database',
     author='Yufei Pan',
