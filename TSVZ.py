@@ -10,7 +10,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.66'
+version = '2.67'
 author = 'pan@zopyr.us'
 
 
@@ -384,12 +384,22 @@ def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose 
         __teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
 
 def getFileUpdateTimeNs(fileName):
+    # return 0 if the file does not exist
+    if not os.path.isfile(fileName):
+        return 0
     try:
         return os.stat(fileName).st_mtime_ns
     except:
         __teePrintOrNot(f"Failed to get file update time for {fileName}",'error')
-        return time.time_ns()
+        return get_time_ns()
 
+def get_time_ns():
+    try:
+        return time.time_ns()
+    except:
+        # try to get the time in nanoseconds
+        return int(time.time()*1e9)
+    
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class TSVZed(OrderedDict):
     def __teePrintOrNot(self,message,level = 'info'):
@@ -503,7 +513,7 @@ class TSVZed(OrderedDict):
         if self.verbose:
             self.__teePrintOrNot(f"Appending {key} to the appendQueue")
         self.appendQueue.append('\t'.join(value))
-        self.lastUpdateTime = time.time_ns()
+        self.lastUpdateTime = get_time_ns()
         # if not self.appendThread.is_alive():
         #     self.commitAppendToFile()
         # else:
@@ -521,7 +531,7 @@ class TSVZed(OrderedDict):
         if self.memoryOnly:
             return
         self.__appendEmptyLine(key)
-        self.lastUpdateTime = time.time_ns()
+        self.lastUpdateTime = get_time_ns()
         
     def __appendEmptyLine(self,key):
         self.dirty = True
@@ -614,7 +624,7 @@ memoryOnly:{self.memoryOnly}
         key, value = super().popitem(last)
         if not self.memoryOnly:
             self.__appendEmptyLine(key)
-        self.lastUpdateTime = time.time_ns()
+        self.lastUpdateTime = get_time_ns()
         return key, value
     
     __marker = object()
@@ -632,7 +642,7 @@ memoryOnly:{self.memoryOnly}
         value = super().pop(key)
         if not self.memoryOnly:
             self.__appendEmptyLine(key)
-        self.lastUpdateTime = time.time_ns()
+        self.lastUpdateTime = get_time_ns()
         return value
     
     def move_to_end(self, key, last=True):
@@ -647,7 +657,7 @@ memoryOnly:{self.memoryOnly}
             self.__teePrintOrNot(f"rewrite_on_exit set to True")
         if self.verbose:
             self.__teePrintOrNot(f"Warning: Trying to move Key {key} moved to {'end' if last else 'beginning'} Need to resync for changes to apply to disk")
-        self.lastUpdateTime = time.time_ns()
+        self.lastUpdateTime = get_time_ns()
         return self
     
     @classmethod
@@ -776,6 +786,8 @@ memoryOnly:{self.memoryOnly}
     
     def checkExternalChanges(self):
         if self.deSynced:
+            return self
+        if not self.monitor_external_changes:
             return self
         realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
         if self.externalFileUpdateTime < realExternalFileUpdateTime:
