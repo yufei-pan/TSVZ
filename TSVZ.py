@@ -10,7 +10,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.68'
+version = '2.69'
 author = 'pan@zopyr.us'
 
 
@@ -353,6 +353,13 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
         return
     if type(lineToAppend) == str:
         lineToAppend = lineToAppend.strip().split('\t')
+    else:
+        for i in range(len(lineToAppend)):
+            if type(lineToAppend[i]) != str:
+                try:
+                    lineToAppend[i] = str(lineToAppend[i])
+                except Exception as e:
+                    lineToAppend[i] = str(e)
     
     with open(fileName, mode ='r+b')as file:
         correctColumnNum = len(lineToAppend)
