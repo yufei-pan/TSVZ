@@ -10,7 +10,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.69'
+version = '2.70'
 author = 'pan@zopyr.us'
 
 
@@ -245,11 +245,15 @@ def lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fals
     Returns:
     bool: True if the header matches the line, False otherwise.
     """
+    escapedHeader = repr(header.strip())
+    escapedLine = repr(line.strip())
     if verbose:
-        __teePrintOrNot(f"Header: {header.strip()}",teeLogger=teeLogger)
-        __teePrintOrNot(f"First line: {line}",teeLogger=teeLogger)
-    if not line.lower().replace(' ','').startswith(header.strip().lower().replace(' ','')):
-        __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header.strip()}",teeLogger=teeLogger)
+        __teePrintOrNot(f"Header: \n{escapedHeader}",teeLogger=teeLogger)
+        __teePrintOrNot(f"First line: \n{escapedLine}",teeLogger=teeLogger)
+    headerList = header.strip().lower().split('\t')
+    lineList = line.strip().lower().split('\t')
+    if len(headerList) != len(lineList) or any([headerList[i] not in lineList[i] for i in range(len(headerList))]):
+        __teePrintOrNot(f"Header mismatch: \n{escapedLine} \n!= \n{escapedHeader}",teeLogger=teeLogger)
         if strict:
             raise Exception("Data format error! Header mismatch")
         return False
