@@ -10,53 +10,81 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '2.70'
+version = '3.00'
 author = 'pan@zopyr.us'
 
+DEFAULT_DELIMITER = '\t'
 
-def pretty_format_table(data):
-	version = 1.0
-	if not data:
-		return ''
-	if type(data) == str:
-		data = data.strip('\n').split('\n')
-		data = [line.split('\t') for line in data]
-	elif isinstance(data, dict):
-		# flatten the 2D dict to a list of lists
-		if isinstance(next(iter(data.values())), dict):
-			tempData = [['key'] + list(next(iter(data.values())).keys())]
-			tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
-			data = tempData
-		else:
-			# it is a dict of lists
-			data = [[key] + list(value) for key, value in data.items()]
-	elif type(data) != list:
-		data = list(data)
-	# format the list into 2d list of list of strings
-	if isinstance(data[0], dict):
-		tempData = [data[0].keys()]
-		tempData.extend([list(item.values()) for item in data])
-		data = tempData
-	data = [[str(item) for item in row] for row in data]
-	num_cols = len(data[0])
-	col_widths = [0] * num_cols
-	# Calculate the maximum width of each column
-	for c in range(num_cols):
-		col_widths[c] = max(len(row[c]) for row in data)
-	# Build the row format string
-	row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
-	# Print the header
-	header = data[0]
-	outTable = []
-	outTable.append(row_format.format(*header))
-	outTable.append('-+-'.join('-' * width for width in col_widths))
-	for row in data[1:]:
-		# if the row is empty, print an divider
-		if not any(row):
-			outTable.append('-+-'.join('-' * width for width in col_widths))
-		else:
-			outTable.append(row_format.format(*row))
-	return '\n'.join(outTable) + '\n'
+def get_delimiter(delimiter,file_name = ''):
+    if not delimiter:
+        return DEFAULT_DELIMITER
+    elif delimiter == ...:
+        if not file_name:
+            rtn =  '\t'
+        if file_name.endswith('.csv'):
+            rtn =  ','
+        elif file_name.endswith('.nsv'):
+            rtn =  '\0'
+        elif file_name.endswith('.psv'):
+            rtn =  '|'
+        else:
+            rtn =  '\t'
+    elif delimiter == 'comma':
+        rtn =  ','
+    elif delimiter == 'tab':
+        rtn =  '\t'
+    elif delimiter == 'pipe':
+        rtn =  '|'
+    elif delimiter == 'null':
+        rtn =  '\0'
+    else:
+        rtn =  delimiter.encode().decode('unicode_escape')
+    DEFAULT_DELIMITER = rtn
+    return rtn
+
+def pretty_format_table(data, delimiter = DEFAULT_DELIMITER):
+    version = 1.0
+    if not data:
+        return ''
+    if type(data) == str:
+        data = data.strip('\n').split('\n')
+        data = [line.split(delimiter) for line in data]
+    elif isinstance(data, dict):
+        # flatten the 2D dict to a list of lists
+        if isinstance(next(iter(data.values())), dict):
+            tempData = [['key'] + list(next(iter(data.values())).keys())]
+            tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
+            data = tempData
+        else:
+            # it is a dict of lists
+            data = [[key] + list(value) for key, value in data.items()]
+    elif type(data) != list:
+        data = list(data)
+    # format the list into 2d list of list of strings
+    if isinstance(data[0], dict):
+        tempData = [data[0].keys()]
+        tempData.extend([list(item.values()) for item in data])
+        data = tempData
+    data = [[str(item) for item in row] for row in data]
+    num_cols = len(data[0])
+    col_widths = [0] * num_cols
+    # Calculate the maximum width of each column
+    for c in range(num_cols):
+        col_widths[c] = max(len(row[c]) for row in data)
+    # Build the row format string
+    row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
+    # Print the header
+    header = data[0]
+    outTable = []
+    outTable.append(row_format.format(*header))
+    outTable.append('-+-'.join('-' * width for width in col_widths))
+    for row in data[1:]:
+        # if the row is empty, print an divider
+        if not any(row):
+            outTable.append('-+-'.join('-' * width for width in col_widths))
+        else:
+            outTable.append(row_format.format(*row))
+    return '\n'.join(outTable) + '\n'
 
 def __teePrintOrNot(message,level = 'info',teeLogger = None):
     """
@@ -78,7 +106,7 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
     except Exception as e:
         print(message,flush=True)
 
-def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True):
+def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER):
     """
     Process a line of text and update the task dictionary.
 
@@ -94,7 +122,7 @@ def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,s
     tuple: A tuple containing the updated correctColumnNum and the processed lineCache.
 
     """
-    line = line.decode().strip(' ').strip('\x00')
+    line = line.strip(' ').strip('\x00').rstrip('\r\n')
     # we throw away the lines that start with '#'
     if not line :
         if verbose:
@@ -105,7 +133,7 @@ def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,s
             __teePrintOrNot(f"Ignoring comment line: {line}",teeLogger=teeLogger)
         return correctColumnNum , []
     # we only interested in the lines that have the correct number of columns
-    lineCache = [segment.strip() for segment in line.split('\t')]
+    lineCache = [segment.strip() for segment in line.split(delimiter)]
     if not lineCache:
         return correctColumnNum , []
     if correctColumnNum == -1:
@@ -144,7 +172,7 @@ def processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,s
                 __teePrintOrNot(f"Key {lineCache[0]} added after correction",teeLogger=teeLogger)
     return correctColumnNum, lineCache
 
-def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False):
+def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,encoding = 'utf8',delimiter = ...):
     """
     Reads the last valid line from a file.
 
@@ -154,6 +182,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
         correctColumnNum (int): A column number to pass to processLine function.
         verbose (bool, optional): Whether to print verbose output. Defaults to False.
         teeLogger (optional): Logger to use for tee print. Defaults to None.
+        encoding (str, optional): The encoding of the file. Defaults to None.
         strict (bool, optional): Whether to enforce strict processing. Defaults to False.
 
     Returns:
@@ -161,6 +190,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
     """
     chunk_size = 1024  # Read in chunks of 1024 bytes
     last_valid_line = []
+    delimiter = get_delimiter(delimiter,file_name=fileName)
     if verbose:
         __teePrintOrNot(f"Reading last line only from {fileName}",teeLogger=teeLogger)
     with open(fileName, 'rb') as file:
@@ -186,13 +216,14 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
             for i in range(len(lines) - 1, -1, -1):
                 if lines[i].strip():  # Skip empty lines
                     # Process the line
-                    correctColumnNum, lineCache = processLine(
-                        lines[i],
+                    correctColumnNum, lineCache = _processLine(
+                        lines[i].decode(encoding=encoding),
                         taskDic,
                         correctColumnNum,
                         verbose=verbose,
                         teeLogger=teeLogger,
-                        strict=strict
+                        strict=strict,
+                        delimiter=delimiter
                     )
                     # If the line is valid, return it
                     if lineCache and any(lineCache):
@@ -204,7 +235,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
     # Return empty list if no valid line found
     return last_valid_line
 
-def formatHeader(header,verbose = False,teeLogger = None):
+def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DELIMITER):
     """
     Format the header string.
 
@@ -218,7 +249,7 @@ def formatHeader(header,verbose = False,teeLogger = None):
     """
     if type(header) != str:
         try:
-            header = '\t'.join(header)
+            header = delimiter.join(header)
         except:
             if verbose:
                 __teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
@@ -231,7 +262,7 @@ def formatHeader(header,verbose = False,teeLogger = None):
     #     header = ''
     return header
 
-def lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False):
+def __lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = DEFAULT_DELIMITER):
     """
     Verify if a line contains the header.
 
@@ -250,8 +281,8 @@ def lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fals
     if verbose:
         __teePrintOrNot(f"Header: \n{escapedHeader}",teeLogger=teeLogger)
         __teePrintOrNot(f"First line: \n{escapedLine}",teeLogger=teeLogger)
-    headerList = header.strip().lower().split('\t')
-    lineList = line.strip().lower().split('\t')
+    headerList = header.strip().lower().split(delimiter)
+    lineList = line.strip().lower().split(delimiter)
     if len(headerList) != len(lineList) or any([headerList[i] not in lineList[i] for i in range(len(headerList))]):
         __teePrintOrNot(f"Header mismatch: \n{escapedLine} \n!= \n{escapedHeader}",teeLogger=teeLogger)
         if strict:
@@ -259,12 +290,12 @@ def lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fals
         return False
     return True
 
-def verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = None,header = '',encoding = 'utf8',strict = True):
+def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,header = '',encoding = 'utf8',strict = True,delimiter = DEFAULT_DELIMITER):
     """
-    Verify the existence of a TSV file.
+    Verify the existence of the tabular file.
 
     Parameters:
-    - fileName (str): The path of the TSV file.
+    - fileName (str): The path of the tabular file.
     - createIfNotExist (bool, optional): Whether to create the file if it doesn't exist. Defaults to True.
     - teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
     - header (str, optional): The header line to verify against. Defaults to ''.
@@ -274,8 +305,14 @@ def verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = None,header 
     Returns:
     bool: True if the file exists, False otherwise.
     """
-    if not fileName.endswith('.tsv'):
+    if delimiter and delimiter == '\t' and not fileName.endswith('.tsv'):
         __teePrintOrNot(f'Warning: Filename {fileName} does not end with .tsv','warning',teeLogger=teeLogger)
+    elif delimiter and delimiter == ',' and not fileName.endswith('.csv'):
+        __teePrintOrNot(f'Warning: Filename {fileName} does not end with .csv','warning',teeLogger=teeLogger)
+    elif delimiter and delimiter == '\0' and not fileName.endswith('.nsv'):
+        __teePrintOrNot(f'Warning: Filename {fileName} does not end with .nsv','warning',teeLogger=teeLogger)
+    elif delimiter and delimiter == '|' and not fileName.endswith('.psv'):
+        __teePrintOrNot(f'Warning: Filename {fileName} does not end with .psv','warning',teeLogger=teeLogger)
     if not os.path.isfile(fileName):
         if createIfNotExist:
             with open(fileName, mode ='w',encoding=encoding)as file:
@@ -289,14 +326,15 @@ def verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = None,header 
             return False
     return True
 
-def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True):
+def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t'):
     """
-    Read a TSV (Tab-Separated Values) file and return the data as a dictionary.
+    Compatibility method, calls readTabularFile. 
+    Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
 
     Parameters:
-    - fileName (str): The path to the TSV file.
+    - fileName (str): The path to the Tabular file.
     - teeLogger (Logger, optional): The logger object to log messages. Defaults to None.
-    - header (str or list, optional): The header of the TSV file. If a string, it should be a tab-separated list of column names. If a list, it should contain the column names. Defaults to ''.
+    - header (str or list, optional): The header of the Tabular file. If a string, it should be a tab-separated list of column names. If a list, it should contain the column names. Defaults to ''.
     - createIfNotExist (bool, optional): Whether to create the file if it doesn't exist. Defaults to False.
     - lastLineOnly (bool, optional): Whether to read only the last valid line of the file. Defaults to False.
     - verifyHeader (bool, optional): Whether to verify the header of the file. Defaults to True.
@@ -304,9 +342,36 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     - taskDic (OrderedDict, optional): The dictionary to store the data. Defaults to an empty OrderedDict.
     - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
+    - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t'.
 
     Returns:
-    - OrderedDict: The dictionary containing the data from the TSV file.
+    - OrderedDict: The dictionary containing the data from the Tabular file.
+
+    Raises:
+    - Exception: If the file is not found or there is a data format error.
+
+    """
+    return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter)
+
+def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...):
+    """
+    Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
+
+    Parameters:
+    - fileName (str): The path to the Tabular file.
+    - teeLogger (Logger, optional): The logger object to log messages. Defaults to None.
+    - header (str or list, optional): The header of the Tabular file. If a string, it should be a tab-separated list of column names. If a list, it should contain the column names. Defaults to ''.
+    - createIfNotExist (bool, optional): Whether to create the file if it doesn't exist. Defaults to False.
+    - lastLineOnly (bool, optional): Whether to read only the last valid line of the file. Defaults to False.
+    - verifyHeader (bool, optional): Whether to verify the header of the file. Defaults to True.
+    - verbose (bool, optional): Whether to print verbose output. Defaults to False.
+    - taskDic (OrderedDict, optional): The dictionary to store the data. Defaults to an empty OrderedDict.
+    - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
+    - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
+    - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+
+    Returns:
+    - OrderedDict: The dictionary containing the data from the Tabular file.
 
     Raises:
     - Exception: If the file is not found or there is a data format error.
@@ -314,33 +379,35 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     """
     if taskDic is None:
         taskDic = {}
-    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not verifyTSVExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict):
+    delimiter = get_delimiter(delimiter,file_name=fileName)
+    header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
+    if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return taskDic
     with open(fileName, mode ='rb')as file:
         correctColumnNum = -1
         if header.strip():
             if verifyHeader:
-                line = file.readline().decode().strip()
-                if lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
-                    correctColumnNum = len(header.strip().split('\t'))
+                line = file.readline().decode(encoding=encoding).strip()
+                if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                    correctColumnNum = len(header.strip().split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         if lastLineOnly:
-            lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict)
+            lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
             if lineCache:
                 taskDic[lineCache[0]] = lineCache
             return lineCache
         for line in file:
-            correctColumnNum, lineCache = processLine(line,taskDic,correctColumnNum,verbose = verbose,teeLogger = teeLogger,strict = strict)
+            correctColumnNum, lineCache = _processLine(line.decode(encoding=encoding),taskDic,correctColumnNum,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter=delimiter)
     return taskDic
 
-def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True):
+def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):
     """
-    Append a line of data to a TSV file.
+    Compatibility method, calls appendTabularFile.
+    Append a line of data to a Tabular file.
     Parameters:
-    - fileName (str): The path of the TSV file.
-    - lineToAppend (str or list): The line of data to append. If it is a string, it will be split by tabs ('\t') to form a list.
+    - fileName (str): The path of the Tabular file.
+    - lineToAppend (str or list): The line of data to append. If it is a string, it will be split by delimiter to form a list.
     - teeLogger (optional): A logger object for logging messages.
     - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
     - createIfNotExist (bool, optional): If True, the file will be created if it does not exist. If False and the file does not exist, an exception will be raised.
@@ -348,15 +415,37 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
     - verbose (bool, optional): If True, additional information will be printed during the execution.
     - encoding (str, optional): The encoding of the file.
     - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+    - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
     Raises:
     - Exception: If the file does not exist and createIfNotExist is False.
     - Exception: If the existing header does not match the provided header.
     """
-    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not verifyTSVExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict):
+    return appendTabularFile(fileName,lineToAppend,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter)
+
+def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...):
+    """
+    Append a line of data to a Tabular file.
+    Parameters:
+    - fileName (str): The path of the Tabular file.
+    - lineToAppend (str or list): The line of data to append. If it is a string, it will be split by delimiter to form a list.
+    - teeLogger (optional): A logger object for logging messages.
+    - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
+    - createIfNotExist (bool, optional): If True, the file will be created if it does not exist. If False and the file does not exist, an exception will be raised.
+    - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
+    - verbose (bool, optional): If True, additional information will be printed during the execution.
+    - encoding (str, optional): The encoding of the file.
+    - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+    - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+    Raises:
+    - Exception: If the file does not exist and createIfNotExist is False.
+    - Exception: If the existing header does not match the provided header.
+    """
+    delimiter = get_delimiter(delimiter,file_name=fileName)
+    header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+    if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return
     if type(lineToAppend) == str:
-        lineToAppend = lineToAppend.strip().split('\t')
+        lineToAppend = lineToAppend.strip().split(get_delimiter(delimiter))
     else:
         for i in range(len(lineToAppend)):
             if type(lineToAppend[i]) != str:
@@ -369,9 +458,9 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
         correctColumnNum = len(lineToAppend)
         if header.strip():
             if verifyHeader:
-                line = file.readline().decode().strip()
-                if lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
-                    correctColumnNum = len(header.strip().split('\t'))
+                line = file.readline().decode(encoding=encoding).strip()
+                if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                    correctColumnNum = len(header.strip().split(get_delimiter(delimiter)))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         # truncate / fill the lineToAppend to the correct number of columns
@@ -383,15 +472,16 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
         file.seek(-1, os.SEEK_END)
         if file.read(1) != b'\n':
             file.write(b'\n')
-        file.write('\t'.join(lineToAppend).encode() + b'\n')
+        file.write(get_delimiter(delimiter).join(lineToAppend).encode(encoding=encoding) + b'\n')
         if verbose:
             __teePrintOrNot(f"Appended {lineToAppend} to {fileName}",teeLogger=teeLogger)
 
-def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False):
+def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t'):
     """
-    Clear the contents of a TSV file. Will create if not exist.
+    Compatibility method, calls clearTabularFile.
+    Clear the contents of a Tabular file. Will create if not exist.
     Parameters:
-    - fileName (str): The path of the TSV file.
+    - fileName (str): The path of the Tabular file.
     - teeLogger (optional): A logger object for logging messages.
     - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
     - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
@@ -399,14 +489,29 @@ def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose 
     - encoding (str, optional): The encoding of the file.
     - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
     """
-    header = formatHeader(header,verbose = verbose,teeLogger = teeLogger)
-    if not verifyTSVExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False):
+    return clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
+
+def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = ...):
+    """
+    Clear the contents of a Tabular file. Will create if not exist.
+    Parameters:
+    - fileName (str): The path of the Tabular file.
+    - teeLogger (optional): A logger object for logging messages.
+    - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
+    - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
+    - verbose (bool, optional): If True, additional information will be printed during the execution.
+    - encoding (str, optional): The encoding of the file.
+    - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+    """
+    delimiter = get_delimiter(delimiter,file_name=fileName)
+    header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+    if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
         raise Exception("Something catastrophic happened! File still not found after creation")
     else:
         with open(fileName, mode ='r+',encoding=encoding)as file:
             if header.strip() and verifyHeader:
                 line = file.readline().strip()
-                if not lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                if not __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     __teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
                 file.truncate()
             else:
@@ -432,7 +537,7 @@ def get_time_ns():
         return int(time.time()*1e9)
     
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
-class TSVZed(OrderedDict):
+class TSVZed(dict):
     def __teePrintOrNot(self,message,level = 'info'):
         try:
             if self.teeLogger:
@@ -442,14 +547,15 @@ class TSVZed(OrderedDict):
         except Exception as e:
             print(message,flush=True)
 
-    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = None):
+    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...):
         super().__init__()
         self.version = version
         self.externalFileUpdateTime = getFileUpdateTimeNs(fileName)
         self.lastUpdateTime = self.externalFileUpdateTime
         self._fileName = fileName
         self.teeLogger = teeLogger
-        self.header = formatHeader(header,verbose = verbose,teeLogger = self.teeLogger)
+        self.delimiter = get_delimiter(delimiter,file_name=fileName)
+        self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
         self.correctColumnNum = -1
         self.createIfNotExist = createIfNotExist
         self.verifyHeader = verifyHeader
@@ -490,10 +596,10 @@ class TSVZed(OrderedDict):
         if self.verbose:
             self.__teePrintOrNot(f"Loading {self._fileName}")
         super().clear()
-        readTSV(self._fileName, teeLogger = self.teeLogger, header = self.header, createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None)
+        readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header, createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None, strict = False, delimiter = self.delimiter)
         if self.verbose:
             self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-        self.correctColumnNum = len(self.header.split('\t')) if (self.header and self.verifyHeader) else (len(self[next(iter(self))]) if self else -1)
+        self.correctColumnNum = len(self.header.split(self.delimiter)) if (self.header and self.verifyHeader) else (len(self[next(iter(self))]) if self else -1)
         if self.verbose:
             self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
         #super().update(loadedData)
@@ -510,7 +616,7 @@ class TSVZed(OrderedDict):
             self.__teePrintOrNot('Key cannot be empty','error')
             return
         if type(value) == str:
-            value = value.strip().split('\t')
+            value = value.strip().split(self.delimiter)
         # sanitize the value
         value = [(str(segment).strip() if type(segment) != str else segment.strip()) if segment else '' for segment in value]
         #value = list(map(lambda segment: str(segment).strip(), value))
@@ -543,7 +649,7 @@ class TSVZed(OrderedDict):
             return
         if self.verbose:
             self.__teePrintOrNot(f"Appending {key} to the appendQueue")
-        self.appendQueue.append('\t'.join(value))
+        self.appendQueue.append(self.delimiter.join(value))
         self.lastUpdateTime = get_time_ns()
         # if not self.appendThread.is_alive():
         #     self.commitAppendToFile()
@@ -567,10 +673,10 @@ class TSVZed(OrderedDict):
     def __appendEmptyLine(self,key):
         self.dirty = True
         if self.correctColumnNum > 0:
-            emptyLine = key+'\t'*(self.correctColumnNum-1)
+            emptyLine = key+self.delimiter*(self.correctColumnNum-1)
         elif len(self[key]) > 1:
             self.correctColumnNum = len(self[key])
-            emptyLine = key+'\t'*(self.correctColumnNum-1)
+            emptyLine = key+self.delimiter*(self.correctColumnNum-1)
         else:
             emptyLine = key
         if self.verbose:
@@ -745,7 +851,7 @@ memoryOnly:{self.memoryOnly}
             if self.header:
                 file.write(self.header+'\n')
             for key in self:
-                file.write('\t'.join(self[key])+'\n')
+                file.write(self.delimiter.join(self[key])+'\n')
             self.release_file_obj(file)
             if self.verbose:
                 self.__teePrintOrNot(f"{len(self)} records written to {self._fileName}")
@@ -764,32 +870,32 @@ memoryOnly:{self.memoryOnly}
         try:
             if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
                 self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-            file = self.get_file_obj('r+')
+            file = self.get_file_obj('r+b')
             overWrite = False
-            line = file.readline()
+            line = file.readline().decode(self.encoding)
             aftPos = file.tell()
-            if self.header and not lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
+            if self.header and not __lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
                 file.seek(0)
-                file.write(self.header+'\n')
+                file.write(f'{self.header}\n'.encode(encoding=self.encoding))
                 # if the header is not the same length as the line, we need to overwrite the file
                 if aftPos != file.tell():
                     overWrite = True
                 if self.verbose:
                     self.__teePrintOrNot(f"Header {self.header} written to {self._fileName}")
             for value in self.values():
-                strToWrite = '\t'.join(value)+'\n'
+                strToWrite = self.delimiter.join(value)+'\n'
                 if overWrite:
                     if self.verbose:
                         self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
-                    file.write(strToWrite)
+                    file.write(strToWrite.encode(encoding=self.encoding))
                     continue
                 pos = file.tell()
-                line = file.readline()
+                line = file.readline().decode(encoding=self.encoding)
                 aftPos = file.tell()
                 if not line or pos == aftPos:
                     if self.verbose:
                         self.__teePrintOrNot(f"End of file reached. Appending {value} to {self._fileName}")
-                    file.write(strToWrite)
+                    file.write(strToWrite.encode(encoding=self.encoding))
                     overWrite = True
                     continue
                 if line != strToWrite:
@@ -797,7 +903,8 @@ memoryOnly:{self.memoryOnly}
                         self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
                     file.seek(pos)
                     # fill the string with space to write to the correct length
-                    file.write(strToWrite.rstrip('\n').ljust(len(line)-1)+'\n')
+                    #file.write(strToWrite.rstrip('\n').ljust(len(line)-1)+'\n')
+                    file.write(strToWrite.encode(encoding=self.encoding).rstrip(b'\n').ljust(len(line)-1)+b'\n')
                     if aftPos != file.tell():
                         overWrite = True
             file.truncate()
@@ -831,9 +938,10 @@ memoryOnly:{self.memoryOnly}
 
     def _appendWorker(self):
         while not self.shutdownEvent.is_set():
-            self.checkExternalChanges()
-            self.rewrite()
-            self.commitAppendToFile()
+            if not self.memoryOnly:
+                self.checkExternalChanges()
+                self.rewrite()
+                self.commitAppendToFile()
             time.sleep(self.append_check_delay)
             # self.appendEvent.wait()
             # self.appendEvent.clear()
@@ -883,15 +991,19 @@ memoryOnly:{self.memoryOnly}
     def get_file_obj(self,modes = 'a'):
         self.writeLock.acquire()
         try:
-            if not self.encoding:
-                self.encoding = 'utf8'
-            file = open(self._fileName, mode=modes, encoding=self.encoding)
+            if 'b' not in modes:
+                if not self.encoding:
+                    self.encoding = 'utf8'
+                file = open(self._fileName, mode=modes, encoding=self.encoding)
+            else:
+                file = open(self._fileName, mode=modes)
             # Lock the file after opening
             if os.name == 'posix':
                 fcntl.lockf(file, fcntl.LOCK_EX)
             elif os.name == 'nt':
                 # For Windows, locking the entire file, avoiding locking an empty file
-                lock_length = max(1, os.path.getsize(self._fileName))
+                #lock_length = max(1, os.path.getsize(self._fileName))
+                lock_length = 2147483647
                 msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, lock_length)
             if self.verbose:
                 self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
@@ -910,13 +1022,18 @@ memoryOnly:{self.memoryOnly}
         try:
             file.flush()  # Ensure the file is flushed before unlocking
             os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
-            if os.name == 'posix':
-                fcntl.lockf(file, fcntl.LOCK_UN)
-            elif os.name == 'nt':
-                # Unlocking the entire file; for Windows, ensure not unlocking an empty file
-                unlock_length = max(1, os.path.getsize(file.name))
-                msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
-            file.close()  # Ensure file is closed after unlocking
+            if not file.closed:
+                if os.name == 'posix':
+                    fcntl.lockf(file, fcntl.LOCK_UN)
+                elif os.name == 'nt':
+                    # Unlocking the entire file; for Windows, ensure not unlocking an empty file
+                    #unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
+                    unlock_length = 2147483647
+                    try:
+                        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
+                    except:
+                        pass
+                file.close()  # Ensure file is closed after unlocking
             if self.verbose:
                 self.__teePrintOrNot(f"File {file.name} unlocked / released")
         except Exception as e:
@@ -925,26 +1042,37 @@ memoryOnly:{self.memoryOnly}
             except Exception as e:
                 self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
             self.__teePrintOrNot(f"Failed to release file {file.name}: {e}",'error')
-        try:
-            self.writeLock.release()  # Ensure the thread lock is always released
-        except Exception as e:
-            self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
-        self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+            import traceback
+            self.__teePrintOrNot(traceback.format_exc(),'error')
+        # release the write lock if not already released
+        if self.writeLock.locked():
+            try:
+                self.writeLock.release()  # Ensure the thread lock is always released
+            except Exception as e:
+                self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
+            self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 
 
 def __main__():
     import argparse
-    parser = argparse.ArgumentParser(description='TSVZed: A TSV file manager')
-    parser.add_argument('filename', type=str, help='The TSV file to read')
+    parser = argparse.ArgumentParser(description='TSVZed: A TSV / CSV / NSV file manager')
+    parser.add_argument('filename', type=str, help='The file to read')
     parser.add_argument('operation', type=str,nargs='?', choices=['read','append','delete','clear'], help='The operation to perform. Default: read', default='read')
-    parser.add_argument('line', type=str, nargs='*', help='The line to append to the TSV file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
-    parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the TSV file. seperate using \\t')
+    parser.add_argument('line', type=str, nargs='*', help='The line to append to the Tabular file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
+    parser.add_argument('-d', '--delimiter', type=str, help='The delimiter of the Tabular file. Default: Infer from last part of filename, or tab if cannot determine. Note: accept unicode escaped char, raw char, or string "comma,tab,null" will refer to their characters. ', default=...)
+    parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the Tabular file. seperate using --delimiter.')
     parser.add_argument('-f', '--force', action='store_true', help='Force the operation. Ignore checks for column numbers / headers')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version} by {author}')
     args = parser.parse_args()
-
-    header = args.header.replace('\\t','\t') if args.header else ''
+    args.delimiter = get_delimiter(delimiter=args.delimiter,file_name=args.filename)
+    if args.header and args.header.endswith('\\'):
+        args.header += '\\'
+    try:
+        header = args.header.encode().decode('unicode_escape') if args.header else ''
+    except Exception as e:
+        print(f"Failed to decode header: {args.header}")
+        header = ''
 
     if args.operation == 'read':
         # check if the file exist
@@ -952,14 +1080,14 @@ def __main__():
             print(f"File not found: {args.filename}")
             return
         # read the file
-        data = readTSV(args.filename, verifyHeader = False, verbose=args.verbose,strict= not args.force)
-        print(pretty_format_table(data.values()))
+        data = readTabularFile(args.filename, verifyHeader = False, verbose=args.verbose,strict= not args.force, delimiter=args.delimiter)
+        print(pretty_format_table(data.values(),delimiter=args.delimiter))
     elif args.operation == 'append':
-        appendTSV(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force)
+        appendTabularFile(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force, delimiter=args.delimiter)
     elif args.operation == 'delete':
-        appendTSV(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force)
+        appendTabularFile(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force, delimiter=args.delimiter)
     elif args.operation == 'clear':
-        clearTSV(args.filename, header=header, verbose=args.verbose, verifyHeader=not args.force)
+        clearTabularFile(args.filename, header=header, verbose=args.verbose, verifyHeader=not args.force, delimiter=args.delimiter)
     else:
         print("Invalid operation")
         return
