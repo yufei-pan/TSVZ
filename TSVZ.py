@@ -10,7 +10,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.00'
+version = '3.01'
 author = 'pan@zopyr.us'
 
 DEFAULT_DELIMITER = '\t'
@@ -254,7 +254,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
             if verbose:
                 __teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
             header = ''
-    header = header.strip()
+    header = delimiter.join([segment.rstrip() for segment in header.split(delimiter)])
     # if header:
     #     if not header.endswith('\n'):
     #         header += '\n'
@@ -276,15 +276,13 @@ def __lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fa
     Returns:
     bool: True if the header matches the line, False otherwise.
     """
-    escapedHeader = repr(header.strip())
-    escapedLine = repr(line.strip())
+    header = [segment.rstrip() for segment in header.split(delimiter)]
+    line = [segment.rstrip() for segment in line.split(delimiter)]
     if verbose:
-        __teePrintOrNot(f"Header: \n{escapedHeader}",teeLogger=teeLogger)
-        __teePrintOrNot(f"First line: \n{escapedLine}",teeLogger=teeLogger)
-    headerList = header.strip().lower().split(delimiter)
-    lineList = line.strip().lower().split(delimiter)
-    if len(headerList) != len(lineList) or any([headerList[i] not in lineList[i] for i in range(len(headerList))]):
-        __teePrintOrNot(f"Header mismatch: \n{escapedLine} \n!= \n{escapedHeader}",teeLogger=teeLogger)
+        __teePrintOrNot(f"Header: \n{header:r}",teeLogger=teeLogger)
+        __teePrintOrNot(f"First line: \n{line:r}",teeLogger=teeLogger)
+    if len(header) != len(line) or any([header[i] not in line[i] for i in range(len(header))]):
+        __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header}",teeLogger=teeLogger)
         if strict:
             raise Exception("Data format error! Header mismatch")
         return False
@@ -385,11 +383,11 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
         return taskDic
     with open(fileName, mode ='rb')as file:
         correctColumnNum = -1
-        if header.strip():
+        if header.rstrip():
             if verifyHeader:
-                line = file.readline().decode(encoding=encoding).strip()
+                line = file.readline().decode(encoding=encoding)
                 if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
-                    correctColumnNum = len(header.strip().split(delimiter))
+                    correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         if lastLineOnly:
@@ -445,7 +443,7 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
     if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return
     if type(lineToAppend) == str:
-        lineToAppend = lineToAppend.strip().split(get_delimiter(delimiter))
+        lineToAppend = lineToAppend.strip().split(delimiter)
     else:
         for i in range(len(lineToAppend)):
             if type(lineToAppend[i]) != str:
@@ -456,11 +454,11 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
     
     with open(fileName, mode ='r+b')as file:
         correctColumnNum = len(lineToAppend)
-        if header.strip():
+        if header.rstrip():
             if verifyHeader:
-                line = file.readline().decode(encoding=encoding).strip()
+                line = file.readline().decode(encoding=encoding)
                 if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
-                    correctColumnNum = len(header.strip().split(get_delimiter(delimiter)))
+                    correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         # truncate / fill the lineToAppend to the correct number of columns
@@ -509,8 +507,8 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
         raise Exception("Something catastrophic happened! File still not found after creation")
     else:
         with open(fileName, mode ='r+',encoding=encoding)as file:
-            if header.strip() and verifyHeader:
-                line = file.readline().strip()
+            if header.rstrip() and verifyHeader:
+                line = file.readline()
                 if not __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     __teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
                 file.truncate()
