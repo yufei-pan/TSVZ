@@ -4,13 +4,14 @@ from collections import OrderedDict , deque
 import time
 import atexit
 import threading
+import re
 
 if os.name == 'nt':
     import msvcrt
 elif os.name == 'posix':
     import fcntl
 
-version = '3.01'
+version = '3.02'
 author = 'pan@zopyr.us'
 
 DEFAULT_DELIMITER = '\t'
@@ -70,7 +71,9 @@ def pretty_format_table(data, delimiter = DEFAULT_DELIMITER):
     col_widths = [0] * num_cols
     # Calculate the maximum width of each column
     for c in range(num_cols):
-        col_widths[c] = max(len(row[c]) for row in data)
+        #col_widths[c] = max(len(row[c]) for row in data)
+        # handle ansii escape sequences
+        col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
     # Build the row format string
     row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
     # Print the header
@@ -262,7 +265,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
     #     header = ''
     return header
 
-def __lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = DEFAULT_DELIMITER):
+def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = DEFAULT_DELIMITER):
     """
     Verify if a line contains the header.
 
@@ -279,8 +282,8 @@ def __lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fa
     header = [segment.rstrip() for segment in header.split(delimiter)]
     line = [segment.rstrip() for segment in line.split(delimiter)]
     if verbose:
-        __teePrintOrNot(f"Header: \n{header:r}",teeLogger=teeLogger)
-        __teePrintOrNot(f"First line: \n{line:r}",teeLogger=teeLogger)
+        __teePrintOrNot(f"Header: \n{header}",teeLogger=teeLogger)
+        __teePrintOrNot(f"First line: \n{line}",teeLogger=teeLogger)
     if len(header) != len(line) or any([header[i] not in line[i] for i in range(len(header))]):
         __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header}",teeLogger=teeLogger)
         if strict:
@@ -386,7 +389,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
         if header.rstrip():
             if verifyHeader:
                 line = file.readline().decode(encoding=encoding)
-                if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -457,7 +460,7 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
         if header.rstrip():
             if verifyHeader:
                 line = file.readline().decode(encoding=encoding)
-                if __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -509,7 +512,7 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
         with open(fileName, mode ='r+',encoding=encoding)as file:
             if header.rstrip() and verifyHeader:
                 line = file.readline()
-                if not __lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     __teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
                 file.truncate()
             else:
@@ -535,7 +538,7 @@ def get_time_ns():
         return int(time.time()*1e9)
     
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
-class TSVZed(dict):
+class TSVZed(OrderedDict):
     def __teePrintOrNot(self,message,level = 'info'):
         try:
             if self.teeLogger:
@@ -872,7 +875,7 @@ memoryOnly:{self.memoryOnly}
             overWrite = False
             line = file.readline().decode(self.encoding)
             aftPos = file.tell()
-            if self.header and not __lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
+            if self.header and not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
                 file.seek(0)
                 file.write(f'{self.header}\n'.encode(encoding=self.encoding))
                 # if the header is not the same length as the line, we need to overwrite the file

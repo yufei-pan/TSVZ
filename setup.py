@@ -1,8 +1,9 @@
 from setuptools import setup
+from TSVZ import version
 
 setup(
     name='TSVZ',
-    version='2.70',  
+    version=version,  
     py_modules=['TSVZ'],  # List of module names (without .py)
     description='An simple in memory wrapper around a TSV file to function as a database',
     author='Yufei Pan',
@@ -22,4 +23,5 @@ setup(
     python_requires='>=3.6',
 	long_description=open('README.md').read(),
 	long_description_content_type='text/markdown',
+	license='GPLv3+',
 )
