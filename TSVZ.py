@@ -11,10 +11,11 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.02'
+version = '3.10'
 author = 'pan@zopyr.us'
 
 DEFAULT_DELIMITER = '\t'
+DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 
 def get_delimiter(delimiter,file_name = ''):
     if not delimiter:
@@ -109,7 +110,7 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
     except Exception as e:
         print(message,flush=True)
 
-def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER):
+def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER,defaults = []):
     """
     Process a line of text and update the task dictionary.
 
@@ -120,6 +121,7 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
     verbose (bool, optional): Whether to print verbose output. Defaults to False.
     teeLogger (object, optional): The tee logger object for printing output. Defaults to None.
     strict (bool, optional): Whether to strictly enforce the correct number of columns. Defaults to True.
+    defaults (list, optional): The default values to use for missing columns. Defaults to [].
 
     Returns:
     tuple: A tuple containing the updated correctColumnNum and the processed lineCache.
@@ -131,36 +133,40 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
         if verbose:
             __teePrintOrNot(f"Ignoring empty line: {line}",teeLogger=teeLogger)
         return correctColumnNum , []
-    if line.startswith('#'):
+    if line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY):
         if verbose:
             __teePrintOrNot(f"Ignoring comment line: {line}",teeLogger=teeLogger)
         return correctColumnNum , []
     # we only interested in the lines that have the correct number of columns
-    lineCache = [segment.strip() for segment in line.split(delimiter)]
+    lineCache = [segment.rstrip() for segment in line.split(delimiter)]
     if not lineCache:
         return correctColumnNum , []
     if correctColumnNum == -1:
+        if defaults and len(defaults) > 1:
+            correctColumnNum = len(defaults)
+        else:
+            correctColumnNum = len(lineCache)
         if verbose:
             __teePrintOrNot(f"detected correctColumnNum: {len(lineCache)}",teeLogger=teeLogger)
-        correctColumnNum = len(lineCache)
     if not lineCache[0]:
         if verbose:
             __teePrintOrNot(f"Ignoring line with empty key: {line}",teeLogger=teeLogger)
         return correctColumnNum , []
     if len(lineCache) == 1 or not any(lineCache[1:]):
-        if correctColumnNum == 1: taskDic[lineCache[0]] = lineCache
+        if correctColumnNum == 1: 
+            taskDic[lineCache[0]] = lineCache
+        elif lineCache[0] == DEFAULTS_INDICATOR_KEY:
+            if verbose:
+                __teePrintOrNot(f"Empty defaults line found: {line}",teeLogger=teeLogger)
+            defaults = []
         else:
             if verbose:
                 __teePrintOrNot(f"Key {lineCache[0]} found with empty value, deleting such key's representaion",teeLogger=teeLogger)
             if lineCache[0] in taskDic:
                 del taskDic[lineCache[0]]
         return correctColumnNum , []
-    elif len(lineCache) == correctColumnNum:
-        taskDic[lineCache[0]] = lineCache
-        if verbose:
-            __teePrintOrNot(f"Key {lineCache[0]} added",teeLogger=teeLogger)
-    else:
-        if strict:
+    elif len(lineCache) != correctColumnNum:
+        if strict and not any(defaults):
             if verbose:
                 __teePrintOrNot(f"Ignoring line with {len(lineCache)} columns: {line}",teeLogger=teeLogger)
             return correctColumnNum , []
@@ -170,12 +176,26 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
                 lineCache += ['']*(correctColumnNum-len(lineCache))
             elif len(lineCache) > correctColumnNum:
                 lineCache = lineCache[:correctColumnNum]
-            taskDic[lineCache[0]] = lineCache
             if verbose:
-                __teePrintOrNot(f"Key {lineCache[0]} added after correction",teeLogger=teeLogger)
+                __teePrintOrNot(f"Correcting {lineCache[0]}",teeLogger=teeLogger)
+    # now replace empty values with defaults
+    if defaults and len(defaults) > 1:
+        for i in range(1,len(lineCache)):
+            if not lineCache[i] and i < len(defaults) and defaults[i]:
+                lineCache[i] = defaults[i]
+                if verbose:
+                    __teePrintOrNot(f"Replacing empty value at {i} with default: {defaults[i]}",teeLogger=teeLogger)
+    if lineCache[0] == DEFAULTS_INDICATOR_KEY:
+        if verbose:
+            __teePrintOrNot(f"Defaults line found: {line}",teeLogger=teeLogger)
+        defaults = lineCache
+        return correctColumnNum , []
+    taskDic[lineCache[0]] = lineCache
+    if verbose:
+        __teePrintOrNot(f"Key {lineCache[0]} added",teeLogger=teeLogger)
     return correctColumnNum, lineCache
 
-def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,encoding = 'utf8',delimiter = ...):
+def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,encoding = 'utf8',delimiter = ...,defaults = []):
     """
     Reads the last valid line from a file.
 
@@ -187,6 +207,8 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
         teeLogger (optional): Logger to use for tee print. Defaults to None.
         encoding (str, optional): The encoding of the file. Defaults to None.
         strict (bool, optional): Whether to enforce strict processing. Defaults to False.
+        delimiter (str, optional): The delimiter used in the file. Defaults to None.
+        defaults (list, optional): The default values to use for missing columns. Defaults to [].
 
     Returns:
         list: The last valid line data processed by processLine, or an empty list if none found.
@@ -220,13 +242,14 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
                 if lines[i].strip():  # Skip empty lines
                     # Process the line
                     correctColumnNum, lineCache = _processLine(
-                        lines[i].decode(encoding=encoding),
-                        taskDic,
-                        correctColumnNum,
+                        line=lines[i].decode(encoding=encoding),
+                        taskDic=taskDic,
+                        correctColumnNum=correctColumnNum,
                         verbose=verbose,
                         teeLogger=teeLogger,
                         strict=strict,
-                        delimiter=delimiter
+                        delimiter=delimiter,
+                        defaults=defaults,
                     )
                     # If the line is valid, return it
                     if lineCache and any(lineCache):
@@ -327,7 +350,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
             return False
     return True
 
-def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t'):
+def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = []):
     """
     Compatibility method, calls readTabularFile. 
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
@@ -344,6 +367,7 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
     - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t'.
+    - defaults (list, optional): The default values to use for missing columns. Defaults to [].
 
     Returns:
     - OrderedDict: The dictionary containing the data from the Tabular file.
@@ -352,9 +376,9 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     - Exception: If the file is not found or there is a data format error.
 
     """
-    return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter)
+    return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
 
-def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...):
+def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = []):
     """
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
 
@@ -370,6 +394,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
     - encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
     - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+    - defaults (list, optional): The default values to use for missing columns. Defaults to [].
 
     Returns:
     - OrderedDict: The dictionary containing the data from the Tabular file.
@@ -394,12 +419,12 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
         if lastLineOnly:
-            lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
+            lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults)
             if lineCache:
                 taskDic[lineCache[0]] = lineCache
             return lineCache
         for line in file:
-            correctColumnNum, lineCache = _processLine(line.decode(encoding=encoding),taskDic,correctColumnNum,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter=delimiter)
+            correctColumnNum, lineCache = _processLine(line.decode(encoding=encoding),taskDic,correctColumnNum,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter=delimiter,defaults = defaults)
     return taskDic
 
 def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):
@@ -446,7 +471,7 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
     if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return
     if type(lineToAppend) == str:
-        lineToAppend = lineToAppend.strip().split(delimiter)
+        lineToAppend = lineToAppend.split(delimiter)
     else:
         for i in range(len(lineToAppend)):
             if type(lineToAppend[i]) != str:
@@ -548,14 +573,16 @@ class TSVZed(OrderedDict):
         except Exception as e:
             print(message,flush=True)
 
-    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...):
+    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...,defualts = [],strict = False):
         super().__init__()
         self.version = version
+        self.strict = strict
         self.externalFileUpdateTime = getFileUpdateTimeNs(fileName)
         self.lastUpdateTime = self.externalFileUpdateTime
         self._fileName = fileName
         self.teeLogger = teeLogger
         self.delimiter = get_delimiter(delimiter,file_name=fileName)
+        self.defaults = defualts
         self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
         self.correctColumnNum = -1
         self.createIfNotExist = createIfNotExist
@@ -584,6 +611,27 @@ class TSVZed(OrderedDict):
         self.load()
         atexit.register(self.stopAppendThread)
 
+    def setDefaults(self,defaults):
+        if not defaults:
+            defaults = []
+            return
+        if isinstance(defaults,str):
+            defaults = defaults.split(self.delimiter)
+        elif not isinstance(defaults,list):
+            try:
+                defaults = list(defaults)
+            except:
+                if self.verbose:
+                    self.__teePrintOrNot('Invalid defaults, setting defaults to empty.','error')
+                defaults = []
+                return
+        if not any(defaults):
+            defaults = []
+            return
+        if defaults[0] != DEFAULTS_INDICATOR_KEY:
+            defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+        self.defaults = defaults
+
     def load(self):
         self.reload()
         if self.rewrite_on_load:
@@ -597,7 +645,7 @@ class TSVZed(OrderedDict):
         if self.verbose:
             self.__teePrintOrNot(f"Loading {self._fileName}")
         super().clear()
-        readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header, createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None, strict = False, delimiter = self.delimiter)
+        readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header, createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None, strict = self.strict, delimiter = self.delimiter, defaults=self.defaults)
         if self.verbose:
             self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
         self.correctColumnNum = len(self.header.split(self.delimiter)) if (self.header and self.verifyHeader) else (len(self[next(iter(self))]) if self else -1)
@@ -612,30 +660,55 @@ class TSVZed(OrderedDict):
         return self
     
     def __setitem__(self,key,value):
-        key = str(key).strip()
+        key = str(key).rstrip()
         if not key:
             self.__teePrintOrNot('Key cannot be empty','error')
             return
         if type(value) == str:
-            value = value.strip().split(self.delimiter)
+            value = value.split(self.delimiter)
         # sanitize the value
-        value = [(str(segment).strip() if type(segment) != str else segment.strip()) if segment else '' for segment in value]
-        #value = list(map(lambda segment: str(segment).strip(), value))
+        value = [(str(segment).rstrip() if type(segment) != str else segment.rstrip()) if segment else '' for segment in value]
+        # escape the delimiter and newline characters
+        value = [segment.replace(self.delimiter,'<sep>').replace('\n','\\n') for segment in value]
         # the first field in value should be the key
         # add it if it is not there
         if not value or value[0] != key:
             value = [key]+value
         # verify the value has the correct number of columns
         if self.correctColumnNum != 1 and len(value) == 1:
-            # this means we want to clear / deelte the key
+            # this means we want to clear / delete the key
             self.__delitem__(key)
         elif self.correctColumnNum > 0:
-            assert len(value) == self.correctColumnNum, f"Data format error! Expected {self.correctColumnNum} columns, but got {len(value) } columns"
+            if len(value) != self.correctColumnNum:
+                if self.strict:
+                    self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
+                    return
+                elif self.verbose:
+                    self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}, correcting...",'warning')
+                if len(value) < self.correctColumnNum:
+                    value += ['']*(self.correctColumnNum-len(value))
+                elif len(value) > self.correctColumnNum:
+                    value = value[:self.correctColumnNum]
         else:
             self.correctColumnNum = len(value)
+        if self.defaults and len(self.defaults) > 1:
+            for i in range(1,len(value)):
+                if not value[i] and i < len(self.defaults) and self.defaults[i]:
+                    value[i] = self.defaults[i]
+                    if self.verbose:
+                        self.__teePrintOrNot(f"    Replacing empty value at {i} with default: {self.defaults[i]}")
+        if key == DEFAULTS_INDICATOR_KEY:
+            self.defaults = value
+            if self.verbose:
+                self.__teePrintOrNot(f"Defaults set to {value}")
+            if not self.memoryOnly:
+                self.appendQueue.append(self.delimiter.join(value))
+                self.lastUpdateTime = get_time_ns()
+                if self.verbose:
+                    self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+            return
         if self.verbose:
             self.__teePrintOrNot(f"Setting {key} to {value}")
-
         if key in self:
             if self[key] == value:
                 if self.verbose:
@@ -644,9 +717,13 @@ class TSVZed(OrderedDict):
             self.dirty = True
         # update the dictionary, 
         super().__setitem__(key,value)
-        if self.verbose:
-            self.__teePrintOrNot(f"Key {key} updated")
         if self.memoryOnly:
+            if self.verbose:
+                self.__teePrintOrNot(f"Key {key} updated in memory only")
+            return
+        elif key.startswith('#'):
+            if self.verbose:
+                self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
             return
         if self.verbose:
             self.__teePrintOrNot(f"Appending {key} to the appendQueue")
@@ -659,16 +736,29 @@ class TSVZed(OrderedDict):
 
     
     def __delitem__(self,key):
-        key = str(key).strip()
+        key = str(key).rstrip()
+        if key == DEFAULTS_INDICATOR_KEY:
+            self.defaults = []
+            if self.verbose:
+                self.__teePrintOrNot(f"Defaults cleared")
+            if not self.memoryOnly:
+                self.__appendEmptyLine(key)
+                if self.verbose:
+                    self.__teePrintOrNot(f"Appending empty default line {key}")
+            return
         # delete the key from the dictionary and update the file
         if key not in self:
             if self.verbose:
                 self.__teePrintOrNot(f"Key {key} not found")
             return
         super().__delitem__(key)
-        if self.memoryOnly:
+        if self.memoryOnly or key.startswith('#'):
+            if self.verbose:
+                self.__teePrintOrNot(f"Key {key} deleted in memory")
             return
         self.__appendEmptyLine(key)
+        if self.verbose:
+            self.__teePrintOrNot(f"Appending empty line {key}")
         self.lastUpdateTime = get_time_ns()
         
     def __appendEmptyLine(self,key):
@@ -868,30 +958,35 @@ memoryOnly:{self.memoryOnly}
         return self
     
     def mapToFile(self):
+        mec = self.monitor_external_changes
+        self.monitor_external_changes = False
         try:
             if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
                 self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
             file = self.get_file_obj('r+b')
             overWrite = False
-            line = file.readline().decode(self.encoding)
-            aftPos = file.tell()
-            if self.header and not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = False):
-                file.seek(0)
-                file.write(f'{self.header}\n'.encode(encoding=self.encoding))
-                # if the header is not the same length as the line, we need to overwrite the file
-                if aftPos != file.tell():
-                    overWrite = True
-                if self.verbose:
-                    self.__teePrintOrNot(f"Header {self.header} written to {self._fileName}")
+            if self.header:
+                line = file.readline().decode(self.encoding)
+                aftPos = file.tell()
+                if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict):
+                    file.seek(0)
+                    file.write(f'{self.header}\n'.encode(encoding=self.encoding))
+                    # if the header is not the same length as the line, we need to overwrite the file
+                    if aftPos != file.tell():
+                        overWrite = True
+                    if self.verbose:
+                        self.__teePrintOrNot(f"Header {self.header} written to {self._fileName}")
             for value in self.values():
-                strToWrite = self.delimiter.join(value)+'\n'
+                if value[0].startswith('#'):
+                    continue
+                strToWrite = self.delimiter.join(value)
                 if overWrite:
                     if self.verbose:
                         self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
-                    file.write(strToWrite.encode(encoding=self.encoding))
+                    file.write(strToWrite.encode(encoding=self.encoding)+b'\n')
                     continue
                 pos = file.tell()
-                line = file.readline().decode(encoding=self.encoding)
+                line = file.readline()
                 aftPos = file.tell()
                 if not line or pos == aftPos:
                     if self.verbose:
@@ -899,13 +994,14 @@ memoryOnly:{self.memoryOnly}
                     file.write(strToWrite.encode(encoding=self.encoding))
                     overWrite = True
                     continue
+                strToWrite = strToWrite.encode(encoding=self.encoding).ljust(len(line)-1)+b'\n'
                 if line != strToWrite:
                     if self.verbose:
-                        self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
+                        self.__teePrintOrNot(f"Modifing {value} to {self._fileName}")
                     file.seek(pos)
                     # fill the string with space to write to the correct length
                     #file.write(strToWrite.rstrip('\n').ljust(len(line)-1)+'\n')
-                    file.write(strToWrite.encode(encoding=self.encoding).rstrip(b'\n').ljust(len(line)-1)+b'\n')
+                    file.write(strToWrite)
                     if aftPos != file.tell():
                         overWrite = True
             file.truncate()
@@ -921,6 +1017,8 @@ memoryOnly:{self.memoryOnly}
             import traceback
             self.__teePrintOrNot(traceback.format_exc(),'error')
             self.deSynced = True
+        self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+        self.monitor_external_changes = mec
         return self
     
     def checkExternalChanges(self):
@@ -1062,7 +1160,10 @@ def __main__():
     parser.add_argument('line', type=str, nargs='*', help='The line to append to the Tabular file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
     parser.add_argument('-d', '--delimiter', type=str, help='The delimiter of the Tabular file. Default: Infer from last part of filename, or tab if cannot determine. Note: accept unicode escaped char, raw char, or string "comma,tab,null" will refer to their characters. ', default=...)
     parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the Tabular file. seperate using --delimiter.')
-    parser.add_argument('-f', '--force', action='store_true', help='Force the operation. Ignore checks for column numbers / headers')
+    parser.add_argument('--defaults', type=str, help='Default values to fill in the missing columns. seperate using --delimiter. Ex. if -d = comma, --defaults="key,value1,value2..." Note: Please specify the key. But it will not be used as a key need to be unique in data.')
+    strictMode = parser.add_mutually_exclusive_group()
+    strictMode.add_argument('-s', '--strict', dest = 'strict',action='store_true', help='Strict mode. Do not parse values that seems malformed, check for column numbers / headers')
+    strictMode.add_argument('-f', '--force', dest = 'strict',action='store_false', help='Force the operation. Ignore checks for column numbers / headers')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version} by {author}')
     args = parser.parse_args()
@@ -1074,6 +1175,13 @@ def __main__():
     except Exception as e:
         print(f"Failed to decode header: {args.header}")
         header = ''
+    defaults = []
+    if args.defaults:
+        try:
+            defaults = args.defaults.encode().decode('unicode_escape').split(args.delimiter)
+        except Exception as e:
+            print(f"Failed to decode defaults: {args.defaults}")
+            defaults = []
 
     if args.operation == 'read':
         # check if the file exist
@@ -1081,14 +1189,14 @@ def __main__():
             print(f"File not found: {args.filename}")
             return
         # read the file
-        data = readTabularFile(args.filename, verifyHeader = False, verbose=args.verbose,strict= not args.force, delimiter=args.delimiter)
+        data = readTabularFile(args.filename, verifyHeader = False, verbose=args.verbose,strict= args.strict, delimiter=args.delimiter, defaults=defaults)
         print(pretty_format_table(data.values(),delimiter=args.delimiter))
     elif args.operation == 'append':
-        appendTabularFile(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force, delimiter=args.delimiter)
+        appendTabularFile(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= args.strict, delimiter=args.delimiter)
     elif args.operation == 'delete':
-        appendTabularFile(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= not args.force, delimiter=args.delimiter)
+        appendTabularFile(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= args.strict, delimiter=args.delimiter)
     elif args.operation == 'clear':
-        clearTabularFile(args.filename, header=header, verbose=args.verbose, verifyHeader=not args.force, delimiter=args.delimiter)
+        clearTabularFile(args.filename, header=header, verbose=args.verbose, verifyHeader=args.strict, delimiter=args.delimiter)
     else:
         print("Invalid operation")
         return

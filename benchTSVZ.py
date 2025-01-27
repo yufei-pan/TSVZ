@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-import TSVZDic as TSVZ
+import TSVZ
 import argparse
 import sys
 import time
