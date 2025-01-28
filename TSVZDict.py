@@ -11,13 +11,12 @@ try:
     import resource
 except:
     RESOURCE_LIB_AVAILABLE = False
-
 if os.name == 'nt':
     import msvcrt
 elif os.name == 'posix':
     import fcntl
 
-version = '3.11'
+version = '3.10'
 author = 'pan@zopyr.us'
 
 DEFAULT_DELIMITER = '\t'
@@ -214,7 +213,6 @@ def get_resource_usage(return_dict = False):
         if return_dict:
             return {}
         return ''
-
 def __teePrintOrNot(message,level = 'info',teeLogger = None):
     """
     Prints the given message or logs it using the provided teeLogger.
@@ -688,7 +686,7 @@ def get_time_ns():
         return int(time.time()*1e9)
     
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
-class TSVZed(OrderedDict):
+class TSVZed(dict):
     def __teePrintOrNot(self,message,level = 'info'):
         try:
             if self.teeLogger:
@@ -697,9 +695,6 @@ class TSVZed(OrderedDict):
                 print(message,flush=True)
         except Exception as e:
             print(message,flush=True)
-
-    def getResourseUsage(self,return_dict = False):
-        return get_resource_usage(return_dict = return_dict)
 
     def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...,defualts = [],strict = False):
         super().__init__()
@@ -738,6 +733,9 @@ class TSVZed(OrderedDict):
         self.appendThread.start()
         self.load()
         atexit.register(self.stopAppendThread)
+
+    def getResourseUsage(self,return_dict = False):
+        return get_resource_usage(return_dict = return_dict)
 
     def setDefaults(self,defaults):
         if not defaults:
@@ -971,17 +969,26 @@ memoryOnly:{self.memoryOnly}
     
     def __str__(self):
         return f"TSVZed({self._fileName},{dict(self)})"
+    
+    def __eq__(self,other):
+        # also check ordering
+        return super().__eq__(other) and all(k1 == k2 for k1,k2 in zip(self,other))
 
     def __del__(self):
         self.stopAppendThread()
         return self
 
     def popitem(self, last=True):
-        key, value = super().popitem(last)
-        if not self.memoryOnly:
-            self.__appendEmptyLine(key)
-        self.lastUpdateTime = get_time_ns()
-        return key, value
+        # key, value = super().popitem(last)
+        # if not self.memoryOnly:
+        #     self.__appendEmptyLine(key)
+        # self.lastUpdateTime = get_time_ns()
+        # return key, value
+        if last:
+            key, value = super().popitem(last)
+        else:
+            key = next(iter(self))
+            value = self.pop(key)
     
     __marker = object()
 
@@ -1001,20 +1008,20 @@ memoryOnly:{self.memoryOnly}
         self.lastUpdateTime = get_time_ns()
         return value
     
-    def move_to_end(self, key, last=True):
-        '''Move an existing element to the end (or beginning if last is false).
-        Raise KeyError if the element does not exist.
-        '''
-        super().move_to_end(key, last)
-        self.dirty = True
-        if not self.rewrite_on_exit:
-            self.rewrite_on_exit = True
-            self.__teePrintOrNot(f"Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
-            self.__teePrintOrNot(f"rewrite_on_exit set to True")
-        if self.verbose:
-            self.__teePrintOrNot(f"Warning: Trying to move Key {key} moved to {'end' if last else 'beginning'} Need to resync for changes to apply to disk")
-        self.lastUpdateTime = get_time_ns()
-        return self
+    # def move_to_end(self, key, last=True):
+    #     '''Move an existing element to the end (or beginning if last is false).
+    #     Raise KeyError if the element does not exist.
+    #     '''
+    #     super().move_to_end(key, last)
+    #     self.dirty = True
+    #     if not self.rewrite_on_exit:
+    #         self.rewrite_on_exit = True
+    #         self.__teePrintOrNot(f"Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
+    #         self.__teePrintOrNot(f"rewrite_on_exit set to True")
+    #     if self.verbose:
+    #         self.__teePrintOrNot(f"Warning: Trying to move Key {key} moved to {'end' if last else 'beginning'} Need to resync for changes to apply to disk")
+    #     self.lastUpdateTime = get_time_ns()
+    #     return self
     
     @classmethod
     def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False):

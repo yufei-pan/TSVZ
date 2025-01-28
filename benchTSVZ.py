@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-import TSVZ
+import TSVZDict as TSVZ
 import argparse
 import sys
 import time
@@ -21,6 +21,7 @@ if __name__ == '__main__':
 	testDic = TSVZ.TSVZed(fileName,rewrite_interval=0,createIfNotExist=True,rewrite_on_exit=False,rewrite_on_load=False,verbose=args.verbose,)
 	endTime = time.perf_counter()
 	print(f"Time to create / load TSVZed object: {endTime-startTime} seconds")
+	print(TSVZ.get_resource_usage())
 	startTime = time.perf_counter()
 	for i in range(number):
 		testDic[str(i)] = [str(i)]*6
@@ -28,10 +29,12 @@ if __name__ == '__main__':
 		#sys.stdout.flush()
 	endTime = time.perf_counter()
 	print(f"Time to write {number} entries: {endTime-startTime} seconds")
+	print(TSVZ.get_resource_usage())
 	testDic.close()
 	del testDic
 	testDic = TSVZ.TSVZed(fileName,rewrite_interval=0,createIfNotExist=True,rewrite_on_exit=False,rewrite_on_load=False,verbose=args.verbose)
 	testDic.memoryOnly = True
+	print(TSVZ.get_resource_usage())
 	startTime = time.perf_counter()
 	for i in range(number):
 		testDic[str(i)] = [str(i)]*6
@@ -39,7 +42,7 @@ if __name__ == '__main__':
 		#sys.stdout.flush()
 	endTime = time.perf_counter()
 	print(f"Time to write {number} entries in memory only mode: {endTime-startTime} seconds")
-
+	print(TSVZ.get_resource_usage())
 	startTime = time.perf_counter()
 	testDic.mapToFile()
 	endTime = time.perf_counter()
