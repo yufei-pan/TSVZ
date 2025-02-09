@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.6"
+# dependencies = [
+# ]
+# ///
 import os , sys
 from collections import OrderedDict , deque
 import time
