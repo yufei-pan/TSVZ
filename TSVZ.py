@@ -22,7 +22,8 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.11'
+version = '3.12'
+__version__ = version
 author = 'pan@zopyr.us'
 
 DEFAULT_DELIMITER = '\t'
