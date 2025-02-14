@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.12'
+version = '3.13'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -597,22 +597,45 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
     - Exception: If the file does not exist and createIfNotExist is False.
     - Exception: If the existing header does not match the provided header.
     """
+    return appendLinesTabularFile(fileName,[lineToAppend],teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter)
+
+def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...):
+    """
+    Append lines of data to a Tabular file.
+    Parameters:
+    - fileName (str): The path of the Tabular file.
+    - linesToAppend (list): The lines of data to append. If it is a list of string, then each string will be split by delimiter to form a list.
+    - teeLogger (optional): A logger object for logging messages.
+    - header (str, optional): The header line to verify against. If provided, the function will check if the existing header matches the provided header.
+    - createIfNotExist (bool, optional): If True, the file will be created if it does not exist. If False and the file does not exist, an exception will be raised.
+    - verifyHeader (bool, optional): If True, the function will verify if the existing header matches the provided header. If False, the header will not be verified.
+    - verbose (bool, optional): If True, additional information will be printed during the execution.
+    - encoding (str, optional): The encoding of the file.
+    - strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+    - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+    Raises:
+    - Exception: If the file does not exist and createIfNotExist is False.
+    - Exception: If the existing header does not match the provided header.
+    """
     delimiter = get_delimiter(delimiter,file_name=fileName)
     header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
     if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return
-    if type(lineToAppend) == str:
-        lineToAppend = lineToAppend.split(delimiter)
-    else:
-        for i in range(len(lineToAppend)):
-            if type(lineToAppend[i]) != str:
-                try:
-                    lineToAppend[i] = str(lineToAppend[i])
-                except Exception as e:
-                    lineToAppend[i] = str(e)
+    formatedLines = []
+    for line in linesToAppend:
+        if type(line) == str:
+            line = line.split(delimiter)
+        else:
+            for i in range(len(line)):
+                if type(line[i]) != str:
+                    try:
+                        line[i] = str(line[i])
+                    except Exception as e:
+                        line[i] = str(e)
+        formatedLines.append(line)
     
     with open(fileName, mode ='r+b')as file:
-        correctColumnNum = len(lineToAppend)
+        correctColumnNum = max([len(line) for line in formatedLines])
         if header.rstrip():
             if verifyHeader:
                 line = file.readline().decode(encoding=encoding)
@@ -620,18 +643,19 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
                     correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-        # truncate / fill the lineToAppend to the correct number of columns
-        if len(lineToAppend) < correctColumnNum:
-            lineToAppend += ['']*(correctColumnNum-len(lineToAppend))
-        elif len(lineToAppend) > correctColumnNum:
-            lineToAppend = lineToAppend[:correctColumnNum]
+        # truncate / fill the lines to the correct number of columns
+        for i in range(len(formatedLines)):
+            if len(formatedLines[i]) < correctColumnNum:
+                formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
+            elif len(formatedLines[i]) > correctColumnNum:
+                formatedLines[i] = formatedLines[i][:correctColumnNum]
         # check if the file ends in a newline
         file.seek(-1, os.SEEK_END)
         if file.read(1) != b'\n':
             file.write(b'\n')
-        file.write(get_delimiter(delimiter).join(lineToAppend).encode(encoding=encoding) + b'\n')
+        file.write(b'\n'.join([delimiter.join(line).encode(encoding=encoding) for line in formatedLines]) + b'\n')
         if verbose:
-            __teePrintOrNot(f"Appended {lineToAppend} to {fileName}",teeLogger=teeLogger)
+            __teePrintOrNot(f"Appended {len(formatedLines)} lines to {fileName}",teeLogger=teeLogger)
 
 def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t'):
     """
