@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.14'
+version = '3.15'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -235,7 +235,10 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
     """
     try:
         if teeLogger:
-            teeLogger.teelog(message,level)
+            try:
+                teeLogger.teelog(message,level,callerStackDepth=3)
+            except:
+                teeLogger.teelog(message,level)
         else:
             print(message,flush=True)
     except Exception as e:
