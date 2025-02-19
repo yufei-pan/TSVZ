@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.13'
+version = '3.14'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -289,7 +289,7 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
         elif lineCache[0] == DEFAULTS_INDICATOR_KEY:
             if verbose:
                 __teePrintOrNot(f"Empty defaults line found: {line}",teeLogger=teeLogger)
-            defaults = []
+            defaults.clear()
         else:
             if verbose:
                 __teePrintOrNot(f"Key {lineCache[0]} found with empty value, deleting such key's representaion",teeLogger=teeLogger)
@@ -319,7 +319,7 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
     if lineCache[0] == DEFAULTS_INDICATOR_KEY:
         if verbose:
             __teePrintOrNot(f"Defaults line found: {line}",teeLogger=teeLogger)
-        defaults = lineCache
+        defaults[:] = lineCache
         return correctColumnNum , []
     taskDic[lineCache[0]] = lineCache
     if verbose:
