@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.17'
+version = '3.18'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -60,7 +60,7 @@ def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
     version = 1.11
     if not data:
         return ''
-    if type(data) == str:
+    if isinstance(data, str):
         data = data.strip('\n').split('\n')
         data = [line.split(delimiter) for line in data]
     elif isinstance(data, dict):
@@ -72,7 +72,7 @@ def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
         else:
             # it is a dict of lists
             data = [[key] + list(value) for key, value in data.items()]
-    elif type(data) != list:
+    elif not isinstance(data,list):
         data = list(data)
     # format the list into 2d list of list of strings
     if isinstance(data[0], dict):
@@ -428,7 +428,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
     Returns:
         str: The formatted header string.
     """
-    if type(header) != str:
+    if not isinstance(header,str):
         try:
             header = delimiter.join(header)
         except:
@@ -647,17 +647,22 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
         return
     formatedLines = []
     for line in linesToAppend:
-        if type(line) == str:
+        if isinstance(linesToAppend,dict):
+            key = line
+            line = linesToAppend[key]
+        if isinstance(line,str):
             line = line.split(delimiter)
-        else:
+        elif line:
             for i in range(len(line)):
-                if type(line[i]) != str:
+                if not isinstance(line[i],str):
                     try:
                         line[i] = str(line[i])
                     except Exception as e:
                         line[i] = str(e)
+        if isinstance(linesToAppend,dict):
+            if not line or line[0] != key:
+                line = [key]+line
         formatedLines.append(line)
-    
     with open(fileName, mode ='r+b')as file:
         correctColumnNum = max([len(line) for line in formatedLines])
         if header.rstrip():
@@ -846,10 +851,10 @@ class TSVZed(OrderedDict):
         if not key:
             self.__teePrintOrNot('Key cannot be empty','error')
             return
-        if type(value) == str:
+        if isinstance(value,str):
             value = value.split(self.delimiter)
         # sanitize the value
-        value = [(str(segment).rstrip() if type(segment) != str else segment.rstrip()) if segment else '' for segment in value]
+        value = [(str(segment).rstrip() if not isinstance(segment,str) else segment.rstrip()) if segment else '' for segment in value]
         # escape the delimiter and newline characters
         value = [segment.replace(self.delimiter,'<sep>').replace('\n','\\n') for segment in value]
         # the first field in value should be the key
