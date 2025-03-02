@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.15'
+version = '3.16'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -56,8 +56,8 @@ def get_delimiter(delimiter,file_name = ''):
     DEFAULT_DELIMITER = rtn
     return rtn
 
-def pretty_format_table(data, delimiter = DEFAULT_DELIMITER):
-    version = 1.0
+def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
+    version = 1.1
     if not data:
         return ''
     if type(data) == str:
@@ -90,16 +90,34 @@ def pretty_format_table(data, delimiter = DEFAULT_DELIMITER):
     # Build the row format string
     row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
     # Print the header
-    header = data[0]
-    outTable = []
-    outTable.append(row_format.format(*header))
-    outTable.append('-+-'.join('-' * width for width in col_widths))
-    for row in data[1:]:
-        # if the row is empty, print an divider
-        if not any(row):
-            outTable.append('-+-'.join('-' * width for width in col_widths))
-        else:
-            outTable.append(row_format.format(*row))
+    if not header:
+        header = data[0]
+        outTable = []
+        outTable.append(row_format.format(*header))
+        outTable.append('-+-'.join('-' * width for width in col_widths))
+        for row in data[1:]:
+            # if the row is empty, print an divider
+            if not any(row):
+                outTable.append('-+-'.join('-' * width for width in col_widths))
+            else:
+                outTable.append(row_format.format(*row))
+    else:
+        # pad / truncate header to appropriate length
+        if isinstance(header,str):
+            header = header.split(delimiter)
+        if len(header) < num_cols:
+            header += ['']*(num_cols-len(header))
+        elif len(header) > num_cols:
+            header = header[:num_cols]
+        outTable = []
+        outTable.append(row_format.format(*header))
+        outTable.append('-+-'.join('-' * width for width in col_widths))
+        for row in data:
+            # if the row is empty, print an divider
+            if not any(row):
+                outTable.append('-+-'.join('-' * width for width in col_widths))
+            else:
+                outTable.append(row_format.format(*row))
     return '\n'.join(outTable) + '\n'
 
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
