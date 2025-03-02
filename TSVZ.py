@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.16'
+version = '3.17'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -57,7 +57,7 @@ def get_delimiter(delimiter,file_name = ''):
     return rtn
 
 def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
-    version = 1.1
+    version = 1.11
     if not data:
         return ''
     if type(data) == str:
@@ -87,6 +87,9 @@ def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
         #col_widths[c] = max(len(row[c]) for row in data)
         # handle ansii escape sequences
         col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
+    if header:
+        header_widths = [len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', col)) for col in header]
+        col_widths = [max(col_widths[i], header_widths[i]) for i in range(num_cols)]
     # Build the row format string
     row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
     # Print the header
