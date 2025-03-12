@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.18'
+version = '3.19'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -30,6 +30,7 @@ DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 
 def get_delimiter(delimiter,file_name = ''):
+    global DEFAULT_DELIMITER
     if not delimiter:
         return DEFAULT_DELIMITER
     elif delimiter == ...:
