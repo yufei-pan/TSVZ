@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.19'
+version = '3.20'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -36,7 +36,7 @@ def get_delimiter(delimiter,file_name = ''):
     elif delimiter == ...:
         if not file_name:
             rtn =  '\t'
-        if file_name.endswith('.csv'):
+        elif file_name.endswith('.csv'):
             rtn =  ','
         elif file_name.endswith('.nsv'):
             rtn =  '\0'
@@ -59,6 +59,7 @@ def get_delimiter(delimiter,file_name = ''):
 
 def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
     version = 1.11
+    _ = version
     if not data:
         return ''
     if isinstance(data, str):
@@ -263,10 +264,10 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
                 teeLogger.teelog(message,level)
         else:
             print(message,flush=True)
-    except Exception as e:
+    except Exception:
         print(message,flush=True)
 
-def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER,defaults = []):
+def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER,defaults = None):
     """
     Process a line of text and update the task dictionary.
 
@@ -283,6 +284,8 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
     tuple: A tuple containing the updated correctColumnNum and the processed lineCache.
 
     """
+    if not defaults:
+        defaults = []
     line = line.strip(' ').strip('\x00').rstrip('\r\n')
     # we throw away the lines that start with '#'
     if not line :
@@ -466,7 +469,7 @@ def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fal
     if len(header) != len(line) or any([header[i] not in line[i] for i in range(len(header))]):
         __teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header}",teeLogger=teeLogger)
         if strict:
-            raise Exception("Data format error! Header mismatch")
+            raise ValueError("Data format error! Header mismatch")
         return False
     return True
 
@@ -501,7 +504,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
             return True
         elif strict:
             __teePrintOrNot('File not found','error',teeLogger=teeLogger)
-            raise Exception("File not found")
+            raise FileNotFoundError("File not found")
         else:
             return False
     return True
@@ -567,8 +570,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
         return taskDic
     with open(fileName, mode ='rb')as file:
         correctColumnNum = -1
-        if header.rstrip():
-            if verifyHeader:
+        if header.rstrip() and verifyHeader:
                 line = file.readline().decode(encoding=encoding)
                 if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     correctColumnNum = len(header.split(delimiter))
@@ -660,14 +662,12 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
                         line[i] = str(line[i])
                     except Exception as e:
                         line[i] = str(e)
-        if isinstance(linesToAppend,dict):
-            if not line or line[0] != key:
+        if isinstance(linesToAppend,dict) and not line or line[0] != key:
                 line = [key]+line
         formatedLines.append(line)
     with open(fileName, mode ='r+b')as file:
         correctColumnNum = max([len(line) for line in formatedLines])
-        if header.rstrip():
-            if verifyHeader:
+        if header.rstrip() and verifyHeader:
                 line = file.readline().decode(encoding=encoding)
                 if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
                     correctColumnNum = len(header.split(delimiter))
@@ -717,7 +717,7 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
     delimiter = get_delimiter(delimiter,file_name=fileName)
     header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
     if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
-        raise Exception("Something catastrophic happened! File still not found after creation")
+        raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
     else:
         with open(fileName, mode ='r+',encoding=encoding)as file:
             if header.rstrip() and verifyHeader:
@@ -755,13 +755,13 @@ class TSVZed(OrderedDict):
                 self.teeLogger.teelog(message,level)
             else:
                 print(message,flush=True)
-        except Exception as e:
+        except Exception:
             print(message,flush=True)
 
     def getResourseUsage(self,return_dict = False):
         return get_resource_usage(return_dict = return_dict)
 
-    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...,defualts = [],strict = False):
+    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...,defualts = None,strict = False):
         super().__init__()
         self.version = version
         self.strict = strict
@@ -770,7 +770,7 @@ class TSVZed(OrderedDict):
         self._fileName = fileName
         self.teeLogger = teeLogger
         self.delimiter = get_delimiter(delimiter,file_name=fileName)
-        self.defaults = defualts
+        self.defaults = defualts if defualts else []
         self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
         self.correctColumnNum = -1
         self.createIfNotExist = createIfNotExist
@@ -836,7 +836,12 @@ class TSVZed(OrderedDict):
         readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header, createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None, strict = self.strict, delimiter = self.delimiter, defaults=self.defaults)
         if self.verbose:
             self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-        self.correctColumnNum = len(self.header.split(self.delimiter)) if (self.header and self.verifyHeader) else (len(self[next(iter(self))]) if self else -1)
+        if self.header and self.verifyHeader:
+            self.correctColumnNum = len(self.header.split(self.delimiter))
+        elif self:
+            self.correctColumnNum = len(self[next(iter(self))])
+        else:
+            self.correctColumnNum = -1
         if self.verbose:
             self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
         #super().update(loadedData)
@@ -1002,9 +1007,12 @@ class TSVZed(OrderedDict):
     def __enter__(self):
         return self
     
-    def __exit__(self,exc_type,exc_value,traceback):
+    def close(self):
         self.stopAppendThread()
         return self
+
+    def __exit__(self,exc_type,exc_value,traceback):
+        return self.close()
     
     def __repr__(self):
         return f"""TSVZed(
@@ -1025,16 +1033,11 @@ deSynced:{self.deSynced}
 memoryOnly:{self.memoryOnly}
 {dict(self)})"""
     
-    def close(self):
-        self.stopAppendThread()
-        return self
-    
     def __str__(self):
         return f"TSVZed({self._fileName},{dict(self)})"
 
     def __del__(self):
-        self.stopAppendThread()
-        return self
+        return self.close()
 
     def popitem(self, last=True):
         key, value = super().popitem(last)
@@ -1360,14 +1363,14 @@ def __main__():
         args.header += '\\'
     try:
         header = args.header.encode().decode('unicode_escape') if args.header else ''
-    except Exception as e:
+    except Exception:
         print(f"Failed to decode header: {args.header}")
         header = ''
     defaults = []
     if args.defaults:
         try:
             defaults = args.defaults.encode().decode('unicode_escape').split(args.delimiter)
-        except Exception as e:
+        except Exception:
             print(f"Failed to decode defaults: {args.defaults}")
             defaults = []
 
@@ -1386,9 +1389,7 @@ def __main__():
     elif args.operation == 'clear':
         clearTabularFile(args.filename, header=header, verbose=args.verbose, verifyHeader=args.strict, delimiter=args.delimiter)
     else:
-        print("Invalid operation")
-        return
-    
+        print("Invalid operation")    
 if __name__ == '__main__':
     __main__()
 
