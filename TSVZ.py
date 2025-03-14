@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.20'
+version = '3.21'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -662,7 +662,8 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
                         line[i] = str(line[i])
                     except Exception as e:
                         line[i] = str(e)
-        if isinstance(linesToAppend,dict) and not line or line[0] != key:
+        if isinstance(linesToAppend,dict):
+            if (not line or line[0] != key):
                 line = [key]+line
         formatedLines.append(line)
     with open(fileName, mode ='r+b')as file:
