@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.22'
+version = '3.23'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -672,6 +672,10 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
             if (not line or line[0] != key):
                 line = [key]+line
         formatedLines.append(line)
+    if not formatedLines:
+        if verbose:
+            __teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
+        return
     with open(fileName, mode ='r+b')as file:
         correctColumnNum = max([len(line) for line in formatedLines])
         if header.rstrip() and verifyHeader:
