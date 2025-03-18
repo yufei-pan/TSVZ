@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.21'
+version = '3.22'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -498,10 +498,16 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
         __teePrintOrNot(f'Warning: Filename {fileName} does not end with .psv','warning',teeLogger=teeLogger)
     if not os.path.isfile(fileName):
         if createIfNotExist:
-            with open(fileName, mode ='w',encoding=encoding)as file:
-                file.write(header+'\n')
-            __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
-            return True
+            try:
+                with open(fileName, mode ='w',encoding=encoding)as file:
+                    file.write(header+'\n')
+                __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
+                return True
+            except:
+                __teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
+                if strict:
+                    raise FileNotFoundError("Failed to create file")
+                return False
         elif strict:
             __teePrintOrNot('File not found','error',teeLogger=teeLogger)
             raise FileNotFoundError("File not found")
