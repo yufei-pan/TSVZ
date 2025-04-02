@@ -22,7 +22,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.24'
+version = '3.25'
 __version__ = version
 author = 'pan@zopyr.us'
 
@@ -280,7 +280,7 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
     except Exception:
         print(message,flush=True)
 
-def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER,defaults = None):
+def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,strict = True,delimiter = DEFAULT_DELIMITER,defaults = ...):
     """
     Process a line of text and update the task dictionary.
 
@@ -297,7 +297,7 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
     tuple: A tuple containing the updated correctColumnNum and the processed lineCache.
 
     """
-    if not defaults:
+    if defaults is ...:
         defaults = []
     line = line.strip(' ').strip('\x00').rstrip('\r\n')
     # we throw away the lines that start with '#'
@@ -367,7 +367,7 @@ def _processLine(line,taskDic,correctColumnNum,verbose = False,teeLogger = None,
         __teePrintOrNot(f"Key {lineCache[0]} added",teeLogger=teeLogger)
     return correctColumnNum, lineCache
 
-def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,encoding = 'utf8',delimiter = ...,defaults = []):
+def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,encoding = 'utf8',delimiter = ...,defaults = ...):
     """
     Reads the last valid line from a file.
 
@@ -387,6 +387,8 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
     """
     chunk_size = 1024  # Read in chunks of 1024 bytes
     last_valid_line = []
+    if defaults is ...:
+        defaults = []
     delimiter = get_delimiter(delimiter,file_name=fileName)
     if verbose:
         __teePrintOrNot(f"Reading last line only from {fileName}",teeLogger=teeLogger)
@@ -528,7 +530,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
             return False
     return True
 
-def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = []):
+def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = ...):
     """
     Compatibility method, calls readTabularFile. 
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
@@ -556,7 +558,7 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     """
     return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
 
-def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = []):
+def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = ...):
     """
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
 
@@ -583,6 +585,8 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
     """
     if taskDic is None:
         taskDic = {}
+    if defaults is ...:
+        defaults = []
     delimiter = get_delimiter(delimiter,file_name=fileName)
     header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
     if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
