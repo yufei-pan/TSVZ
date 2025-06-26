@@ -22,10 +22,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.26'
+version = '3.27'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2025-05-19'
+COMMIT_DATE = '2025-06-25'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -736,20 +736,22 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
         if verbose:
             __teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
         return
+    correctColumnNum = max([len(line) for line in formatedLines])
+    
+    if header.rstrip() and verifyHeader:
+        with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
+            line = file.readline().decode(encoding=encoding,errors='replace')
+            if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                correctColumnNum = len(header.split(delimiter))
+                if verbose:
+                    __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
+    # truncate / fill the lines to the correct number of columns
+    for i in range(len(formatedLines)):
+        if len(formatedLines[i]) < correctColumnNum:
+            formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
+        elif len(formatedLines[i]) > correctColumnNum:
+            formatedLines[i] = formatedLines[i][:correctColumnNum]
     with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
-        correctColumnNum = max([len(line) for line in formatedLines])
-        if header.rstrip() and verifyHeader:
-                line = file.readline().decode(encoding=encoding,errors='replace')
-                if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
-                    correctColumnNum = len(header.split(delimiter))
-                    if verbose:
-                        __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-        # truncate / fill the lines to the correct number of columns
-        for i in range(len(formatedLines)):
-            if len(formatedLines[i]) < correctColumnNum:
-                formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
-            elif len(formatedLines[i]) > correctColumnNum:
-                formatedLines[i] = formatedLines[i][:correctColumnNum]
         # check if the file ends in a newline
         # file.seek(-1, os.SEEK_END)
         # if file.read(1) != b'\n':
