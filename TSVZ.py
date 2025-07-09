@@ -22,10 +22,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.27'
+version = '3.28'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2025-06-25'
+COMMIT_DATE = '2025-07-07'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -1410,16 +1410,21 @@ memoryOnly:{self.memoryOnly}
         return self
     
     def stopAppendThread(self):
-        if self.shutdownEvent.is_set():
-            # if self.verbose:
-            #     self.__teePrintOrNot(f"Append thread for {self._fileName} already stopped")
-            return
-        self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
-        # self.appendEvent.set()
-        self.shutdownEvent.set()  # Signal the append thread to shut down
-        self.appendThread.join()  # Wait for the append thread to complete 
-        if self.verbose:
-            self.__teePrintOrNot(f"Append thread for {self._fileName} stopped")
+        try:
+            if self.shutdownEvent.is_set():
+                # if self.verbose:
+                #     self.__teePrintOrNot(f"Append thread for {self._fileName} already stopped")
+                return
+            self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
+            # self.appendEvent.set()
+            self.shutdownEvent.set()  # Signal the append thread to shut down
+            self.appendThread.join()  # Wait for the append thread to complete 
+            if self.verbose:
+                self.__teePrintOrNot(f"Append thread for {self._fileName} stopped")
+        except Exception as e:
+            self.__teePrintOrNot(f"Failed to stop append thread for {self._fileName}: {e}",'error')
+            import traceback
+            self.__teePrintOrNot(traceback.format_exc(),'error')
     
     def get_file_obj(self,modes = 'ab'):
         self.writeLock.acquire()
