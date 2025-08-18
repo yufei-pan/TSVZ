@@ -22,10 +22,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.28'
+version = '3.29'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2025-07-07'
+COMMIT_DATE = '2025-08-11'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -885,6 +885,29 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
         appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
     return file
 
+def getListView(tsvzDic,header = [],delimiter = DEFAULT_DELIMITER):
+    if header:
+        if isinstance(header,str):
+            header = header.split(delimiter)
+        elif not isinstance(header,list):
+            try:
+                header = list(header)
+            except:
+                header = []
+    if not tsvzDic:
+        if not header:
+            return []
+        else:
+            return [header]
+    if not header:
+        return list(tsvzDic.values())
+    else:
+        values = list(tsvzDic.values())
+        if values[0] and values[0] == header:
+            return values
+        else:
+            return [header] + values
+
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class TSVZed(OrderedDict):
     def __teePrintOrNot(self,message,level = 'info'):
@@ -1105,6 +1128,9 @@ class TSVZed(OrderedDict):
             self.__teePrintOrNot(f"Appending {emptyLine} to the appendQueue")
         self.appendQueue.append(emptyLine)
         return self
+    
+    def getListView(self):
+        return getListView(self,header=self.header,delimiter=self.delimiter)
 
     def clear(self):
         # clear the dictionary and update the file
@@ -1539,6 +1565,3 @@ def __main__():
         print("Invalid operation")    
 if __name__ == '__main__':
     __main__()
-
-
-    
