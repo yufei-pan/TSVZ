@@ -22,10 +22,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.29'
+version = '3.30'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2025-08-11'
+COMMIT_DATE = '2025-09-15'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -573,7 +573,9 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
             return False
     return True
 
-def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = ...):
+def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
+            verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = ...,
+            correctColumnNum = -1):
     """
     Compatibility method, calls readTabularFile. 
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
@@ -591,6 +593,7 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
     - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t'.
     - defaults (list, optional): The default values to use for missing columns. Defaults to [].
+    - correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 
     Returns:
     - OrderedDict: The dictionary containing the data from the Tabular file.
@@ -599,9 +602,14 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
     - Exception: If the file is not found or there is a data format error.
 
     """
-    return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
+    return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
+                           lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
+                           encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,
+                           correctColumnNum = correctColumnNum)
 
-def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = ...):
+def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
+                    verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = ...,
+                    correctColumnNum = -1):
     """
     Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
 
@@ -618,6 +626,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
     - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
     - defaults (list, optional): The default values to use for missing columns. Defaults to [].
+    - correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 
     Returns:
     - OrderedDict: The dictionary containing the data from the Tabular file.
@@ -635,10 +644,9 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
     if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
         return taskDic
     with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
-        correctColumnNum = -1
         if header.rstrip() and verifyHeader:
                 line = file.readline().decode(encoding=encoding,errors='replace')
-                if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+                if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict) and correctColumnNum == -1:
                     correctColumnNum = len(header.split(delimiter))
                     if verbose:
                         __teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -852,7 +860,8 @@ def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, las
     """
     return scrubTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
 
-def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...):
+def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
+                     verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1):
     """
     Scrub a Tabular (CSV / TSV / NSV) file by reading it and writing the contents back into the file.
     If using compressed files. This will recompress the file in whole and possibily increase the compression ratio reducing the file size.
@@ -871,6 +880,7 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
     - strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to False.
     - delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
     - defaults (list, optional): The default values to use for missing columns. Defaults to [].
+    - correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 
     Returns:
     - OrderedDict: The dictionary containing the data from the Tabular file.
@@ -879,7 +889,9 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
     - Exception: If the file is not found or there is a data format error.
 
     """
-    file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
+    file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
+                            lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
+                            encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum)
     if file:
         clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
         appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
@@ -922,7 +934,9 @@ class TSVZed(OrderedDict):
     def getResourseUsage(self,return_dict = False):
         return get_resource_usage(return_dict = return_dict)
 
-    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,verbose = False,encoding = 'utf8',delimiter = ...,defualts = None,strict = False):
+    def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,
+                  rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,
+                  verbose = False,encoding = 'utf8',delimiter = ...,defualts = None,strict = False,correctColumnNum = -1):
         super().__init__()
         self.version = version
         self.strict = strict
@@ -933,7 +947,7 @@ class TSVZed(OrderedDict):
         self.delimiter = get_delimiter(delimiter,file_name=fileName)
         self.defaults = defualts if defualts else []
         self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
-        self.correctColumnNum = -1
+        self.correctColumnNum = correctColumnNum
         self.createIfNotExist = createIfNotExist
         self.verifyHeader = verifyHeader
         self.rewrite_on_load = rewrite_on_load
