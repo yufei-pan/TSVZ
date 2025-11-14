@@ -4,17 +4,17 @@
 # dependencies = [
 # ]
 # ///
-import os , sys
-from collections import OrderedDict , deque
-import time
 import atexit
-import threading
+import os
 import re
+import threading
+import time
+from collections import OrderedDict, deque
 
 RESOURCE_LIB_AVAILABLE = True
 try:
     import resource
-except:
+except ImportError:
     RESOURCE_LIB_AVAILABLE = False
 
 if os.name == 'nt':
@@ -22,10 +22,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
     import fcntl
 
-version = '3.30'
+version = '3.31'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2025-09-15'
+COMMIT_DATE = '2025-11-13'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -75,19 +75,19 @@ def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None
         try:
             import lzma
             return lzma.open(fileName, mode, **kwargs)
-        except:
+        except Exception:
             __teePrintOrNot(f"Failed to open {fileName} with lzma, trying bin",teeLogger=teeLogger)
     elif fileName.endswith('.gz') or fileName.endswith('.gzip'):
         try:
             import gzip
             return gzip.open(fileName, mode, **kwargs)
-        except:
+        except Exception:
             __teePrintOrNot(f"Failed to open {fileName} with gzip, trying bin",teeLogger=teeLogger)
     elif fileName.endswith('.bz2') or fileName.endswith('.bzip2'):
         try:
             import bz2
             return bz2.open(fileName, mode, **kwargs)
-        except:
+        except Exception:
             __teePrintOrNot(f"Failed to open {fileName} with bz2, trying bin",teeLogger=teeLogger)
     if 't' in mode:
         mode = mode.replace('t','')
@@ -231,14 +231,14 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 		else:
 			try:
 				return int(size)
-			except Exception as e:
+			except Exception:
 				return 0
 	elif to_str or isinstance(size, int) or isinstance(size, float):
 		if isinstance(size, str):
 			try:
 				size = size.rstrip('B').rstrip('b')
 				size = float(size.lower().strip())
-			except Exception as e:
+			except Exception:
 				return size
 		# size is in bytes
 		if use_1024_bytes or use_1024_bytes is None:
@@ -313,7 +313,7 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
         if teeLogger:
             try:
                 teeLogger.teelog(message,level,callerStackDepth=3)
-            except:
+            except Exception:
                 teeLogger.teelog(message,level)
         else:
             print(message,flush=True)
@@ -490,7 +490,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
     if not isinstance(header,str):
         try:
             header = delimiter.join(header)
-        except:
+        except Exception:
             if verbose:
                 __teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
             header = ''
@@ -561,7 +561,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
                     file.write(header.encode(encoding=encoding,errors='replace')+b'\n')
                 __teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
                 return True
-            except:
+            except Exception:
                 __teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
                 if strict:
                     raise FileNotFoundError("Failed to create file")
@@ -820,14 +820,14 @@ def getFileUpdateTimeNs(fileName):
         return 0
     try:
         return os.stat(fileName).st_mtime_ns
-    except:
+    except Exception:
         __teePrintOrNot(f"Failed to get file update time for {fileName}",'error')
         return get_time_ns()
 
 def get_time_ns():
     try:
         return time.time_ns()
-    except:
+    except Exception:
         # try to get the time in nanoseconds
         return int(time.time()*1e9)
 
@@ -904,7 +904,7 @@ def getListView(tsvzDic,header = [],delimiter = DEFAULT_DELIMITER):
         elif not isinstance(header,list):
             try:
                 header = list(header)
-            except:
+            except Exception:
                 header = []
     if not tsvzDic:
         if not header:
@@ -922,6 +922,112 @@ def getListView(tsvzDic,header = [],delimiter = DEFAULT_DELIMITER):
 
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class TSVZed(OrderedDict):
+    """
+    A thread-safe, file-backed ordered dictionary for managing TSV (Tab-Separated Values) files.
+    TSVZed extends OrderedDict to provide automatic synchronization between an in-memory
+    dictionary and a TSV file on disk. It supports concurrent file access, automatic
+    persistence, and configurable sync strategies.
+    Parameters
+    ----------
+    fileName : str
+        Path to the TSV file to be managed.
+    teeLogger : object, optional
+        Logger object with a teelog method for logging messages. If None, uses print.
+    header : str, optional
+        Column header line for the TSV file. Used for validation and file creation.
+    createIfNotExist : bool, default=True
+        If True, creates the file if it doesn't exist.
+    verifyHeader : bool, default=True
+        If True, verifies that the file header matches the provided header.
+    rewrite_on_load : bool, default=True
+        If True, rewrites the entire file when loading to ensure consistency.
+    rewrite_on_exit : bool, default=False
+        If True, rewrites the entire file when closing/exiting.
+    rewrite_interval : float, default=0
+        Minimum time interval (in seconds) between full file rewrites. 0 means no limit.
+    append_check_delay : float, default=0.01
+        Time delay (in seconds) between checks of the append queue by the worker thread.
+    monitor_external_changes : bool, default=True
+        If True, monitors and detects external file modifications.
+    verbose : bool, default=False
+        If True, prints detailed operation logs.
+    encoding : str, default='utf8'
+        Character encoding for reading/writing the file.
+    delimiter : str, optional
+        Field delimiter character. Auto-detected from filename if not specified.
+    defualts : list or str, optional
+        Default values for columns when values are missing.
+    strict : bool, default=False
+        If True, enforces strict validation of column counts and raises errors on mismatch.
+    correctColumnNum : int, default=-1
+        Expected number of columns. -1 means auto-detect from header or first record.
+    Attributes
+    ----------
+    version : str
+        Version of the TSVZed implementation.
+    dirty : bool
+        True if the in-memory data differs from the file on disk.
+    deSynced : bool
+        True if synchronization with the file has failed or external changes detected.
+    memoryOnly : bool
+        If True, changes are kept in memory only and not written to disk.
+    appendQueue : deque
+        Queue of lines waiting to be appended to the file.
+    writeLock : threading.Lock
+        Lock for ensuring thread-safe file operations.
+    shutdownEvent : threading.Event
+        Event signal for stopping the append worker thread.
+    appendThread : threading.Thread
+        Background thread that handles asynchronous file appending.
+    Methods
+    -------
+    load()
+        Load or reload data from the TSV file.
+    reload()
+        Refresh data from the TSV file, discarding in-memory changes.
+    rewrite(force=False, reloadInternalFromFile=None)
+        Rewrite the entire file with current in-memory data.
+    mapToFile()
+        Synchronize in-memory data to the file using in-place updates.
+    hardMapToFile()
+        Completely rewrite the file from scratch with current data.
+    clear()
+        Clear all data from memory and optionally the file.
+    clear_file()
+        Clear the file, keeping only the header.
+    commitAppendToFile()
+        Write all queued append operations to the file.
+    stopAppendThread()
+        Stop the background append worker thread and perform final sync.
+    setDefaults(defaults)
+        Set default values for columns.
+    getListView()
+        Get a list representation of the data with headers.
+    getResourseUsage(return_dict=False)
+        Get current resource usage statistics.
+    checkExternalChanges()
+        Check if the file has been modified externally.
+    close()
+        Close the TSVZed object, stopping background threads and syncing data.
+    Notes
+    -----
+    - The class uses a background thread to handle asynchronous file operations.
+    - File locking is implemented for both POSIX and Windows systems.
+    - Keys starting with '#' are treated as comments and not persisted to file.
+    - The special key '#DEFAULTS#' is used to store column default values.
+    - Supports compressed file formats through automatic detection.
+    - Thread-safe for concurrent access from multiple threads.
+    Examples
+    --------
+    >>> with TSVZed('data.tsv', header='id\tname\tvalue') as tsv:
+    ...     tsv['key1'] = ['key1', 'John', '100']
+    ...     tsv['key2'] = ['key2', 'Jane', '200']
+    ...     print(tsv['key1'])
+    ['key1', 'John', '100']
+    >>> tsv = TSVZed('data.tsv', verbose=True, rewrite_on_exit=True)
+    >>> tsv['key3'] = 'key3\tBob\t300'
+    >>> tsv.close()
+    """
     def __teePrintOrNot(self,message,level = 'info'):
         try:
             if self.teeLogger:
@@ -983,7 +1089,7 @@ class TSVZed(OrderedDict):
         elif not isinstance(defaults,list):
             try:
                 defaults = list(defaults)
-            except:
+            except Exception:
                 if self.verbose:
                     self.__teePrintOrNot('Invalid defaults, setting defaults to empty.','error')
                 defaults = []
@@ -1108,7 +1214,7 @@ class TSVZed(OrderedDict):
         if key == DEFAULTS_INDICATOR_KEY:
             self.defaults = []
             if self.verbose:
-                self.__teePrintOrNot(f"Defaults cleared")
+                self.__teePrintOrNot("Defaults cleared")
             if not self.memoryOnly:
                 self.__appendEmptyLine(key)
                 if self.verbose:
@@ -1250,8 +1356,8 @@ memoryOnly:{self.memoryOnly}
         self.dirty = True
         if not self.rewrite_on_exit:
             self.rewrite_on_exit = True
-            self.__teePrintOrNot(f"Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
-            self.__teePrintOrNot(f"rewrite_on_exit set to True")
+            self.__teePrintOrNot("Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
+            self.__teePrintOrNot("rewrite_on_exit set to True")
         if self.verbose:
             self.__teePrintOrNot(f"Warning: Trying to move Key {key} moved to {'end' if last else 'beginning'} Need to resync for changes to apply to disk")
         self.lastUpdateTime = get_time_ns()
@@ -1283,7 +1389,7 @@ memoryOnly:{self.memoryOnly}
                 self.reload()
             if self.memoryOnly:
                 if self.verbose:
-                    self.__teePrintOrNot(f"Memory only mode. Map to file skipped.")
+                    self.__teePrintOrNot("Memory only mode. Map to file skipped.")
                 return False
             if self.dirty:
                 if self.verbose:
@@ -1427,7 +1533,7 @@ memoryOnly:{self.memoryOnly}
             if self.memoryOnly:
                 self.appendQueue.clear()
                 if self.verbose:
-                    self.__teePrintOrNot(f"Memory only mode. Append queue cleared.") 
+                    self.__teePrintOrNot("Memory only mode. Append queue cleared.") 
                 return self
             try:
                 if self.verbose:
@@ -1506,7 +1612,7 @@ memoryOnly:{self.memoryOnly}
                     unlock_length = 2147483647
                     try:
                         msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
-                    except:
+                    except Exception:
                         pass
                 file.close()  # Ensure file is closed after unlocking
             if self.verbose:
