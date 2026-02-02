@@ -545,8 +545,9 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 					)
 					# If the line is valid, return it
 					if lineCache:
-						if storeOffset and any(lineCache):
-							return lineCache
+						if storeOffset :
+							return file_size - processedSize + 1
+						return lineCache
 			
 			# Keep the last (possibly incomplete) line in buffer for the next read
 			buffer = lines[0]
