@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#! /usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 # /// script
 # requires-python = ">=3.6"
 # dependencies = [
@@ -2261,6 +2262,11 @@ def __main__():
 	strictMode.add_argument('-f', '--force', dest = 'strict',action='store_false', help='Force the operation. Ignore checks for column numbers / headers')
 	parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
 	parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by {author}')
+	try:
+		import argcomplete
+		argcomplete.autocomplete(parser,always_complete_options='long')
+	except ImportError:
+		pass
 	args = parser.parse_args()
 	args.delimiter = get_delimiter(delimiter=args.delimiter,file_name=args.filename)
 	if args.header and args.header.endswith('\\'):

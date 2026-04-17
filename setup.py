@@ -15,6 +15,14 @@ setup(
 			'tsvz = TSVZ:__main__',
         ],
     },
+    install_requires=[
+        'argparse',
+    ],
+    extras_require={
+        'completion': [
+            'argcomplete',
+        ],
+    },
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)',
