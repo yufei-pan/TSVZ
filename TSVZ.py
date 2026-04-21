@@ -27,15 +27,15 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '3.36'
+version = '3.37'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-02-02'
+COMMIT_DATE = '2026-04-21'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 
-COMPRESSED_FILE_EXTENSIONS = ['gz','gzip','bz2','bzip2','xz','lzma']
+COMPRESSED_FILE_EXTENSIONS = ['gz','gzip','bz2','bzip2','xz','lzma','zst','zstd']
 
 def get_delimiter(delimiter,file_name = ''):
 	global DEFAULT_DELIMITER
@@ -76,34 +76,43 @@ def eprint(*args, **kwargs):
 		print(*args, **kwargs)
 
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
+	lowerFileName = fileName.lower()
 	if 'b' not in mode:
 		mode += 't'
 	kwargs = {}
 	if 'r' not in mode:
-		if fileName.endswith('.xz'):
+		if lowerFileName.endswith('.xz'):
 			kwargs['preset'] = compressLevel
+		elif lowerFileName.endswith('.zst') or lowerFileName.endswith('.zstd'):
+			kwargs['level'] = compressLevel
 		else:
 			kwargs['compresslevel'] = compressLevel
 	if 'b' not in mode:
 		kwargs['encoding'] = encoding
-	if fileName.endswith('.xz') or fileName.endswith('.lzma'):
+	if lowerFileName.endswith('.xz') or lowerFileName.endswith('.lzma'):
 		try:
 			import lzma
 			return lzma.open(fileName, mode, **kwargs)
 		except Exception:
 			__teePrintOrNot(f"Failed to open {fileName} with lzma, trying bin",teeLogger=teeLogger)
-	elif fileName.endswith('.gz') or fileName.endswith('.gzip'):
+	elif lowerFileName.endswith('.gz') or lowerFileName.endswith('.gzip'):
 		try:
 			import gzip
 			return gzip.open(fileName, mode, **kwargs)
 		except Exception:
 			__teePrintOrNot(f"Failed to open {fileName} with gzip, trying bin",teeLogger=teeLogger)
-	elif fileName.endswith('.bz2') or fileName.endswith('.bzip2'):
+	elif lowerFileName.endswith('.bz2') or lowerFileName.endswith('.bzip2'):
 		try:
 			import bz2
 			return bz2.open(fileName, mode, **kwargs)
 		except Exception:
 			__teePrintOrNot(f"Failed to open {fileName} with bz2, trying bin",teeLogger=teeLogger)
+	elif lowerFileName.endswith('.zst') or lowerFileName.endswith('.zstd'):
+		try:
+			from compression import zstd
+			return zstd.open(fileName, mode, **kwargs)
+		except Exception:
+			__teePrintOrNot(f"Failed to open {fileName} with zstd, trying bin",teeLogger=teeLogger)
 	if 't' in mode:
 		mode = mode.replace('t','')
 		return open(fileName, mode, encoding=encoding)
