@@ -10,7 +10,6 @@ import functools
 import io
 import os
 import re
-from tabnanny import verbose
 import threading
 import time
 import sys
@@ -36,6 +35,9 @@ DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 
 COMPRESSED_FILE_EXTENSIONS = ['gz','gzip','bz2','bzip2','xz','lzma','zst','zstd']
+
+def _isCompressedFile(fileName):
+	return fileName.rpartition('.')[2].lower() in COMPRESSED_FILE_EXTENSIONS
 
 def get_delimiter(delimiter,file_name = ''):
 	global DEFAULT_DELIMITER
@@ -338,7 +340,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			power = 2**10
 			n = 0
 			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi'}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}}{' '}{power_labels[n]}"
@@ -346,7 +348,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			power = 10**3
 			n = 0
 			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P'}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}}{' '}{power_labels[n]}"
@@ -456,7 +458,7 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = DEFAULT
 			# if verbose:
 			# 	__teePrintOrNot(f"Empty defaults line found: {line}",teeLogger=teeLogger)
 			defaults.clear()
-			defaults[0] = DEFAULTS_INDICATOR_KEY
+			defaults[:] = [DEFAULTS_INDICATOR_KEY]
 		else:
 			# if verbose:
 			# 	__teePrintOrNot(f"Key {lineCache[0]} found with empty value, deleting such key's representaion",teeLogger=teeLogger)
@@ -491,6 +493,43 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = DEFAULT
 	# 	__teePrintOrNot(f"Key {lineCache[0]} added",teeLogger=teeLogger)
 	return correctColumnNum, lineCache
 
+def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None,
+								  strict=False, encoding='utf8', delimiter=DEFAULT_DELIMITER,
+								  defaults=None, storeOffset=False):
+	"""
+	Forward, single-pass variant of read_last_valid_line for compressed files.
+
+	Backward chunked seeking forces a full re-decompress on every seek (and is not
+	reliably supported for some codecs e.g. zstd), so for compressed files we decompress
+	once, streaming forward, and keep only the last valid line / offset. A scratch dict is
+	used so memory stays flat instead of accumulating the whole file into taskDic.
+	"""
+	if defaults is None:
+		defaults = []
+	last_valid = -1 if storeOffset else []
+	scratch = {}
+	with openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
+		while True:
+			offset = file.tell()
+			line = file.readline()
+			if not line:
+				break
+			if not line.strip():
+				continue
+			correctColumnNum, lineCache = _processLine(
+				line=line.decode(encoding=encoding, errors='replace'),
+				taskDic=scratch,
+				correctColumnNum=correctColumnNum,
+				strict=strict,
+				delimiter=delimiter,
+				defaults=defaults,
+				storeOffset=storeOffset,
+				offset=offset,
+			)
+			if lineCache:
+				last_valid = offset if storeOffset else lineCache
+	return last_valid
+
 def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,
 						 encoding = 'utf8',delimiter = ...,defaults = ...,storeOffset = False	):
 	"""
@@ -518,6 +557,12 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	if verbose:
 		__teePrintOrNot(f"Reading last line only from {fileName}",teeLogger=teeLogger)
+	if _isCompressedFile(fileName):
+		# Backward seeking through a codec is slow/unsupported; decompress once, forward.
+		return _read_last_valid_line_forward(
+			fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger,
+			strict=strict, encoding=encoding, delimiter=delimiter, defaults=defaults,
+			storeOffset=storeOffset)
 	with openFileAsCompressed(fileName, 'rb',encoding=encoding, teeLogger=teeLogger) as file:
 		file.seek(0, os.SEEK_END)
 		file_size = file.tell()
@@ -687,7 +732,6 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 			try:
 				with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)as file:
 					header = delimiter.join(_sanitize(_formatHeader(header,
-													 verbose=verbose,
 													 teeLogger=teeLogger,
 													 delimiter=delimiter,
 													 ),delimiter=delimiter))
@@ -1076,7 +1120,7 @@ class TSVZed(OrderedDict):
 	rewrite_on_exit : bool, default=False
 		If True, rewrites the entire file when closing/exiting.
 	rewrite_interval : float, default=0
-		Minimum time interval (in seconds) between full file rewrites. 0 means no limit.
+		Minimum time interval (in seconds) between full file rewrites. 0 means do not rewrite.
 	append_check_delay : float, default=0.01
 		Time delay (in seconds) between checks of the append queue by the worker thread.
 	monitor_external_changes : bool, default=True
@@ -1736,6 +1780,7 @@ memoryOnly:{self.memoryOnly}
 	
 	def get_file_obj(self,modes = 'ab'):
 		self.writeLock.acquire()
+		file = None
 		try:
 			if not self.encoding:
 				self.encoding = 'utf8'
@@ -1761,6 +1806,8 @@ memoryOnly:{self.memoryOnly}
 	def release_file_obj(self,file):
 		# if write lock is already released, return
 		if not self.writeLock.locked():
+			return
+		if file is None:
 			return
 		try:
 			file.flush()  # Ensure the file is flushed before unlocking
@@ -2034,13 +2081,18 @@ class TSVZedLite(MutableMapping):
 					)
 		if self.verbose:
 			eprint(f"Read at position {pos}: {segments}")
-		if key is not ... and segments[0] != key:
+		if key is not ...:
+			if not segments:
+				eprint(f"Error: No segments found at position {pos}")
+			elif segments[0] != key:
 				eprint(f"Warning: Key mismatch at position {pos}: expected {key}, got {segments[0]}")
-				if self.strict:
-					eprint("Error: Key mismatch and strict mode enabled. Raising KeyError.")
-					raise KeyError(key)
-				else :
-					eprint("Continuing despite key mismatch due to non-strict mode. Expect errors!")
+			else:
+				return segments
+			if self.strict:
+				eprint("Error: Key mismatch and strict mode enabled. Raising KeyError.")
+				raise KeyError(key)
+			else :
+				eprint("Continuing despite key mismatch due to non-strict mode. Expect errors!")
 		return segments
 
 	# Implement basic __getitem__, __setitem__, __delitem__, __iter__, and __len__. needed for MutableMapping
@@ -2093,6 +2145,7 @@ class TSVZedLite(MutableMapping):
 			self.defaults = value
 			if self.verbose:
 				eprint(f"Defaults set to {value}")
+			return
 		elif key.startswith('#'):
 			if self.verbose:
 				eprint(f"Key {key} updated in memory (data in index) as it starts with #")
