@@ -26,10 +26,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '3.37'
+version = '3.38'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-04-21'
+COMMIT_DATE = '2026-06-04'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -39,13 +39,29 @@ COMPRESSED_FILE_EXTENSIONS = ['gz','gzip','bz2','bzip2','xz','lzma','zst','zstd'
 def _isCompressedFile(fileName):
 	return fileName.rpartition('.')[2].lower() in COMPRESSED_FILE_EXTENSIONS
 
-def get_delimiter(delimiter,file_name = ''):
+def get_delimiter(delimiter = ...,file_name = ''):
+	"""
+	Resolve the delimiter to use for an operation.
+
+	When the delimiter is not provided (the ``...`` sentinel or a falsy value),
+	it is determined automatically: inferred from the file name when one is
+	available, otherwise falling back to the last-determined default. Explicit
+	delimiters (including the aliases 'comma', 'tab', 'pipe', 'null' and escape
+	sequences) are normalized. The resolved value is remembered as the new
+	module-level default.
+
+	Parameters:
+	- delimiter: The delimiter or alias, or ``...``/``None`` to auto-determine.
+	- file_name (str, optional): The file name to infer the delimiter from.
+
+	Returns:
+	str: The resolved delimiter.
+	"""
 	global DEFAULT_DELIMITER
-	if not delimiter:
-		return DEFAULT_DELIMITER
-	elif delimiter == ...:
+	if delimiter is ...:
 		if not file_name:
-			rtn =  '\t'
+			# Nothing to infer from; reuse the last-determined default.
+			return DEFAULT_DELIMITER
 		elif file_name.endswith('.csv'):
 			rtn =  ','
 		elif file_name.endswith('.nsv'):
@@ -54,6 +70,8 @@ def get_delimiter(delimiter,file_name = ''):
 			rtn =  '|'
 		else:
 			rtn =  '\t'
+	elif not delimiter:
+		return DEFAULT_DELIMITER
 	elif delimiter == 'comma':
 		rtn =  ','
 	elif delimiter == 'tab':
@@ -415,7 +433,7 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
 	except Exception:
 		print(message,flush=True)
 
-def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = DEFAULT_DELIMITER,defaults = ...,
+def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,defaults = ...,
 				 storeOffset = False, offset = -1):
 	"""
 	Process a line of text and update the task dictionary.
@@ -435,6 +453,7 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = DEFAULT
 	"""
 	if defaults is ...:
 		defaults = []
+	delimiter = get_delimiter(delimiter)
 	line = line.strip('\x00').rstrip('\r\n')
 	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
 		# if verbose:
@@ -494,7 +513,7 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = DEFAULT
 	return correctColumnNum, lineCache
 
 def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None,
-								  strict=False, encoding='utf8', delimiter=DEFAULT_DELIMITER,
+								  strict=False, encoding='utf8', delimiter=...,
 								  defaults=None, storeOffset=False):
 	"""
 	Forward, single-pass variant of read_last_valid_line for compressed files.
@@ -506,6 +525,7 @@ def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=F
 	"""
 	if defaults is None:
 		defaults = []
+	delimiter = get_delimiter(delimiter, file_name=fileName)
 	last_valid = -1 if storeOffset else []
 	scratch = {}
 	with openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
@@ -613,7 +633,8 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 	return last_valid_line
 
 @functools.lru_cache(maxsize=None)
-def _get_sanitization_re(delimiter = DEFAULT_DELIMITER):
+def _get_sanitization_re(delimiter = ...):
+	delimiter = get_delimiter(delimiter)
 	return re.compile(r"(</sep/>|</LF/>|<sep>|<LF>|\n|" + re.escape(delimiter) + r")")
 
 _sanitize_replacements = {
@@ -623,9 +644,10 @@ _sanitize_replacements = {
 }
 _inverse_sanitize_replacements = {v: k for k, v in _sanitize_replacements.items()}
 
-def _sanitize(data,delimiter = DEFAULT_DELIMITER):
+def _sanitize(data,delimiter = ...):
 	if not data:
 		return data
+	delimiter = get_delimiter(delimiter)
 	def repl(m):
 		tok = m.group(0)
 		if tok == delimiter:
@@ -639,9 +661,10 @@ def _sanitize(data,delimiter = DEFAULT_DELIMITER):
 	else:
 		return [pattern.sub(repl,str(segment)) if segment else '' for segment in data]
 
-def _unsanitize(data,delimiter = DEFAULT_DELIMITER):
+def _unsanitize(data,delimiter = ...):
 	if not data:
 		return data
+	delimiter = get_delimiter(delimiter)
 	def repl(m):
 		tok = m.group(0)
 		if tok == "<sep>":
@@ -653,7 +676,7 @@ def _unsanitize(data,delimiter = DEFAULT_DELIMITER):
 	else:
 		return [pattern.sub(repl,str(segment).rstrip()) if segment else '' for segment in data]
 
-def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DELIMITER):
+def _formatHeader(header,verbose = False,teeLogger = None,delimiter = ...):
 	"""
 	Format the header string.
 
@@ -666,7 +689,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
 		list: The formatted header list of string.
 	"""
 	if isinstance(header,str):
-		header = header.split(delimiter)
+		header = header.split(get_delimiter(delimiter))
 	else:
 		try:
 			header = [str(s) for s in header]
@@ -676,7 +699,7 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = DEFAULT_DE
 			header = []
 	return [s.rstrip() for s in header]
 
-def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = DEFAULT_DELIMITER):
+def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = ...):
 	"""
 	Verify if a line contains the header.
 
@@ -690,6 +713,7 @@ def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fal
 	Returns:
 	bool: True if the header matches the line, False otherwise.
 	"""
+	delimiter = get_delimiter(delimiter)
 	line = _formatHeader(line,verbose=verbose,teeLogger=teeLogger,delimiter=delimiter)
 	if verbose:
 		__teePrintOrNot(f"Header: \n{header}",teeLogger=teeLogger)
@@ -701,7 +725,7 @@ def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fal
 		return False
 	return True
 
-def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,header = [],encoding = 'utf8',strict = True,delimiter = DEFAULT_DELIMITER):
+def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,header = [],encoding = 'utf8',strict = True,delimiter = ...):
 	"""
 	Verify the existence of the tabular file.
 
@@ -716,6 +740,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 	Returns:
 	bool: True if the file exists, False otherwise.
 	"""
+	delimiter = get_delimiter(delimiter, file_name=fileName)
 	remainingFileName, _ ,extenstionName = fileName.rpartition('.')
 	if extenstionName in COMPRESSED_FILE_EXTENSIONS:
 		remainingFileName, _ ,extenstionName = remainingFileName.rpartition('.')
@@ -824,7 +849,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
 		if any(header) and verifyHeader:
 				line = file.readline().decode(encoding=encoding,errors='replace')
-				if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict) and correctColumnNum == -1:
+				if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter) and correctColumnNum == -1:
 					correctColumnNum = len(header)
 					if verbose:
 						__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -926,7 +951,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	if any(header) and verifyHeader:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
 			line = file.readline().decode(encoding=encoding,errors='replace')
-			if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+			if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 				correctColumnNum = len(header)
 				if verbose:
 					__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -980,7 +1005,7 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
 			if any(header) and verifyHeader:
 				line = file.readline().decode(encoding=encoding,errors='replace')
-				if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict):
+				if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 				header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 		with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)as file:
@@ -1073,10 +1098,10 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 		appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
 	return file
 
-def getListView(tsvzDic,header = [],delimiter = DEFAULT_DELIMITER):
+def getListView(tsvzDic,header = [],delimiter = ...):
 	if header:
 		if isinstance(header,str):
-			header = header.split(delimiter)
+			header = header.split(get_delimiter(delimiter))
 		elif not isinstance(header,list):
 			try:
 				header = list(header)
@@ -1649,7 +1674,7 @@ memoryOnly:{self.memoryOnly}
 			if self.header:
 				line = file.readline().decode(self.encoding,errors='replace')
 				aftPos = file.tell()
-				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict):
+				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 					header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 					file.seek(0)
 					file.write(f'{header}\n'.encode(encoding=self.encoding,errors='replace'))
