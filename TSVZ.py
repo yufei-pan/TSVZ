@@ -26,10 +26,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '3.38'
+version = '3.39'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-06-04'
+COMMIT_DATE = '2026-06-20'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -45,10 +45,14 @@ def get_delimiter(delimiter = ...,file_name = ''):
 
 	When the delimiter is not provided (the ``...`` sentinel or a falsy value),
 	it is determined automatically: inferred from the file name when one is
-	available, otherwise falling back to the last-determined default. Explicit
-	delimiters (including the aliases 'comma', 'tab', 'pipe', 'null' and escape
-	sequences) are normalized. The resolved value is remembered as the new
-	module-level default.
+	available (a trailing compression extension such as ``.gz`` is ignored for
+	the purpose of inference), otherwise falling back to the module default
+	(``DEFAULT_DELIMITER``, a tab). Explicit delimiters (including the aliases
+	'comma', 'tab', 'pipe', 'null' and escape sequences) are normalized.
+
+	This function is pure: it has no side effects and never mutates module
+	state, so concurrent callers operating on different file types do not
+	interfere with one another.
 
 	Parameters:
 	- delimiter: The delimiter or alias, or ``...``/``None`` to auto-determine.
@@ -57,33 +61,36 @@ def get_delimiter(delimiter = ...,file_name = ''):
 	Returns:
 	str: The resolved delimiter.
 	"""
-	global DEFAULT_DELIMITER
 	if delimiter is ...:
 		if not file_name:
-			# Nothing to infer from; reuse the last-determined default.
+			# Nothing to infer from; fall back to the module default.
 			return DEFAULT_DELIMITER
-		elif file_name.endswith('.csv'):
-			rtn =  ','
-		elif file_name.endswith('.nsv'):
-			rtn =  '\0'
-		elif file_name.endswith('.psv'):
-			rtn =  '|'
+		# Ignore a trailing compression extension so 'data.csv.gz' still
+		# infers ',' rather than the tab fallback.
+		lowerName = file_name.lower()
+		base, _, ext = lowerName.rpartition('.')
+		if ext in COMPRESSED_FILE_EXTENSIONS:
+			lowerName = base
+		if lowerName.endswith('.csv'):
+			return ','
+		elif lowerName.endswith('.nsv'):
+			return '\0'
+		elif lowerName.endswith('.psv'):
+			return '|'
 		else:
-			rtn =  '\t'
+			return '\t'
 	elif not delimiter:
 		return DEFAULT_DELIMITER
 	elif delimiter == 'comma':
-		rtn =  ','
+		return ','
 	elif delimiter == 'tab':
-		rtn =  '\t'
+		return '\t'
 	elif delimiter == 'pipe':
-		rtn =  '|'
+		return '|'
 	elif delimiter == 'null':
-		rtn =  '\0'
+		return '\0'
 	else:
-		rtn =  delimiter.encode().decode('unicode_escape')
-	DEFAULT_DELIMITER = rtn
-	return rtn
+		return delimiter.encode().decode('unicode_escape')
 
 def eprint(*args, **kwargs):
 	try:
@@ -602,9 +609,15 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 			
 			# Split the buffer into lines
 			lines = buffer.split(b'\n')
-			
+
+			# When more of the file remains to the left, lines[0] may be an
+			# incomplete line; defer it (it is carried into the next chunk via
+			# `buffer = lines[0]` below) so it is counted/processed exactly once.
+			# Only when we have reached the start of the file (position == 0) is
+			# lines[0] a complete line that must be processed here.
+			lowest = 1 if position > 0 else 0
 			# Process lines from the last to the first
-			for i in range(len(lines) - 1, -1, -1):
+			for i in range(len(lines) - 1, lowest - 1, -1):
 				processedSize += len(lines[i]) + 1  # +1 for the newline character
 				if lines[i].strip():  # Skip empty lines
 					# Process the line
@@ -652,8 +665,14 @@ def _sanitize(data,delimiter = ...):
 		tok = m.group(0)
 		if tok == delimiter:
 			return "<sep>"
-		if tok in ("</sep/>", "</LF/>"):
-			eprint(f"Warning: Found illegal token '{tok}' during sanitization. It will be replaced.")
+		if tok == "</sep/>":
+			eprint("Warning: '</sep/>' is a reserved token and is invalid as field data; "
+				   "it will be read back as the literal '<sep>'.")
+			return tok
+		if tok == "</LF/>":
+			eprint("Warning: '</LF/>' is a reserved token and is invalid as field data; "
+				   "it will be read back as the literal '<LF>'.")
+			return tok
 		return _sanitize_replacements.get(tok, tok)
 	pattern = _get_sanitization_re(delimiter)
 	if isinstance(data,str):
@@ -933,12 +952,17 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 		if isinstance(line,str):
 			line = line.split(delimiter)
 		elif line:
-			for i in range(len(line)):
-				if not isinstance(line[i],str):
+			# Build a new list rather than mutating the caller's list in place.
+			newLine = []
+			for item in line:
+				if isinstance(item,str):
+					newLine.append(item)
+				else:
 					try:
-						line[i] = str(line[i]).rstrip()
+						newLine.append(str(item).rstrip())
 					except Exception as e:
-						line[i] = str(e)
+						newLine.append(str(e))
+			line = newLine
 		if isinstance(linesToAppend,dict):
 			if (not line or line[0] != key):
 				line = [key]+line
@@ -1215,7 +1239,7 @@ class TSVZed(OrderedDict):
 	- The class uses a background thread to handle asynchronous file operations.
 	- File locking is implemented for both POSIX and Windows systems.
 	- Keys starting with '#' are treated as comments and not persisted to file.
-	- The special key '#DEFAULTS#' is used to store column default values.
+	- The special key '#_defaults_#' is used to store column default values.
 	- Supports compressed file formats through automatic detection.
 	- Thread-safe for concurrent access from multiple threads.
 	Examples
@@ -1350,8 +1374,10 @@ class TSVZed(OrderedDict):
 			value = [key]+value
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
-			# this means we want to clear / delete the key
+			# a lone key (no following values) means delete the key, per the
+			# TSVZ spec. del is a no-op when the key is absent (tolerated).
 			del self[key]
+			return
 		elif self.correctColumnNum > 0:
 			if len(value) != self.correctColumnNum:
 				if self.strict:
@@ -1439,12 +1465,15 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = get_time_ns()
 		
 	def __appendEmptyLine(self,key):
+		# Append a tombstone line: the key followed by empty values. On read a
+		# row whose values are all empty deletes the key (see _processLine).
+		# Fillers MUST be empty strings ('') -- using the delimiter character
+		# here would be sanitized to '<sep>' and read back as a non-empty value,
+		# resurrecting the deleted key. The key has already been removed from
+		# the mapping by the caller, so self[key] must not be accessed.
 		self.dirty = True
-		if self.correctColumnNum > 0:
-			emptyLine = [key]+[self.delimiter]*(self.correctColumnNum-1)
-		elif len(self[key]) > 1:
-			self.correctColumnNum = len(self[key])
-			emptyLine = [key]+[self.delimiter]*(self.correctColumnNum-1)
+		if self.correctColumnNum > 1:
+			emptyLine = [key]+['']*(self.correctColumnNum-1)
 		else:
 			emptyLine = [key]
 		if self.verbose:
@@ -1467,6 +1496,7 @@ class TSVZed(OrderedDict):
 		return self
 
 	def clear_file(self):
+		file = None
 		try:
 			if self.header:
 				file = self.get_file_obj('wb')
@@ -1634,6 +1664,7 @@ memoryOnly:{self.memoryOnly}
 			return False
 		
 	def hardMapToFile(self):
+		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
@@ -1642,7 +1673,15 @@ memoryOnly:{self.memoryOnly}
 			if self.header:
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				buf.write(header.encode(self.encoding,errors='replace') + b'\n')
+			# Persist the defaults line (right after the header) so it survives a
+			# full rewrite -- it is not a regular mapping key.
+			if self.defaults and len(self.defaults) > 1:
+				defaultsLine = self.delimiter.join(_sanitize(self.defaults,delimiter=self.delimiter))
+				buf.write(defaultsLine.encode(self.encoding,errors='replace') + b'\n')
 			for key in self:
+				# '#'-prefixed keys are in-memory only (comments / internal); never written.
+				if str(key).startswith('#'):
+					continue
 				segments = _sanitize(self[key],delimiter=self.delimiter)
 				buf.write(self.delimiter.join(segments).encode(encoding=self.encoding,errors='replace')+b'\n')
 			buf.flush()
@@ -1663,6 +1702,7 @@ memoryOnly:{self.memoryOnly}
 	def mapToFile(self):
 		mec = self.monitor_external_changes
 		self.monitor_external_changes = False
+		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
@@ -1683,9 +1723,14 @@ memoryOnly:{self.memoryOnly}
 						overWrite = True
 					if self.verbose:
 						self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
-			for value in self.values():
-				if value[0].startswith('#'):
-					continue
+			# Rows to (re)write, in order: the defaults line first (right after the
+			# header, if set) then every data row. '#'-prefixed keys are in-memory
+			# only (comments / internal) and are never written.
+			rowsToWrite = []
+			if self.defaults and len(self.defaults) > 1:
+				rowsToWrite.append(self.defaults)
+			rowsToWrite.extend(v for v in self.values() if v and not str(v[0]).startswith('#'))
+			for value in rowsToWrite:
 				segments = _sanitize(value,delimiter=self.delimiter)
 				strToWrite = self.delimiter.join(segments)
 				if overWrite:
@@ -1764,6 +1809,7 @@ memoryOnly:{self.memoryOnly}
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Append queue cleared.") 
 				return self
+			file = None
 			try:
 				if self.verbose:
 					self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
@@ -1986,6 +2032,13 @@ class TSVZedLite(MutableMapping):
 		else:
 			self.indexes = indexes
 		if fileObj is ...:
+			# 'r+b' requires the file to exist. When indexes were supplied
+			# externally, load() (which would have created it) is skipped, so
+			# ensure the file exists first -- creating it when allowed, or
+			# raising a clear FileNotFoundError instead of a cryptic open error.
+			_verifyFileExistence(self._fileName, createIfNotExist = self.createIfNotExist,
+								  header = self.header, encoding = self.encoding,
+								  strict = self.strict, delimiter = self.delimiter)
 			self.fileObj = open(self._fileName,'r+b')
 		else:
 			self.fileObj = fileObj
@@ -2075,22 +2128,25 @@ class TSVZedLite(MutableMapping):
 		return write_at
 
 	def __mapDeleteToFile(self,key):
+		# Persist a deletion by appending a tombstone (a lone key with no
+		# values); on read such a row deletes the key (see _processLine). The
+		# key must already have been removed from self.indexes by the caller --
+		# this method does NOT touch the index (previously it re-added the key,
+		# pointing it at the tombstone line).
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = [DEFAULTS_INDICATOR_KEY]
 			if self.verbose:
 				eprint("Defaults cleared")
-		# delete the key from the dictionary and update the file
-		elif key not in self.indexes:
-			if self.verbose:
-				eprint(f"Key {key} not found")
+			self.__writeValues([key])
 			return
-		elif key.startswith('#'):
+		if key.startswith('#'):
+			# comment / internal keys are in-memory only; nothing to persist
 			if self.verbose:
 				eprint(f"Key {key} deleted in memory")
 			return
 		if self.verbose:
-			eprint(f"Appending empty line {key}")
-		self.indexes[key] = self.__writeValues([key])
+			eprint(f"Writing tombstone line for {key}")
+		self.__writeValues([key])
 
 	def __readValuesAtPos(self,pos,key = ...):
 		self.fileObj.seek(pos)
@@ -2145,8 +2201,10 @@ class TSVZedLite(MutableMapping):
 			value = [key]+value
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
-			# this means we want to clear / delete the key
+			# a lone key (no following values) means delete the key, per the
+			# TSVZ spec. del is a no-op when the key is absent (tolerated).
 			del self[key]
+			return
 		elif self.correctColumnNum > 0:
 			if len(value) != self.correctColumnNum:
 				if self.strict:
@@ -2182,6 +2240,14 @@ class TSVZedLite(MutableMapping):
 		
 	def __delitem__(self,key):
 		key = str(key).rstrip()
+		if key == DEFAULTS_INDICATOR_KEY:
+			self.__mapDeleteToFile(key)
+			return
+		if key not in self.indexes:
+			if self.verbose:
+				eprint(f"Key {key} not found")
+			return
+		# Remove from the index first, then persist the tombstone to the file.
 		self.indexes.pop(key,None)
 		self.__mapDeleteToFile(key)
 
