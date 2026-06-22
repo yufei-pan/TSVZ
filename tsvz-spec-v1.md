@@ -228,20 +228,27 @@ integrity-marker line (already handled in §7.4) have no further effect; an
 official-marker line is applied (§12). In all of these cases, proceed to the next
 record.
 
-7.6 **Tombstone test (raw, pre-defaulting).** For a data row: if it contains no raw
-delimiter (it split into exactly one field), it is a **tombstone**; delete the key
-(§9) and proceed to the next record.
+7.6 **Tombstone detection (raw, pre-stripping).** For a data row, determine whether
+it is a **tombstone**: it is one if and only if it contains no raw delimiter (it
+split into exactly one field). This determination is made on the raw row, before
+stripping or defaulting (§9.1); the deletion it implies is applied in §7.8, after
+the key is resolved.
 
 7.7 **Resolve the key.** Apply trailing-whitespace stripping to `F0` if enabled
 (§10), then decode escape tokens (§13). If the resulting key is the empty string,
-the row is ignored (§8.4); proceed to the next record.
+the row is ignored (§8.4); proceed to the next record. (The empty-key check
+precedes the tombstone deletion, so an empty-key row — even one with no delimiter —
+is ignored rather than treated as a deletion.)
 
-7.8 **Resolve value columns.** For each written value column _j_ ≥ 1: apply
+7.8 **Tombstone deletion.** If the row was found to be a tombstone in §7.6, delete
+the resolved key (§9) and proceed to the next record.
+
+7.9 **Resolve value columns.** For each written value column _j_ ≥ 1: apply
 trailing-whitespace stripping if enabled, then decode escape tokens, then apply
 the empty-cell rule of §14.2. Absent value columns are resolved at read time per
 §14.
 
-7.9 **Store.** Record `key → value` with last-wins semantics, preserving the key's
+7.10 **Store.** Record `key → value` with last-wins semantics, preserving the key's
 first-appearance position (§3.4).
 
 A non-normative pseudocode rendering of this pipeline appears in Appendix B.
@@ -255,14 +262,14 @@ store; physical duplicates in the file are the update mechanism and are resolved
 last-wins (§3.3).
 
 8.2 The **value** of a key is its sequence of value columns (fields 1..),
-post-processing (§7.7, §14).
+post-processing (§7.9, §14).
 
 8.3 The raw first field of a **data row** MUST NOT begin with `#`; such lines are
 comments or markers (§11, §12). To store a key whose value begins with `#`, encode
 the leading `#` as the escape token `<#>` (§13); the row's raw first field then
 begins with `<` and is correctly classified as data.
 
-8.4 **Empty-key rows are ignored.** If, after the processing of §7.6, the key is
+8.4 **Empty-key rows are ignored.** If, after the processing of §7.7, the key is
 the empty string, the entire row is discarded with no effect on state — exactly
 like a comment.
 
@@ -270,8 +277,11 @@ like a comment.
 
 ## 9. Deletion (tombstones)
 
-9.1 A **tombstone** removes a key from the store. Tombstone detection is performed
-on the **raw** row, **before** any whitespace stripping or defaulting.
+9.1 A **tombstone** removes a key from the store. Whether a row is a tombstone is
+determined on the **raw** row, **before** any whitespace stripping or defaulting
+(§7.6). The key it removes, however, is the **resolved** key — field 0 after
+trailing-whitespace stripping and escape decoding (§7.7) — so that a tombstone
+matches the same key identity under which the key was stored.
 
 9.2 A data row is a tombstone **if and only if** it contains no raw field
 delimiter — that is, it consists of the key alone, with **zero** value fields.
@@ -281,7 +291,8 @@ delimiter — that is, it consists of the key alone, with **zero** value fields.
      `mykey` to a value whose written columns are present and empty (≥ one value
      field exists). See §14.
 
-9.3 A tombstone deletes the key if present and is a no-op if absent.
+9.3 A tombstone deletes its resolved key if present and is a no-op if absent. An
+empty-key row is ignored rather than treated as a deletion (§7.7, §8.4).
 
 9.4 Active defaults never resurrect a tombstoned key, because tombstone detection
 precedes defaulting (§9.1). Whether a now-missing key *reads back* as defaults is
@@ -299,7 +310,7 @@ include at least one delimiter (`key\t\n`).
 ## 10. Whitespace
 
 10.1 When trailing-whitespace stripping is enabled, a reader **strips trailing
-whitespace from every field** (including the key) during processing (§7.6, §7.7).
+whitespace from every field** (including the key) during processing (§7.7, §7.9).
 **Leading whitespace is significant and preserved.**
 
 10.2 Stripping removes a trailing run of the ASCII characters space (`U+0020`) and
@@ -445,7 +456,7 @@ conformant file always begins a control token; decoding is therefore unambiguous
 and total over all UTF-8 (and arbitrary byte) field content. A reader maps the
 tokens of §13.2; a `<...>` token it does not recognize (for example, one
 introduced by a higher version) is **passed through literally**. **Field splitting
-(§7.3) occurs before token decoding**, so an encoded `<sep>` or `<LF>` never causes
+(§7.2) occurs before token decoding**, so an encoded `<sep>` or `<LF>` never causes
 a split.
 
 13.5 **Reversibility examples** (no lossy cases):
