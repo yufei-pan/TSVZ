@@ -928,4 +928,3 @@ Final reads (iteration order alice, carol; bob is missing):
 - `bob`   → missing; with `#_return_defaults_when_missing_#` at its default
   (`true`), returns the active defaults `["guest", "0"]`. (A deletion here is thus
   observationally a reset to the defaults.)
-```
