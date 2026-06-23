@@ -1,0 +1,42 @@
+# Sample systemd unit for serve_spec.py
+#
+# Install (adjust paths and user first):
+#   sudo cp deploy/tsvz-spec.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tsvz-spec.service
+#
+# Logs: journalctl -u tsvz-spec.service -f
+
+[Unit]
+Description=TSVZ format specification web server
+Documentation=file:///opt/tsvz/tsvz-spec-v1.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Clone or copy the repo here (must contain serve_spec.py and tsvz-spec-v1.md).
+WorkingDirectory=/opt/tsvz
+
+# Listen on all interfaces; put nginx/caddy in front for TLS in production.
+# For localhost-only (reverse proxy on same host), use: -H 127.0.0.1
+ExecStart=/usr/bin/python3 /opt/tsvz/serve_spec.py -H 0.0.0.0 -p 8765
+
+# Dedicated unprivileged account (create with: useradd --system --home /opt/tsvz --shell /usr/sbin/nologin tsvz)
+User=tsvz
+Group=tsvz
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening (read-only service; only needs the repo directory)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+ReadOnlyPaths=/opt/tsvz
+
+[Install]
+WantedBy=multi-user.target
