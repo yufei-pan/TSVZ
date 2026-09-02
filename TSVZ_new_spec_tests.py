@@ -1,5 +1,6 @@
 """Tests for TSVZ_new.py (tsvz-spec-v1.md core conformance)."""
 import gzip
+import hashlib
 import os
 import sys
 import tempfile
@@ -113,7 +114,7 @@ class TestClassification(unittest.TestCase):
 		self.assertEqual(TSVZ.classify_record('alice'), 'data')
 		self.assertEqual(TSVZ.classify_record('# header'), 'comment')
 		self.assertEqual(TSVZ.classify_record('#_version_#'), 'marker')
-		self.assertEqual(TSVZ.classify_record('#_checksum_sha256_#'), 'ignore')
+		self.assertEqual(TSVZ.classify_record('#_checksum_sha256_#'), 'checksum')
 		self.assertEqual(TSVZ.classify_record('#__custom__#'), 'ignore')
 
 	def test_leading_space_is_data(self):
@@ -702,9 +703,11 @@ class TestMarkerConformance(unittest.TestCase):
 		_rows, state = replay('#_DEFAULTS_#\tD1\nk\n')
 		self.assertEqual(state.defaults, ['D1'])
 
-	def test_checksum_marker_ignored_either_case(self):
-		self.assertEqual(TSVZ.classify_record('#_CHECKSUM_SHA256_#'), 'ignore')
-		self.assertEqual(TSVZ.classify_record('#_checksum_sha256_#'), 'ignore')
+	def test_checksum_marker_classified_either_case(self):
+		# §12.2.1 case-insensitive; §15.2 the algo is part of the key.
+		self.assertEqual(TSVZ.classify_record('#_CHECKSUM_SHA256_#'), 'checksum')
+		self.assertEqual(TSVZ.classify_record('#_checksum_sha256_#'), 'checksum')
+		self.assertEqual(TSVZ.checksum_algorithm('#_CHECKSUM_SHA256_#'), 'sha256')
 
 	def test_lone_marker_resets_to_builtin_default(self):
 		# §12.1: a value-less stateful marker resets to its built-in default.
@@ -1040,6 +1043,12 @@ class TestRecordIterator(unittest.TestCase):
 	"""§4 framing, implemented once in _iter_records."""
 
 	def _recs(self, data, **kw):
+		"""Return (offset, text) pairs, dropping the blank records."""
+		import io as _io
+		return [(o, t) for o, t, _ in
+				TSVZ._iter_records(_io.BytesIO(data), 'utf8', **kw) if t]
+
+	def _raw(self, data, **kw):
 		import io as _io
 		return list(TSVZ._iter_records(_io.BytesIO(data), 'utf8', **kw))
 
@@ -1059,6 +1068,15 @@ class TestRecordIterator(unittest.TestCase):
 		data = b'alpha\tone\nbeta\ttwo\n'
 		for offset, text in self._recs(data):
 			self.assertTrue(data[offset:].startswith(text.encode()))
+
+	def test_blank_records_are_yielded_with_their_bytes(self):
+		# §15.4: a blank line's bytes still belong to an open digest segment.
+		self.assertEqual(self._raw(b'a\n\nb\n'),
+						 [(0, 'a', b'a\n'), (2, '', b'\n'), (3, 'b', b'b\n')])
+
+	def test_raw_bytes_are_untouched(self):
+		self.assertEqual([r for _, _, r in self._raw(b'a\r\nb\n')],
+						 [b'a\r\n', b'b\n'])
 
 	def test_bad_utf8_warns_once_and_replaces(self):
 		data = b'a\tok\nb\t\xff\xfe\nc\t\xff\n'
@@ -1384,6 +1402,436 @@ class TestGetListViewDeprecated(unittest.TestCase):
 					self.assertEqual(db.getListView(), [['k', 'v']])
 			finally:
 				db.close()
+
+
+class TestIntegrity(unittest.TestCase):
+	"""§15 — opt-in, detection-only integrity."""
+
+	def test_crc_vectors(self):
+		for algo, want in (('crc32', 'cbf43926'), ('crc32c', 'e3069283')):
+			with self.subTest(algo=algo):
+				d = TSVZ.new_digest(algo)
+				d.update(b'123456789')
+				self.assertEqual(d.hexdigest(), want)
+
+	def test_unknown_algorithm_has_no_accumulator(self):
+		self.assertIsNone(TSVZ.new_digest('definitely-not-real'))
+		self.assertIsNone(TSVZ.new_digest('shake_128'))
+
+	def test_no_markers_means_no_checking(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches, bool(d)), (0, [], False))
+
+	def test_first_marker_arms_and_ignores_its_value(self):
+		# §15.3: nothing precedes it, so a value would have nothing to verify.
+		content = 'a\t1\n#_checksum_sha256_#\tdeadbeef\nb\t2\n'
+		with TempFile(suffix='.tsvz', content=content) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches), (0, []))
+
+	def test_segment_excludes_content_before_arming(self):
+		seg = b'b\t2\nc\t3\n'
+		digest = hashlib.sha256(seg).hexdigest().encode()
+		body = b'a\t1\n#_checksum_sha256_#\n' + seg + b'#_checksum_sha256_#\t' + digest + b'\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches), (1, []))
+
+	def test_mismatch_is_detected(self):
+		body = b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t00000000\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual(len(d.mismatches), 1)
+			self.assertEqual(d.mismatches[0][0], 'crc32')
+
+	def test_empty_value_resets_without_verifying(self):
+		body = b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\nb\t2\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches), (0, []))
+
+	def test_unimplemented_algorithm_is_inert(self):
+		body = b'#_checksum_notreal_#\na\t1\n#_checksum_notreal_#\tffffffff\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.armed, d.mismatches), (frozenset(), []))
+			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '1']})
+
+	def test_other_algorithms_markers_are_ordinary_content(self):
+		# §15.4: a checksum line is withheld only from its OWN accumulator.
+		inner, crc_line = b'x\t1\n', b'#_checksum_crc32_#\n'
+		digest = hashlib.sha256(inner + crc_line).hexdigest().encode()
+		body = (b'#_checksum_sha256_#\n' + inner + crc_line
+				+ b'#_checksum_sha256_#\t' + digest + b'\n')
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches), (1, []))
+
+	def test_blank_and_cr_bytes_are_in_the_segment(self):
+		for seg in (b'a\t1\n\nb\t2\n', b'a\t1\r\n'):
+			with self.subTest(seg=seg):
+				acc = TSVZ.new_digest('crc32')
+				acc.update(seg)
+				body = (b'#_checksum_crc32_#\n' + seg
+						+ b'#_checksum_crc32_#\t' + acc.hexdigest().encode() + b'\n')
+				with TempFile(suffix='.tsvz', content=body) as path:
+					d = TSVZ.verify_part(path)
+					self.assertEqual((d.verified, d.mismatches), (1, []))
+
+	def test_append_checksum_round_trip(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			self.assertEqual(TSVZ.append_checksum(path, 'crc32'), '')
+			TSVZ.append_records(path, [['b', '2']])
+			self.assertNotEqual(TSVZ.append_checksum(path, 'crc32'), '')
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.verified, d.mismatches), (1, []))
+
+	def test_staggered_algorithms_cover_each_others_digest_lines(self):
+		# §15.6: a digest cannot cover its own marker; two algorithms can.
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			TSVZ.append_checksum(path, 'crc32')
+			TSVZ.append_records(path, [['b', '2']])
+			TSVZ.append_checksum(path, 'sha256')
+			TSVZ.append_records(path, [['c', '3']])
+			TSVZ.append_checksum(path, 'crc32')
+			TSVZ.append_records(path, [['d', '4']])
+			TSVZ.append_checksum(path, 'sha256')
+			self.assertEqual(TSVZ.verify_part(path).verified, 2)
+			raw = bytearray(read_text(path).encode())
+			i = raw.index(b'#_checksum_sha256_#\t')
+			j = raw.index(b'\n', i)
+			raw[j - 1] = ord('0') if raw[j - 1] != ord('0') else ord('1')
+			with open(path, 'wb') as f:
+				f.write(bytes(raw))
+			self.assertTrue(TSVZ.verify_part(path).mismatches)
+
+	def test_append_checksum_rejects_inert_algorithm(self):
+		with TempFile(suffix='.tsvz') as path, self.assertRaises(ValueError):
+			TSVZ.append_checksum(path, 'not-an-algo')
+
+	def test_policies(self):
+		body = b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\tbadbad00\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			with self.assertWarns(TSVZ.IntegrityWarning):
+				TSVZ.read_store(path)
+			with self.assertRaises(TSVZ.IntegrityError):
+				TSVZ.read_store(path, policy='raise')
+			with warnings.catch_warnings():
+				warnings.simplefilter('error')
+				data = TSVZ.read_store(path, policy='ignore')
+			self.assertTrue(data._digests.mismatches)
+
+	def test_works_over_compression(self):
+		with TempFile(suffix='.tsvz.gz') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			TSVZ.append_checksum(path, 'sha256')
+			TSVZ.append_records(path, [['b', '2']])
+			TSVZ.append_checksum(path, 'sha256')
+			self.assertEqual(TSVZ.verify_part(path).verified, 1)
+
+
+class TestMultiPart(unittest.TestCase):
+	"""§17 — a store split across ordinal-suffixed parts."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp()
+
+	def base(self, name='ev.tsvz'):
+		return os.path.join(self.dir, name)
+
+	def test_filename_grammar(self):
+		pn = TSVZ.parse_part_name('/d/events.tsvz.1f')
+		self.assertEqual((pn.store_path, pn.format_ext, pn.ordinal_value,
+						  pn.rotated, pn.codec), ('/d/events', 'tsvz', 31, False, ''))
+		pn = TSVZ.parse_part_name('/d/events.tsvz.0a.rotated.zst')
+		self.assertEqual((pn.ordinal_value, pn.rotated, pn.codec), (10, True, 'zst'))
+		self.assertIsNone(TSVZ.parse_part_name('/d/events.tsvz'))
+		self.assertIsNone(TSVZ.parse_part_name('/d/events.tsvz.gz'))
+
+	def test_ordinals_sort_as_integers_not_strings(self):
+		# §17.3: .f is 15 and precedes .10 (16), though it follows it lexically.
+		base = self.base()
+		TSVZ.append_records(TSVZ.part_path(base, 0xF), [['k', 'from-f']], create=True)
+		TSVZ.append_records(TSVZ.part_path(base, 0x10), [['k', 'from-10']], create=True)
+		self.assertEqual([os.path.basename(p) for p in TSVZ.store_part_paths(base)],
+						 ['ev.tsvz.f', 'ev.tsvz.10'])
+		self.assertEqual(dict(TSVZ.read_multipart(base))['k'], ['k', 'from-10'])
+
+	def test_marker_state_spans_parts(self):
+		base = self.base('m.tsvz')
+		with open(TSVZ.part_path(base, 1), 'w') as f:
+			f.write('#_defaults_#\tD1\tD2\n')
+		with open(TSVZ.part_path(base, 2), 'w') as f:
+			f.write('k\tv\n')
+		self.assertEqual(dict(TSVZ.read_multipart(base))['k'], ['k', 'v', 'D2'])
+
+	def test_digest_segment_spans_parts(self):
+		base = self.base('c.tsvz')
+		seg = b'x\t1\n'
+		with open(TSVZ.part_path(base, 1), 'wb') as f:
+			f.write(b'#_checksum_sha256_#\n' + seg)
+		with open(TSVZ.part_path(base, 2), 'wb') as f:
+			f.write(b'#_checksum_sha256_#\t' + hashlib.sha256(seg).hexdigest().encode() + b'\n')
+		data = TSVZ.read_multipart(base, policy='ignore')
+		self.assertEqual((data._digests.verified, data._digests.mismatches), (1, []))
+
+	def test_tombstone_in_a_later_part_deletes(self):
+		base = self.base()
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1'], ['b', '2']], create=True)
+		TSVZ.append_records(TSVZ.part_path(base, 2), [['a']], create=True)
+		self.assertEqual(dict(TSVZ.read_multipart(base)), {'b': ['b', '2']})
+
+	def test_rotated_parts_excluded(self):
+		base = self.base()
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
+		TSVZ.append_records(TSVZ.part_path(base, 2, rotated=True), [['z', 'ghost']], create=True)
+		self.assertNotIn('z', TSVZ.read_multipart(base))
+		self.assertIn('z', TSVZ.read_multipart(base, include_rotated=True))
+
+	def test_uuid7_ordinals(self):
+		o = TSVZ.new_ordinal()
+		self.assertEqual(len(o), 32)
+		self.assertEqual((int(o, 16) >> 76) & 0xF, 7)
+		self.assertNotEqual(TSVZ.new_ordinal(), TSVZ.new_ordinal())
+		# Fixed 32-wide zero-padded hex, so §17.3's integer order and plain
+		# string order agree -- and UUIDv7 makes both chronological.
+		batch = [TSVZ.new_ordinal() for _ in range(50)]
+		self.assertEqual(sorted(batch), sorted(batch, key=lambda o: int(o, 16)))
+		self.assertEqual(len({len(o) for o in batch}), 1)
+
+	def test_format_inference_understands_part_names(self):
+		# §16.3: strip codec, .rotated and the ordinal before inferring.
+		self.assertEqual(TSVZ.delimiter_for_path('ev.csvz.1f'), ',')
+		self.assertEqual(TSVZ.delimiter_for_path('ev.psvz.0a.rotated'), '|')
+		self.assertEqual(TSVZ.delimiter_for_path('ev.nsvz.3.gz'), '\0')
+		self.assertTrue(TSVZ.is_strict_store('ev.csvz.1f'))
+		self.assertFalse(TSVZ.is_strict_store('ev.csv.1f'))
+
+	def test_csvz_multipart_round_trip(self):
+		base = self.base('ev.csvz')
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['k', 'a,b']], create=True)
+		self.assertIn('<sep>', read_text(TSVZ.part_path(base, 1)))
+		self.assertEqual(dict(TSVZ.read_multipart(base))['k'], ['k', 'a,b'])
+
+	def test_single_file_is_the_one_part_case(self):
+		base = self.base()
+		TSVZ.append_records(base, [['a', '1']], create=True)
+		self.assertEqual(dict(TSVZ.read_multipart(base)), {'a': ['a', '1']})
+
+	def test_missing_store_raises(self):
+		with self.assertRaises(FileNotFoundError):
+			TSVZ.read_multipart(self.base('nope.tsvz'))
+
+	def test_checksum_segment_closes_across_parts(self):
+		# §15.4 + §17.4: a marker in a later part closes a segment armed in an
+		# earlier one, so append_checksum must replay the preceding parts.
+		base = self.base()
+		o = sorted(TSVZ.new_ordinal() for _ in range(2))
+		p0, p1 = TSVZ.part_path(base, o[0]), TSVZ.part_path(base, o[1])
+		TSVZ.append_records(p0, [['a', '1']], create=True)
+		TSVZ.append_checksum(p0, 'sha256')
+		TSVZ.append_records(p0, [['b', '2']])
+		TSVZ.append_records(p1, [['c', '3']], create=True)
+		self.assertNotEqual(TSVZ.append_checksum(p1, 'sha256'), '',
+							'a later part must close, not re-arm, the segment')
+		data = TSVZ.read_multipart(base, policy='ignore')
+		self.assertEqual((data._digests.verified, data._digests.mismatches), (1, []))
+
+	def test_cross_part_tampering_is_detected(self):
+		base = self.base()
+		o = sorted(TSVZ.new_ordinal() for _ in range(2))
+		p0, p1 = TSVZ.part_path(base, o[0]), TSVZ.part_path(base, o[1])
+		TSVZ.append_records(p0, [['a', '1']], create=True)
+		TSVZ.append_checksum(p0, 'sha256')
+		TSVZ.append_records(p0, [['b', '2']])
+		TSVZ.append_records(p1, [['c', '3']], create=True)
+		TSVZ.append_checksum(p1, 'sha256')
+		with open(p0, 'rb') as f:
+			raw = bytearray(f.read())
+		raw[raw.index(b'b\t2') + 2] = ord('9')
+		with open(p0, 'wb') as f:
+			f.write(bytes(raw))
+		with self.assertRaises(TSVZ.IntegrityError):
+			TSVZ.read_multipart(base, policy='raise')
+
+	def test_standalone_checksum_ignores_other_parts(self):
+		base = self.base()
+		o = sorted(TSVZ.new_ordinal() for _ in range(2))
+		p0, p1 = TSVZ.part_path(base, o[0]), TSVZ.part_path(base, o[1])
+		TSVZ.append_records(p0, [['a', '1']], create=True)
+		TSVZ.append_checksum(p0, 'sha256')
+		TSVZ.append_records(p1, [['b', '2']], create=True)
+		# preceding=() opts out of the cross-part scan: this arms afresh.
+		self.assertEqual(TSVZ.append_checksum(p1, 'sha256', preceding=()), '')
+
+	def test_walstore_opens_a_fresh_part(self):
+		base = self.base()
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
+		db = TSVZ.WalStore(base, multipart=True, create=True, flush_interval=600)
+		try:
+			self.assertEqual(dict(db), {'a': ['a', '1']})
+			self.assertNotEqual(db.path, TSVZ.part_path(base, 1))
+			db['b'] = ['b', '2']
+		finally:
+			db.close()
+		self.assertEqual(read_text(TSVZ.part_path(base, 1)), 'a\t1\n')
+		self.assertEqual(dict(TSVZ.read_multipart(base)),
+						 {'a': ['a', '1'], 'b': ['b', '2']})
+
+	def test_multipart_clear_uses_tombstones(self):
+		base = self.base()
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
+		db = TSVZ.WalStore(base, multipart=True, create=True, flush_interval=600)
+		try:
+			db.clear()
+		finally:
+			db.close()
+		self.assertEqual(read_text(TSVZ.part_path(base, 1)), 'a\t1\n')
+		self.assertEqual(dict(TSVZ.read_multipart(base)), {})
+
+
+class TestSnapshotStore(unittest.TestCase):
+	"""§19.2 — the race-free multi-part snapshot procedure."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp()
+		self.base = os.path.join(self.dir, 'ev.tsvz')
+		self.ords = sorted(TSVZ.new_ordinal() for _ in range(4))
+		for i, o in enumerate(self.ords[:3]):
+			TSVZ.append_records(TSVZ.part_path(self.base, o),
+								[[f'k{i}', f'v{i}'], ['shared', f'from{i}']], create=True)
+		TSVZ.append_records(TSVZ.part_path(self.base, self.ords[3]),
+							[['live', 'active']], create=True)
+
+	def test_reads_are_unchanged(self):
+		before = dict(TSVZ.read_multipart(self.base))
+		TSVZ.snapshot_store(self.base)
+		self.assertEqual(dict(TSVZ.read_multipart(self.base)), before)
+
+	def test_ordinal_slots_between_prefix_and_active(self):
+		res = TSVZ.snapshot_store(self.base)
+		self.assertLess(int(self.ords[2], 16), int(res.ordinal, 16))
+		self.assertLess(int(res.ordinal, 16), int(self.ords[3], 16))
+
+	def test_snapshot_contents(self):
+		res = TSVZ.snapshot_store(self.base)
+		body = read_text(res.path).splitlines()
+		rows = [ln for ln in body if not ln.startswith('#')]
+		markers = [ln for ln in body if ln.startswith('#')]
+		self.assertEqual(body[:len(markers)], markers)        # §19.2.3a top
+		self.assertTrue(body[0].startswith('#_version_#'))
+		self.assertEqual([ln for ln in markers if not ln.startswith('#_')], [])  # §19.2.3c
+		self.assertEqual([ln for ln in rows if '\t' not in ln], [])              # no tombstones
+		self.assertEqual([ln.split('\t')[0] for ln in rows],
+						 ['k0', 'shared', 'k1', 'k2'])                           # §19.2.3b
+
+	def test_active_part_untouched(self):
+		TSVZ.snapshot_store(self.base)
+		self.assertEqual(read_text(TSVZ.part_path(self.base, self.ords[3])),
+						 'live\tactive\n')
+
+	def test_concurrent_writer_loses_nothing(self):
+		stop = threading.Event()
+		written = []
+
+		def writer():
+			i = 0
+			while not stop.is_set():
+				TSVZ.append_records(TSVZ.part_path(self.base, self.ords[3]),
+									[[f'w{i}', str(i)]])
+				written.append(f'w{i}')
+				i += 1
+				time.sleep(0.002)
+		th = threading.Thread(target=writer, daemon=True)
+		th.start()
+		try:
+			time.sleep(0.05)
+			TSVZ.snapshot_store(self.base)
+			time.sleep(0.05)
+		finally:
+			stop.set()
+			th.join(timeout=5)
+		final = TSVZ.read_multipart(self.base)
+		self.assertTrue(all(k in final for k in written))
+		self.assertTrue(all(f'k{i}' in final for i in range(3)))
+
+	def test_rotate_rename(self):
+		res = TSVZ.snapshot_store(self.base, rotate='rename')
+		self.assertTrue(all(os.path.exists(p + '.rotated') for p in res.subsumed))
+		self.assertFalse(any(os.path.exists(p) for p in res.subsumed))
+		self.assertEqual(sorted(TSVZ.read_multipart(self.base)),
+						 ['k0', 'k1', 'k2', 'live', 'shared'])
+
+	def test_delete_is_downgraded_unless_allowed(self):
+		res = TSVZ.snapshot_store(self.base, rotate='delete')
+		self.assertEqual(res.rotate_action, 'rename')
+
+	def test_delete_honoured_on_request(self):
+		res = TSVZ.snapshot_store(self.base, rotate='delete', allow_delete=True)
+		self.assertEqual(res.rotate_action, 'delete')
+		self.assertFalse(any(os.path.exists(p) for p in res.subsumed))
+		self.assertEqual(sorted(TSVZ.read_multipart(self.base)),
+						 ['k0', 'k1', 'k2', 'live', 'shared'])
+
+	def test_rotate_marker_selects_the_action(self):
+		with open(TSVZ.part_path(self.base, self.ords[0]), 'a') as f:
+			f.write('#_rotate_#\trename\n')
+		self.assertEqual(TSVZ.snapshot_store(self.base).rotate_action, 'rename')
+
+	def test_refuses_when_no_ordinal_fits(self):
+		tight = os.path.join(self.dir, 'tight.tsvz')
+		TSVZ.append_records(TSVZ.part_path(tight, 1), [['a', '1']], create=True)
+		TSVZ.append_records(TSVZ.part_path(tight, 2), [['b', '2']], create=True)
+		with self.assertRaises(ValueError):
+			TSVZ.snapshot_store(tight)
+		res = TSVZ.snapshot_store(tight, quiesce=True)
+		self.assertEqual(len(res.subsumed), 2)
+		self.assertEqual(dict(TSVZ.read_multipart(tight)),
+						 {'a': ['a', '1'], 'b': ['b', '2']})
+
+	def test_nothing_to_compact(self):
+		one = os.path.join(self.dir, 'one.tsvz')
+		TSVZ.append_records(TSVZ.part_path(one, 1), [['a', '1']], create=True)
+		self.assertIsNone(TSVZ.snapshot_store(one))
+
+	def test_unnumbered_file_points_at_snapshot_part(self):
+		plain = os.path.join(self.dir, 'plain.tsvz')
+		TSVZ.append_records(plain, [['a', '1']], create=True)
+		with self.assertRaises(ValueError):
+			TSVZ.snapshot_store(plain)
+
+	def test_compensates_for_varying_defaults(self):
+		# §19.4: hoisting #_defaults_# must not change how earlier rows resolve.
+		base = os.path.join(self.dir, 'vary.csvz')
+		o = sorted(TSVZ.new_ordinal() for _ in range(3))
+		with open(TSVZ.part_path(base, o[0]), 'w') as f:
+			f.write('#_strip_trailing_whites_#,false\nk1,keep  \n')
+		with open(TSVZ.part_path(base, o[1]), 'w') as f:
+			f.write('#_defaults_#,D1,D2\nk2,v\n')
+		TSVZ.append_records(TSVZ.part_path(base, o[2]), [['live', 'x']], create=True)
+		before = dict(TSVZ.read_multipart(base))
+		self.assertEqual(before['k1'], ['k1', 'keep  '])
+		self.assertEqual(before['k2'], ['k2', 'v', 'D2'])
+		TSVZ.snapshot_store(base)
+		after = dict(TSVZ.read_multipart(base))
+		self.assertEqual(set(after), set(before))
+		for key, was in before.items():
+			now = after[key]
+			width = max(len(was), len(now))
+			# §3.6 lets width vary; every column *value* must be identical.
+			self.assertEqual(now + [''] * (width - len(now)),
+							 was + [''] * (width - len(was)), key)
+
+	def test_snapshot_is_a_fixed_point(self):
+		TSVZ.snapshot_store(self.base)
+		once = dict(TSVZ.read_multipart(self.base))
+		TSVZ.snapshot_store(self.base, quiesce=True)
+		self.assertEqual(dict(TSVZ.read_multipart(self.base)), once)
 
 
 if __name__ == '__main__':

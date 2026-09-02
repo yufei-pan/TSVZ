@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 """
-TSVZ core library implementing tsvz-spec-v1.
+TSVZ reference implementation of tsvz-spec-v1.
 
 This module provides an append-only write-ahead log (WAL) for tabular
 key–value data. Compaction is performed by :func:`snapshot_part` (a
@@ -35,26 +35,30 @@ Implemented
 - §13 — field escaping (``<sep>``, ``<LF>``, ``<lt>``, ``<#>``)
 - §14 — defaults, fill-empty, return-on-missing, and absent-column
   resolution (§14.3, via :func:`materialize_row`)
+- §15 — opt-in ``#_checksum_<algo>_#`` integrity: arming, marker-to-marker
+  segments spanning parts, per-algorithm accumulators, and detection-only
+  reporting (:class:`DigestSet`, :func:`verify_part`, :func:`append_checksum`)
 - §16 — transparent compression for ``.gz`` / ``.bz2`` / ``.xz`` / ``.zst``
   (``.zst`` requires Python 3.14+; it never degrades to plaintext)
+- §17 — multi-part stores: the Appendix A filename grammar, hexadecimal
+  ordinal ordering, ``.rotated`` exclusion, UUIDv7 ordinals, and replay of
+  the parts as one concatenation (:func:`read_multipart`, ``WalStore(
+  multipart=True)``)
 - §18 — batched whole-record appends under an exclusive lock (§18.2–§18.3);
   ``#_write_ack_#`` selects per-batch fsync (§18.4)
-- Simplified §19 — :func:`snapshot_part` atomically rewrites one part with
-  the §19.4 marker preamble and fully resolved live rows, discarding
-  superseded values, tombstones, and non-header comments
+- §19 — both forms of compaction: :func:`snapshot_part` rewrites a single
+  file atomically, and :func:`snapshot_store` performs the full race-free
+  procedure (immutable prefix, ordinal slotting between prefix and active
+  part, §19.4 compensation, and the §19.5 ``#_rotate_#`` actions)
 - Stores — :class:`WalStore` (asynchronous append) and :class:`OffsetStore`
-  (key→byte-offset index; uncompressed parts only)
+  (key→byte-offset index; uncompressed, single-part)
 
 Not yet implemented
 -------------------
-- §15 integrity — ``#_checksum_<algo>_#`` is classified and ignored (no
-  digest arming or verification); unrecognized markers are likewise skipped
-  on the data path
-- ``#_rotate_#`` — recognized as a marker but treated as a no-op; the §19.5
-  ``keep``/``rename``/``delete`` actions are not applied
-- §17 multi-part stores (``store.tsvz.<ordinal>``, cross-part replay)
-- Full §19 snapshot procedure (ordinal slotting, ``.rotated`` exclusion,
-  immutable prefix with an active writer)
+- ``blake3`` digests require the optional third-party module; without it the
+  marker is inert, exactly as §15.3 prescribes for an unimplemented algorithm
+- Byte-offset indexing is single-part: an offset alone cannot address a
+  multi-part store, which would need a ``(part, offset)`` pair (§19.7)
 
 Known deviations
 ----------------
@@ -74,6 +78,15 @@ Known deviations
 - Invalid UTF-8 is repaired with replacement characters and warned about once
   per read rather than raising; pass ``errors='strict'`` to
   :func:`replay_part` / :func:`replay_bytes` to make it an error instead.
+- §19.5 calls its actions advisory and permits a conservative processor to
+  downgrade ``delete`` -> ``rename`` -> ``keep``. This implementation takes
+  that option: ``delete`` becomes ``rename`` unless the caller passes
+  ``allow_delete=True``.
+- When ``#_defaults_#`` varied across a compacted span, §19.4 compensation
+  bakes each row out to the width the re-emitted marker covers. Every column
+  *value* is preserved exactly; a row narrower than the marker gains
+  explicitly-empty trailing cells, which §3.6 permits since a reconstructed
+  row has no guaranteed width.
 
 Examples:
 	>>> import os, tempfile
@@ -89,15 +102,18 @@ Examples:
 import atexit
 import contextlib
 import functools
+import hashlib
 import io
 import os
 import re
+import secrets
 import sys
 import tempfile
 import threading
 import time
 import warnings
-from collections import OrderedDict, deque
+import zlib
+from collections import OrderedDict, deque, namedtuple
 from collections.abc import MutableMapping
 
 if os.name == 'nt':
@@ -119,6 +135,14 @@ WRITE_ACK_MEMORY = 'memory'
 WRITE_ACK_DISK = 'disk'
 WRITE_ACK_MODES = frozenset({WRITE_ACK_MEMORY, WRITE_ACK_DISK})
 
+MARKER_ROTATE = '#_rotate_#'
+#: §19.5 actions for parts superseded by a snapshot. Advisory: a conservative
+#: processor MAY downgrade delete -> rename -> keep.
+ROTATE_KEEP = 'keep'
+ROTATE_RENAME = 'rename'
+ROTATE_DELETE = 'delete'
+ROTATE_ACTIONS = (ROTATE_KEEP, ROTATE_RENAME, ROTATE_DELETE)
+
 #: Longest a Condition-signalled flusher sleeps when its queue is empty. Only a
 #: safety net against a lost wakeup -- writes notify the worker directly.
 _IDLE_WAKE_SECONDS = 1.0
@@ -137,12 +161,21 @@ OFFICIAL_MARKERS = frozenset({
 
 __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorted
 	# Reading
-	'read_store', 'read_offsets', 'read_last_record', 'replay_bytes', 'replay_part',
-	'process_record', 'classify_record', 'apply_marker', 'committed_payload',
+	'read_store', 'read_offsets', 'read_last_record', 'read_multipart',
+	'replay_bytes', 'replay_part', 'replay_parts', 'process_record',
+	'classify_record', 'apply_marker', 'committed_payload',
 	'resolve_missing_key', 'materialize_row',
 	# Writing
 	'append_record', 'append_records', 'delete_record', 'delete_records',
-	'truncate_part', 'snapshot_part', 'ensure_part_exists',
+	'truncate_part', 'snapshot_part', 'snapshot_store', 'ensure_part_exists',
+	# §15 integrity
+	'DigestSet', 'new_digest', 'verify_part', 'append_checksum',
+	'checksum_marker_key', 'checksum_algorithm', 'report_corruption',
+	'IntegrityError', 'IntegrityWarning', 'CORRUPTION_POLICIES',
+	# §17 multi-part / §19.5 rotation
+	'parse_part_name', 'part_path', 'new_ordinal', 'store_parts',
+	'store_part_paths', 'format_base', 'PartName', 'rotate_parts',
+	'SnapshotResult', 'ROTATE_ACTIONS', 'MARKER_ROTATE',
 	# Format primitives
 	'decode_field', 'encode_field', 'format_data_row', 'format_tombstone',
 	'format_marker_line', 'format_header_comment', 'build_snapshot_preamble',
@@ -151,8 +184,10 @@ __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorte
 	# Stores and state
 	'WalStore', 'OffsetStore', 'ReaderState', 'StoreEntry',
 	# Constants
-	'DEFAULT_DELIMITER', 'MARKER_DEFAULTS', 'MAX_SPEC_VERSION', 'OFFICIAL_MARKERS',
-	'STRICT_EXTENSIONS', 'COMPRESSION_EXTENSIONS', '__version__',
+	'DEFAULT_DELIMITER', 'MARKER_DEFAULTS', 'MARKER_WRITE_ACK', 'MAX_SPEC_VERSION',
+	'OFFICIAL_MARKERS', 'STRICT_EXTENSIONS', 'COMPRESSION_EXTENSIONS',
+	'WRITE_ACK_MEMORY', 'WRITE_ACK_DISK', 'WRITE_ACK_MODES',
+	'ROTATE_KEEP', 'ROTATE_RENAME', 'ROTATE_DELETE', '__version__',
 	# Deprecated legacy surface (removal: see LEGACY_REMOVAL_VERSION)
 	'readTabularFile', 'appendTabularFile', 'appendLinesTabularFile',
 	'clearTabularFile', 'scrubTabularFile', 'read_last_valid_line', 'get_delimiter',
@@ -187,10 +222,13 @@ class ReaderState:
 		write_ack (str): ``'memory'`` or ``'disk'`` from ``#_write_ack_#``
 			(§18.4). Advisory — it never affects reconstructed data (§12.4.3),
 			only when a writer considers a record acknowledged.
+		rotate (str): ``'keep'``, ``'rename'``, or ``'delete'`` from
+			``#_rotate_#`` (§19.5). Advisory — the recommended disposition of
+			parts a snapshot supersedes.
 	"""
 
-	__slots__ = ('defaults', 'fill_empty', 'return_on_missing', 'strip_trailing',
-				 'version', 'write_ack')
+	__slots__ = ('defaults', 'fill_empty', 'return_on_missing', 'rotate',
+				 'strip_trailing', 'version', 'write_ack')
 
 	def __init__(self):
 		self.version = 1
@@ -199,6 +237,7 @@ class ReaderState:
 		self.fill_empty = False
 		self.return_on_missing = True
 		self.write_ack = WRITE_ACK_MEMORY
+		self.rotate = ROTATE_KEEP
 
 	def copy(self):
 		"""Return a deep copy of this state (defaults list is independent).
@@ -220,6 +259,7 @@ class ReaderState:
 		s.strip_trailing = self.strip_trailing
 		s.fill_empty = self.fill_empty
 		s.write_ack = self.write_ack
+		s.rotate = self.rotate
 		s.return_on_missing = self.return_on_missing
 		return s
 
@@ -301,6 +341,368 @@ def decode_field(raw, delimiter):
 			out.append(raw[i])
 			i += 1
 	return ''.join(out)
+
+
+# ---------------------------------------------------------------------------
+# §15 integrity
+# ---------------------------------------------------------------------------
+
+class _Crc32:
+	"""CRC-32 (IEEE 802.3) accumulator with a hashlib-shaped interface."""
+
+	__slots__ = ('_v',)
+
+	def __init__(self):
+		self._v = 0
+
+	def update(self, data):
+		self._v = zlib.crc32(data, self._v)
+
+	def hexdigest(self):
+		return format(self._v & 0xFFFFFFFF, '08x')
+
+
+_CRC32C_TABLE = None
+
+
+def _crc32c_table():
+	"""Build (once) the reflected Castagnoli table used by :class:`_Crc32c`."""
+	global _CRC32C_TABLE  # memoized lookup table
+	if _CRC32C_TABLE is None:
+		table = []
+		for i in range(256):
+			crc = i
+			for _ in range(8):
+				crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+			table.append(crc)
+		_CRC32C_TABLE = tuple(table)
+	return _CRC32C_TABLE
+
+
+class _Crc32c:
+	"""CRC-32C (Castagnoli) accumulator, table-driven and dependency-free."""
+
+	__slots__ = ('_v',)
+
+	def __init__(self):
+		self._v = 0xFFFFFFFF
+
+	def update(self, data):
+		table = _crc32c_table()
+		v = self._v
+		for byte in data:
+			v = table[(v ^ byte) & 0xFF] ^ (v >> 8)
+		self._v = v
+
+	def hexdigest(self):
+		return format(self._v ^ 0xFFFFFFFF, '08x')
+
+
+def new_digest(algo):
+	"""Return a fresh accumulator for ``algo``, or ``None`` if unimplemented.
+
+	``None`` makes the corresponding ``#_checksum_<algo>_#`` line inert, which
+	is exactly what §15.3 requires of a reader that does not implement an
+	algorithm: no arming, no verification, no effect on reconstructed state.
+
+	Recognizes ``crc32`` and ``crc32c`` natively, ``blake3`` when the optional
+	third-party module is installed, and every fixed-length algorithm
+	:mod:`hashlib` offers. Variable-length XOFs (``shake_*``) are rejected
+	because §15.2 expects a single canonical hex digest.
+
+	Args:
+		algo: Algorithm name from the marker key, any case.
+
+	Returns:
+		object | None: Accumulator with ``update``/``hexdigest``, or ``None``.
+
+	Examples:
+		>>> d = new_digest('crc32'); d.update(b'123456789'); d.hexdigest()
+		'cbf43926'
+		>>> d = new_digest('crc32c'); d.update(b'123456789'); d.hexdigest()
+		'e3069283'
+		>>> new_digest('sha256').hexdigest()[:8]
+		'e3b0c442'
+		>>> new_digest('definitely-not-an-algorithm') is None
+		True
+	"""
+	algo = algo.lower()
+	if algo == 'crc32':
+		return _Crc32()
+	if algo == 'crc32c':
+		return _Crc32c()
+	if algo == 'blake3':
+		try:
+			import blake3
+		except ImportError:
+			return None
+		return blake3.blake3()
+	if algo.startswith('shake'):
+		return None  # XOF: no single canonical digest length
+	try:
+		return hashlib.new(algo)
+	except (ValueError, TypeError):
+		return None
+
+
+class DigestSet:
+	"""Armed per-algorithm digest accumulators (§15).
+
+	Integrity is opt-in: nothing is computed until a ``#_checksum_<algo>_#``
+	line arms an algorithm, and each algorithm keeps an independent
+	accumulator and independent segmentation (§15.5). Segments run
+	marker-to-marker and may span part boundaries (§15.4, §15.7).
+
+	Attributes:
+		mismatches (list): ``(algo, expected, actual)`` per detected
+			corruption. Detection only — §15.1 leaves the response to the
+			implementation.
+		verified (int): Count of segments that matched their stored digest.
+	"""
+
+	__slots__ = ('_acc', '_unimplemented', 'mismatches', 'verified')
+
+	def __init__(self):
+		self._acc = {}
+		self._unimplemented = set()
+		self.mismatches = []
+		self.verified = 0
+
+	def __bool__(self):
+		return bool(self._acc)
+
+	@property
+	def armed(self):
+		"""Return the set of currently armed algorithm names."""
+		return frozenset(self._acc)
+
+	def feed(self, raw, exclude=None):
+		"""Feed one record's raw on-disk bytes to every armed accumulator.
+
+		Args:
+			raw: Full raw line bytes including delimiters and the terminating
+				``\n`` (and a preceding ``\r`` if present) — §15.4.
+			exclude: Algorithm whose own marker line this is; a digest can
+				never cover its own marker (§15.4, §15.6).
+
+		Returns:
+			None
+		"""
+		if not self._acc:
+			return
+		for algo, acc in self._acc.items():
+			if algo != exclude:
+				acc.update(raw)
+
+	def checkpoint(self, algo, expected):
+		"""Process one ``#_checksum_<algo>_#`` line per §15.3.
+
+		Args:
+			algo: Algorithm named in the marker key.
+			expected: The marker's value field — a lowercase hex digest, or
+				``''``.
+
+		Returns:
+			str: ``'armed'`` (first marker for this algorithm; any value is
+			ignored because there is nothing before it to verify),
+			``'ok'``/``'mismatch'`` (segment verified), ``'reset'`` (empty
+			value: new segment, previous one left unverified), or ``'inert'``
+			(algorithm not implemented here).
+		"""
+		algo = algo.lower()
+		if algo in self._unimplemented:
+			return 'inert'
+		if algo not in self._acc:
+			acc = new_digest(algo)
+			if acc is None:
+				self._unimplemented.add(algo)
+				return 'inert'
+			self._acc[algo] = acc
+			return 'armed'
+		actual = self._acc[algo].hexdigest()
+		self._acc[algo] = new_digest(algo)
+		if not expected:
+			return 'reset'
+		if actual == expected.strip().lower():
+			self.verified += 1
+			return 'ok'
+		self.mismatches.append((algo, expected.strip().lower(), actual))
+		return 'mismatch'
+
+	def digest_for(self, algo):
+		"""Return the current hex digest of ``algo``'s open segment, or ``None``."""
+		acc = self._acc.get(algo.lower())
+		return None if acc is None else acc.hexdigest()
+
+
+class IntegrityError(Exception):
+	"""A §15 digest did not match and the corruption policy is ``'raise'``."""
+
+
+class IntegrityWarning(UserWarning):
+	"""A §15 digest did not match; §15.1 leaves the response to the reader."""
+
+
+#: Responses to a detected §15 mismatch. Detection is mandatory once armed;
+#: §15.1 makes the action implementation-defined.
+CORRUPTION_POLICIES = ('warn', 'raise', 'ignore')
+
+
+def report_corruption(digests, source, policy='warn'):
+	"""Act on any mismatches a :class:`DigestSet` collected (§15.1).
+
+	Args:
+		digests: The :class:`DigestSet` used during replay.
+		source: Path or description named in the message.
+		policy: ``'warn'`` (default), ``'raise'``, or ``'ignore'``.
+
+	Returns:
+		list: The mismatches, whatever the policy.
+
+	Raises:
+		IntegrityError: If ``policy`` is ``'raise'`` and a segment mismatched.
+		ValueError: If ``policy`` is not a recognized policy.
+	"""
+	if policy not in CORRUPTION_POLICIES:
+		raise ValueError(f'policy must be one of {CORRUPTION_POLICIES}, got {policy!r}')
+	if digests is None or not digests.mismatches:
+		return []
+	if policy == 'ignore':
+		return list(digests.mismatches)
+	detail = '; '.join(f'{algo}: expected {want}, computed {got}'
+					   for algo, want, got in digests.mismatches)
+	message = f'integrity check failed for {source!r} -- {detail}'
+	if policy == 'raise':
+		raise IntegrityError(message)
+	warnings.warn(message, IntegrityWarning, stacklevel=3)
+	return list(digests.mismatches)
+
+
+def verify_part(path, *, encoding='utf8', delimiter=None, errors='replace',
+				policy='ignore'):
+	"""Replay a part and return the §15 integrity result.
+
+	Args:
+		path: Filesystem path of the part.
+		encoding: Text encoding used to decode lines.
+		delimiter: Field delimiter; inferred from ``path`` when ``None``.
+		errors: Decode error policy; see :func:`_iter_records`.
+		policy: Passed to :func:`report_corruption`; defaults to ``'ignore'``
+			so the caller inspects the result rather than being warned.
+
+	Returns:
+		DigestSet: Carries ``mismatches`` and ``verified``. A part with no
+		``#_checksum_*_#`` markers verifies vacuously (§15.1).
+
+	Examples:
+		>>> import os, tempfile
+		>>> fd, path = tempfile.mkstemp(suffix='.tsvz'); os.close(fd)
+		>>> append_records(path, [['a', '1']])
+		>>> _ = append_checksum(path, 'crc32')       # arms; no value to verify
+		>>> append_records(path, [['b', '2']])
+		>>> _ = append_checksum(path, 'crc32')       # closes and records segment
+		>>> d = verify_part(path); d.verified, d.mismatches
+		(1, [])
+		>>> os.unlink(path)
+	"""
+	delimiter = delimiter or delimiter_for_path(path)
+	digests = DigestSet()
+	replay_part(path, delimiter, encoding=encoding, errors=errors, digests=digests)
+	report_corruption(digests, path, policy)
+	return digests
+
+
+def append_checksum(path, algo, *, encoding='utf8', delimiter=None, preceding=None):
+	"""Close the current §15 segment for ``algo`` with a checksum marker.
+
+	Replays the store to compute the digest of everything written since the
+	previous ``#_checksum_<algo>_#`` line, then appends a new marker carrying
+	it. The first marker for an algorithm carries no value, because §15.3
+	gives it nothing to verify — it only arms the accumulator.
+
+	When ``path`` names a part of a multi-part store, every earlier part is
+	replayed first: §15.4 segments run marker-to-marker across the whole
+	concatenation (§17.4), so a marker in one part closes a segment that may
+	have been armed in an earlier one.
+
+	§15.6: a digest can never cover its own marker line, so a single algorithm
+	leaves its own markers unprotected. Alternate two algorithms to have each
+	cover the other's digest lines.
+
+	Args:
+		path: Filesystem path of the part.
+		algo: Digest algorithm name (for example ``'sha256'``, ``'crc32'``).
+		encoding: Text encoding for the appended line.
+		delimiter: Field delimiter; inferred from ``path`` when ``None``.
+		preceding: Explicit list of earlier part paths. ``None`` auto-detects
+			them from ``path``'s store; pass ``()`` to treat ``path`` as
+			standalone.
+
+	Returns:
+		str: The digest written, or ``''`` for the arming marker.
+
+	Raises:
+		ValueError: If ``algo`` is not implemented here (§15.3 would make the
+			marker inert, so writing one would be pointless).
+	"""
+	if new_digest(algo) is None:
+		raise ValueError(
+			f'digest algorithm {algo!r} is not available; a marker for it would '
+			f'be inert on read (§15.3)')
+	delimiter = delimiter or delimiter_for_path(path)
+	if preceding is None:
+		preceding = _preceding_parts(path)
+	digests = DigestSet()
+	replay_parts([*preceding, path], delimiter, encoding=encoding, digests=digests)
+	value = digests.digest_for(algo) if algo.lower() in digests.armed else ''
+	key = checksum_marker_key(algo)
+	line = format_marker_line(key, [value], delimiter) if value else key
+	_warn_loose_extension(path, [line], delimiter)
+	with open_part(path, 'ab', encoding=encoding) as f:
+		f.write((line + '\n').encode(encoding, errors='replace'))
+	return value
+
+
+def _preceding_parts(path):
+	"""Return the parts of ``path``'s store that precede it in ordinal order.
+
+	Empty for a single unnumbered file. Used so a checksum marker closes the
+	segment its algorithm actually opened, which §15.4 allows to have started
+	in an earlier part.
+	"""
+	parsed = parse_part_name(path)
+	if parsed is None:
+		return []
+	store = f'{parsed.store_path}.{parsed.format_ext}'
+	return [pn.path for pn in store_parts(store)
+			if pn.ordinal_value < parsed.ordinal_value]
+
+
+def checksum_marker_key(algo):
+	"""Return the ``#_checksum_<algo>_#`` marker key for ``algo`` (§15.2).
+
+	Examples:
+		>>> checksum_marker_key('SHA256')
+		'#_checksum_sha256_#'
+	"""
+	return f'#_checksum_{algo.lower()}_#'
+
+
+def checksum_algorithm(f0_raw):
+	"""Return the algorithm named by a checksum marker key, or ``None``.
+
+	Examples:
+		>>> checksum_algorithm('#_checksum_sha256_#')
+		'sha256'
+		>>> checksum_algorithm('#_CHECKSUM_CRC32_#')
+		'crc32'
+		>>> checksum_algorithm('#_defaults_#') is None
+		True
+	"""
+	kl = f0_raw.lower()
+	if not CHECKSUM_MARKER_RE.match(kl):
+		return None
+	return kl[len('#_checksum_'):-len('_#')]
 
 
 def _needs_escape(value, delimiter):
@@ -401,7 +803,8 @@ def classify_record(f0_raw):
 		f0_raw: Undecoded first field of the line.
 
 	Returns:
-		str: One of ``'data'``, ``'comment'``, ``'marker'``, or ``'ignore'``.
+		str: One of ``'data'``, ``'comment'``, ``'marker'``, ``'checksum'``,
+		or ``'ignore'``.
 
 	Examples:
 		>>> classify_record('alice')
@@ -411,7 +814,7 @@ def classify_record(f0_raw):
 		>>> classify_record('#_defaults_#')
 		'marker'
 		>>> classify_record('#_checksum_sha256_#')
-		'ignore'
+		'checksum'
 		>>> classify_record('#_future_marker_#')
 		'ignore'
 	"""
@@ -422,7 +825,7 @@ def classify_record(f0_raw):
 	# §12.2.1: marker keys are compared case-insensitively over ASCII.
 	kl = f0_raw.lower()
 	if CHECKSUM_MARKER_RE.match(kl):
-		return 'ignore'
+		return 'checksum'
 	if kl in OFFICIAL_MARKERS:
 		return 'marker'
 	return 'ignore'
@@ -481,6 +884,10 @@ def apply_marker(state, f0_raw, value_fields, delimiter):
 		# Advisory only (§12.4.3): recorded for writers, never applied to data.
 		mode = (decoded[0].strip().lower() if decoded else '')
 		state.write_ack = mode if mode in WRITE_ACK_MODES else WRITE_ACK_MEMORY
+	elif kl == MARKER_ROTATE:
+		# Advisory only (§12.4.3); consumed by snapshot_store (§19.5).
+		action = (decoded[0].strip().lower() if decoded else '')
+		state.rotate = action if action in ROTATE_ACTIONS else ROTATE_KEEP
 
 
 def committed_payload(data):
@@ -581,7 +988,8 @@ def materialize_row(entry):
 
 
 def process_record(raw_line, state, store, delimiter, *, offset=None,
-				   store_offset=False, values_cache=None):
+				   store_offset=False, values_cache=None, digests=None,
+				   raw_bytes=None):
 	"""Process one logical line and update ``store``.
 
 	A line consisting of a lone key (no delimiter) is a tombstone
@@ -597,10 +1005,14 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 		offset: Byte offset of this line within the part (optional).
 		store_offset: If True, store ``offset`` instead of a :class:`StoreEntry`.
 		values_cache: Optional key→row cache updated alongside ``store``.
+		digests: Optional :class:`DigestSet` to feed and checkpoint (§15).
+		raw_bytes: The record's raw on-disk bytes including its terminator,
+			required when ``digests`` is given (§15.4).
 
 	Returns:
 		tuple: ``(kind, payload)`` where ``kind`` is one of ``'data'``,
-		``'tombstone'``, ``'marker'``, ``'comment'``, or ``'ignore'``.
+		``'tombstone'``, ``'marker'``, ``'comment'``, ``'checksum'``, or
+		``'ignore'``. For ``'checksum'`` the payload is the algorithm name.
 
 	Examples:
 		>>> st, store = ReaderState(), OrderedDict()
@@ -620,6 +1032,18 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 	fields = raw_line.split(delimiter)
 	f0 = fields[0]
 	kind = classify_record(f0)
+	algo = checksum_algorithm(f0) if kind == 'checksum' else None
+	# Appendix B ordering: classify, then feed every armed accumulator, then
+	# act. A checksum line is withheld only from its own algorithm (§15.4);
+	# other algorithms see it as ordinary content, which is what lets two
+	# staggered algorithms protect each other's digest lines (§15.6).
+	if digests is not None and raw_bytes is not None:
+		digests.feed(raw_bytes, exclude=algo)
+	if kind == 'checksum':
+		if digests is not None:
+			expected = decode_field(fields[1], delimiter) if len(fields) > 1 else ''
+			digests.checkpoint(algo, expected)
+		return kind, algo
 	if kind in ('comment', 'ignore'):
 		return kind, None
 	if kind == 'marker':
@@ -655,8 +1079,11 @@ def _iter_records(stream, encoding, *, errors='replace', source=''):
 	- records split on ``\\n`` (§4.2); at most one ``\\r`` immediately before
 	  the terminator is stripped, and a ``\\r`` anywhere else is field data;
 	- the terminating ``\\n`` is the commit marker, so a trailing unterminated
-	  line is discarded whether or not it would parse (§4.3-§4.5);
-	- blank lines are skipped.
+	  line is discarded whether or not it would parse (§4.3-§4.5).
+
+	Blank lines are yielded, not skipped: their raw bytes belong to any open
+	integrity segment (§15.4), and the reader discards them anyway as
+	empty-key rows (§8.4).
 
 	Streams rather than slurping, so peak memory does not include a copy of
 	the whole part. ``offset`` is a byte offset into the *decoded* stream,
@@ -671,12 +1098,15 @@ def _iter_records(stream, encoding, *, errors='replace', source=''):
 		source: Path used in the warning message.
 
 	Yields:
-		tuple: ``(offset, text)`` per committed record.
+		tuple: ``(offset, text, raw)`` per committed record, where ``raw`` is
+		the untouched on-disk bytes including the terminator (§15.4).
 
 	Examples:
 		>>> import io
-		>>> list(_iter_records(io.BytesIO(b'a\\n\\nb\\r\\ntorn'), 'utf8'))
-		[(0, 'a'), (3, 'b')]
+		>>> [(o, t) for o, t, _ in _iter_records(io.BytesIO(b'a\\n\\nb\\r\\ntorn'), 'utf8')]
+		[(0, 'a'), (2, ''), (3, 'b')]
+		>>> [r for _, _, r in _iter_records(io.BytesIO(b'a\\r\\n'), 'utf8')]
+		[b'a\\r\\n']
 	"""
 	pos = 0
 	warned = False
@@ -689,6 +1119,7 @@ def _iter_records(stream, encoding, *, errors='replace', source=''):
 		if line.endswith(b'\r'):  # removesuffix needs 3.9+
 			line = line[:-1]
 		if not line:
+			yield start, '', raw
 			continue
 		try:
 			text = line.decode(encoding)
@@ -704,11 +1135,12 @@ def _iter_records(stream, encoding, *, errors='replace', source=''):
 					f'replacement characters. Further occurrences not reported.',
 					UnicodeWarning, stacklevel=2)
 			text = line.decode(encoding, errors=errors)
-		yield start, text
+		yield start, text, raw
 
 
 def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
-				 store_offset=False, values_cache=None, errors='replace'):
+				 store_offset=False, values_cache=None, errors='replace',
+				 digests=None):
 	"""Replay committed bytes into a key->entry mapping (last write wins).
 
 	Only the committed payload is processed (§4.3).
@@ -722,6 +1154,7 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 		store_offset: If True, store byte offsets instead of entries.
 		values_cache: Optional key->row cache filled during replay.
 		errors: Decode error policy; see :func:`_iter_records`.
+		digests: Optional :class:`DigestSet` collecting §15 verification.
 
 	Returns:
 		tuple: ``(store, state)`` where ``state`` is the final
@@ -735,16 +1168,18 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 	if store is None:
 		store = OrderedDict()
 	state = ReaderState()
-	for offset, line in _iter_records(io.BytesIO(data), encoding, errors=errors):
+	for offset, line, raw in _iter_records(io.BytesIO(data), encoding, errors=errors):
 		process_record(
 			line, state, store, delimiter,
 			offset=offset, store_offset=store_offset, values_cache=values_cache,
+			digests=digests, raw_bytes=raw,
 		)
 	return store, state
 
 
 def replay_part(path, delimiter, *, encoding='utf8', store=None,
-				store_offset=False, values_cache=None, errors='replace'):
+				store_offset=False, values_cache=None, errors='replace',
+				digests=None, state=None):
 	"""Replay a part file from disk into a key->entry mapping.
 
 	Streams the part rather than reading it whole, so peak memory scales with
@@ -759,23 +1194,121 @@ def replay_part(path, delimiter, *, encoding='utf8', store=None,
 		store_offset: If True, store byte offsets instead of entries.
 		values_cache: Optional key->row cache filled during replay.
 		errors: Decode error policy; see :func:`_iter_records`.
+		digests: Optional :class:`DigestSet` collecting §15 verification.
+		state: Optional :class:`ReaderState` to continue from. Multi-part
+			replay passes the previous part's state so marker state carries
+			across the boundary (§17.4).
 
 	Returns:
 		tuple: ``(store, state)`` after replaying the part.
 	"""
 	if store is None:
 		store = OrderedDict()
-	state = ReaderState()
+	if state is None:
+		state = ReaderState()
 	try:
 		with open_part(path, 'rb', encoding=encoding) as f:
-			for offset, line in _iter_records(f, encoding, errors=errors, source=path):
+			for offset, line, raw in _iter_records(f, encoding, errors=errors, source=path):
 				process_record(
 					line, state, store, delimiter, offset=offset,
 					store_offset=store_offset, values_cache=values_cache,
+					digests=digests, raw_bytes=raw,
 				)
 	except FileNotFoundError:
-		return store, ReaderState()
+		return store, state
 	return store, state
+
+
+def replay_parts(paths, delimiter, *, encoding='utf8', store=None, state=None,
+				 digests=None, errors='replace'):
+	"""Replay several parts as ONE concatenation (§17.4).
+
+	Marker state (§12) and integrity accumulators (§15.4) both carry across
+	part boundaries, because the logical store is the concatenation of its
+	parts in ordinal order — not a sequence of independent files.
+
+	Args:
+		paths: Part paths already in ordinal order (see :func:`store_parts`).
+		delimiter: Field delimiter.
+		encoding: Text encoding used to decode lines.
+		store: Optional mapping to populate.
+		state: Optional starting :class:`ReaderState`.
+		digests: Optional :class:`DigestSet` spanning every part.
+		errors: Decode error policy; see :func:`_iter_records`.
+
+	Returns:
+		tuple: ``(store, state, digests)`` after the last part.
+	"""
+	if store is None:
+		store = OrderedDict()
+	if state is None:
+		state = ReaderState()
+	if digests is None:
+		digests = DigestSet()
+	for path in paths:
+		store, state = replay_part(
+			path, delimiter, encoding=encoding, store=store, state=state,
+			digests=digests, errors=errors,
+		)
+	return store, state, digests
+
+
+def read_multipart(store_path, *, encoding='utf8', delimiter=None, store=None,
+				   errors='replace', policy='warn', include_rotated=False):
+	"""Replay a whole multi-part store into a key→row mapping (§17).
+
+	Parts are discovered by :func:`store_part_paths` and replayed in ordinal
+	order as one stream, so last-wins, first-appearance order, marker state,
+	and integrity segments all behave as if the parts were concatenated.
+	A single unnumbered file is handled as the one-part case (§17.1).
+
+	Byte-offset indexing (:func:`read_offsets`, :class:`OffsetStore`) is
+	single-part only: an offset alone cannot address a multi-part store, which
+	would need a ``(part, offset)`` pair.
+
+	Args:
+		store_path: Store path including its format extension.
+		encoding: Text encoding used to decode lines.
+		delimiter: Field delimiter; inferred from ``store_path`` when ``None``.
+		store: Optional mapping to populate.
+		errors: Decode error policy; see :func:`_iter_records`.
+		policy: Response to a §15 mismatch — ``'warn'``, ``'raise'``,
+			``'ignore'``.
+		include_rotated: If True, also replay ``.rotated`` parts. Off by
+			default because §17.2 excludes them from normal loading.
+
+	Returns:
+		MutableMapping: Ordered key→row mapping, carrying ``_reader_state``,
+		``_digests``, and ``_parts`` attributes.
+
+	Raises:
+		FileNotFoundError: If the store has no parts and no single file.
+
+	Examples:
+		>>> import os, tempfile
+		>>> d = tempfile.mkdtemp(); base = os.path.join(d, 'events.tsvz')
+		>>> append_records(part_path(base, 1), [['a', '1'], ['b', '2']], create=True)
+		>>> append_records(part_path(base, 2), [['b', '9'], ['a']], create=True)
+		>>> dict(read_multipart(base))
+		{'b': ['b', '9']}
+	"""
+	delimiter = delimiter or delimiter_for_path(store_path)
+	paths = store_part_paths(store_path, include_rotated=include_rotated)
+	if not paths:
+		raise FileNotFoundError(store_path)
+	if store is None:
+		store = OrderedDict()
+	replayed, state, digests = replay_parts(
+		paths, delimiter, encoding=encoding, errors=errors)
+	report_corruption(digests, store_path, policy)
+	clear, setitem = _base_mutators(store)
+	clear(store)
+	for key, entry in replayed.items():
+		setitem(store, key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
+	_attach_replay_meta(store, state, None, digests)
+	with contextlib.suppress(AttributeError):
+		store._parts = list(paths)
+	return store
 
 
 def resolve_missing_key(key, state):
@@ -894,6 +1427,67 @@ def format_header_comment(columns, delimiter):
 	encoded = [encode_field(c, delimiter) for c in columns]
 	encoded[0] = '#' + encoded[0]
 	return delimiter.join(encoded)
+
+
+def _bake_row(entry, width):
+	"""Resolve ``entry`` to at least ``width`` fields for a snapshot (§19.4).
+
+	Beyond the row's own materialized width, each extra column takes the value
+	§14.3 gives it *at the row's original position* — i.e. from the defaults
+	that were in force when the row was written, not the snapshot's. That is
+	what lets a snapshot hoist ``#_defaults_#`` to the top without changing
+	how a row written before that marker resolves.
+	"""
+	row = materialize_row(entry) if isinstance(entry, StoreEntry) else list(entry)
+	defaults = entry.row_defaults if isinstance(entry, StoreEntry) else []
+	while len(row) < width:
+		row.append(_default_at(defaults, len(row)))
+	return row
+
+
+def _snapshot_body(replayed, state, delimiter, header=None):
+	"""Build the §19 snapshot lines for a set of replayed entries.
+
+	§19.4 requires a snapshot to reproduce the store's exact observable read
+	result. Hoisting the final ``#_defaults_#`` to the top of the snapshot is
+	safe only when that marker never changed over the compacted span, because
+	forward-only binding (§12.4.4) means a row written before a defaults line
+	resolves its absent columns differently from one written after.
+
+	So: when every live row bound the same defaults as the final state, the
+	rows stay sparse and the marker is simply re-emitted. When they did not,
+	every row is baked out to the width the marker covers, carrying the value
+	each column resolved to at its own position. ``#_defaults_#`` is still
+	emitted either way, because a missing-key read returns the active defaults
+	(§14.3) and dropping it would change *that* observable.
+
+	Args:
+		replayed: Key -> :class:`StoreEntry` mapping from replay.
+		state: Final :class:`ReaderState` of the compacted span.
+		delimiter: Field delimiter.
+		header: Optional header comment (a §19.2.3c deviation when given).
+
+	Returns:
+		list[str]: Snapshot lines, markers first, then live rows in
+		first-appearance order.
+	"""
+	entries = [e for e in replayed.values() if isinstance(e, StoreEntry)]
+	uniform = all(e.row_defaults == state.defaults for e in entries)
+	snap = ReaderState()
+	snap.defaults = list(state.defaults)
+	snap.return_on_missing = state.return_on_missing
+	snap.write_ack = state.write_ack
+	lines = []
+	if header:
+		lines.append(format_header_comment(_parse_columns(header, delimiter), delimiter))
+	lines.extend(build_snapshot_preamble(snap, delimiter))
+	width = 0 if uniform else len(state.defaults) + 1
+	for entry in replayed.values():
+		row = (list(entry.row) if uniform and isinstance(entry, StoreEntry)
+			   else _bake_row(entry, width))
+		if isinstance(row, list) and row:
+			lines.append(format_data_row(row, delimiter))
+	return lines
 
 
 def build_snapshot_preamble(state, delimiter):
@@ -1018,6 +1612,211 @@ def _warn_loose_extension(path, lines, delimiter):
 			return
 
 
+# ---------------------------------------------------------------------------
+# §17 multi-part stores
+# ---------------------------------------------------------------------------
+
+#: Appendix A part-file grammar:
+#: ``store-path "." format-ext "." ordinal [".rotated"] ["." codec]``
+PART_NAME_RE = re.compile(
+	r'^(?P<store>.+)'
+	r'\.(?P<ext>tsvz|csvz|nsvz|psvz|tsv|csv|nsv|psv)'
+	r'\.(?P<ordinal>[0-9A-Fa-f]+)'
+	r'(?P<rotated>\.rotated)?'
+	r'(?:\.(?P<codec>gz|gzip|bz2|bzip2|xz|lzma|zst|zstd))?$',
+	re.ASCII | re.IGNORECASE)
+
+PartName = namedtuple(
+	'PartName', 'path store_path format_ext ordinal ordinal_value rotated codec')
+
+
+def parse_part_name(path):
+	"""Parse a §17.2 part filename, or return ``None`` if it is not one.
+
+	The ordinal is a hexadecimal integer (§17.3); ``.rotated`` is an infix
+	before any compression suffix (§16.2). A plain ``store.tsvz`` with no
+	ordinal is *not* a part — it is the degenerate single-file store of §17.1.
+
+	Args:
+		path: Filesystem path to parse.
+
+	Returns:
+		PartName | None: Parsed components, with ``ordinal_value`` the ordinal
+		as an integer.
+
+	Examples:
+		>>> pn = parse_part_name('/d/events.tsvz.1f')
+		>>> pn.store_path, pn.format_ext, pn.ordinal_value, pn.rotated, pn.codec
+		('/d/events', 'tsvz', 31, False, '')
+		>>> pn = parse_part_name('/d/events.tsvz.0a.rotated.zst')
+		>>> pn.ordinal_value, pn.rotated, pn.codec
+		(10, True, 'zst')
+		>>> parse_part_name('/d/events.tsvz') is None
+		True
+		>>> parse_part_name('/d/events.tsvz.gz') is None
+		True
+	"""
+	match = PART_NAME_RE.match(str(path))
+	if match is None:
+		return None
+	ordinal = match.group('ordinal')
+	return PartName(
+		path=str(path),
+		store_path=match.group('store'),
+		format_ext=match.group('ext'),
+		ordinal=ordinal,
+		ordinal_value=int(ordinal, 16),
+		rotated=bool(match.group('rotated')),
+		codec=match.group('codec') or '',
+	)
+
+
+def part_path(store_path, ordinal, *, rotated=False, codec=''):
+	"""Build a §17.2 part filename.
+
+	Args:
+		store_path: Store path including its format extension, e.g.
+			``/d/events.tsvz``.
+		ordinal: Hex ordinal string, or an int to be rendered as hex.
+		rotated: If True, insert the ``.rotated`` component (§19.5).
+		codec: Optional compression suffix, with or without a leading dot.
+
+	Returns:
+		str: The part path.
+
+	Examples:
+		>>> part_path('/d/events.tsvz', 31)
+		'/d/events.tsvz.1f'
+		>>> part_path('/d/events.tsvz', '0a', rotated=True, codec='zst')
+		'/d/events.tsvz.0a.rotated.zst'
+	"""
+	if isinstance(ordinal, int):
+		ordinal = format(ordinal, 'x')
+	suffix = '.rotated' if rotated else ''
+	if codec:
+		suffix += '.' + codec.lstrip('.')
+	return f'{store_path}.{ordinal}{suffix}'
+
+
+def new_ordinal():
+	"""Return a fresh ordinal: a UUIDv7 as 32 hex characters (§17.6).
+
+	UUIDv7 is time-ordered, so parts sort chronologically under the
+	hexadecimal-integer ordering of §17.3, and carries random bits so two
+	processes starting in the same millisecond do not collide.
+
+	Returns:
+		str: 32 lowercase hex characters.
+
+	Examples:
+		>>> o = new_ordinal()
+		>>> len(o), int(o, 16) > 0, (int(o, 16) >> 76) & 0xF
+		(32, True, 7)
+		>>> new_ordinal() != new_ordinal()
+		True
+	"""
+	timestamp = int(time.time() * 1000) & ((1 << 48) - 1)
+	rand_a = secrets.randbits(12)
+	rand_b = secrets.randbits(62)
+	value = (timestamp << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
+	return format(value, '032x')
+
+
+def store_parts(store_path, *, include_rotated=False):
+	"""Return a store's parts in ordinal order (§17.3).
+
+	Ordering is by the **integer** value of the hex ordinal, never
+	lexicographic — ``.f`` (15) precedes ``.10`` (16) even though it follows
+	it as a string. Parts carrying ``.rotated`` are excluded from normal
+	loading (§17.2, §19.5).
+
+	Args:
+		store_path: Store path including its format extension. A part path is
+			accepted too and normalized back to its store.
+		include_rotated: If True, also return ``.rotated`` parts.
+
+	Returns:
+		list[PartName]: Parts in ascending ordinal order. Empty when the store
+		is a single unnumbered file or does not exist.
+	"""
+	parsed = parse_part_name(store_path)
+	if parsed is not None:
+		store_path = f'{parsed.store_path}.{parsed.format_ext}'
+	directory = os.path.dirname(store_path) or '.'
+	base = os.path.basename(store_path)
+	try:
+		names = os.listdir(directory)
+	except (FileNotFoundError, NotADirectoryError):
+		return []
+	found = []
+	for name in names:
+		candidate = parse_part_name(os.path.join(directory, name))
+		if candidate is None:
+			continue
+		if os.path.basename(f'{candidate.store_path}.{candidate.format_ext}') != base:
+			continue
+		if candidate.rotated and not include_rotated:
+			continue
+		found.append(candidate)
+	# §17.3: integer ordering; path breaks ties so the result is deterministic.
+	found.sort(key=lambda pn: (pn.ordinal_value, pn.path))
+	return found
+
+
+def store_part_paths(store_path, *, include_rotated=False):
+	"""Return the paths making up a store, in replay order.
+
+	Falls back to ``[store_path]`` for the single-file case of §17.1 when no
+	numbered parts exist.
+
+	Args:
+		store_path: Store path including its format extension.
+		include_rotated: If True, also include ``.rotated`` parts.
+
+	Returns:
+		list[str]: Part paths in ordinal order, or the single file, or ``[]``.
+	"""
+	parts = store_parts(store_path, include_rotated=include_rotated)
+	if parts:
+		if os.path.isfile(store_path):
+			warnings.warn(
+				f'{store_path!r} exists alongside numbered parts; the numbered '
+				f'parts are the store (§17.1) and the unnumbered file is ignored.',
+				UserWarning, stacklevel=2)
+		return [pn.path for pn in parts]
+	return [store_path] if os.path.isfile(store_path) else []
+
+
+def format_base(path):
+	"""Reduce ``path`` to its store path plus format extension, lowercased.
+
+	§16.3: format and delimiter inference strip the compression suffix first,
+	and then the §17 ordinal and ``.rotated`` components. Without this a part
+	named ``events.csvz.1f`` infers the fallback TAB delimiter instead of the
+	comma its CSVZ variant requires.
+
+	Args:
+		path: Any part path, store path, or plain filename.
+
+	Returns:
+		str: Lowercased path through the format extension.
+
+	Examples:
+		>>> format_base('events.csvz.1f')
+		'events.csvz'
+		>>> format_base('events.psvz.0a.rotated.zst')
+		'events.psvz'
+		>>> format_base('data.csv.gz')
+		'data.csv'
+		>>> format_base('plain.tsvz')
+		'plain.tsvz'
+	"""
+	parsed = parse_part_name(path)
+	if parsed is not None:
+		return f'{parsed.store_path}.{parsed.format_ext}'.lower()
+	return _strip_compression_suffix(path)
+
+
 def is_strict_store(path):
 	"""Return True if ``path`` uses a strict ``*z`` store extension (§5).
 
@@ -1036,8 +1835,10 @@ def is_strict_store(path):
 		(True, False)
 		>>> is_strict_store('data.csvz.gz')
 		True
+		>>> is_strict_store('data.csvz.1f'), is_strict_store('data.csv.1f')
+		(True, False)
 	"""
-	lower = _strip_compression_suffix(path)
+	lower = format_base(path)
 	return any(lower.endswith(ext) for ext in STRICT_EXTENSIONS)
 
 
@@ -1061,12 +1862,14 @@ def delimiter_for_path(path, delimiter=None):
 		('\\t', ',', '|')
 		>>> delimiter_for_path('data.csv.gz')
 		','
+		>>> delimiter_for_path('events.csvz.1f'), delimiter_for_path('events.psvz.0a.rotated')
+		(',', '|')
 		>>> delimiter_for_path('x.unknown', delimiter='|')
 		'|'
 	"""
 	if delimiter is not None:
 		return delimiter or DEFAULT_DELIMITER
-	lower = _strip_compression_suffix(path)
+	lower = format_base(path)
 	if lower.endswith(('.csv', '.csvz')):
 		return ','
 	if lower.endswith(('.nsv', '.nsvz')):
@@ -1233,11 +2036,13 @@ def _base_mutators(store):
 	return type(store).clear, type(store).__setitem__
 
 
-def _attach_replay_meta(target, state, values_cache=None):
+def _attach_replay_meta(target, state, values_cache=None, digests=None):
 	try:
 		target._reader_state = state
 		if values_cache is not None:
 			target._values_cache = values_cache
+		if digests is not None:
+			target._digests = digests
 	except AttributeError:
 		pass
 
@@ -1282,7 +2087,7 @@ def read_last_record(path, *, encoding='utf8', delimiter=None, store_offset=Fals
 	# before it.
 	try:
 		with open_part(path, 'rb', encoding=encoding) as f:
-			for offset, line in _iter_records(f, encoding, source=path):
+			for offset, line, _raw in _iter_records(f, encoding, source=path):
 				scratch.clear()
 				kind, entry = process_record(line, state, scratch, delimiter)
 				if kind == 'data' and entry is not None:
@@ -1321,12 +2126,12 @@ def _fit_row(row, column_count):
 
 
 def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
-				 store_offset, cache_values=True):
+				 store_offset, cache_values=True, policy='warn'):
 	"""Shared body of :func:`read_store` and :func:`read_offsets`.
 
 	Returns:
-		tuple: ``(store, state, values_cache)``; ``values_cache`` is ``None``
-		unless ``store_offset`` is True.
+		tuple: ``(store, state, values_cache, digests)``; ``values_cache`` is
+		``None`` unless ``store_offset`` is True.
 	"""
 	header_cols = _parse_columns(header, delimiter) if header else []
 	ensure_part_exists(
@@ -1334,10 +2139,13 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 		header=header_cols or None, defaults=_normalize_defaults(defaults),
 	)
 	values_cache = {} if (store_offset and cache_values) else None
+	# A DigestSet costs nothing until a #_checksum_*_# line arms it (§15.1).
+	digests = DigestSet()
 	replayed, state = replay_part(
 		path, delimiter, encoding=encoding, store=OrderedDict(),
-		store_offset=store_offset, values_cache=values_cache,
+		store_offset=store_offset, values_cache=values_cache, digests=digests,
 	)
+	report_corruption(digests, path, policy)
 	# Replay is a read: fill the target through its base mapping so a live
 	# store's clear()/__setitem__ side effects (truncate, WAL append) never
 	# fire. See _base_mutators.
@@ -1346,12 +2154,12 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 	for key, value in replayed.items():
 		setitem(store, key, value if store_offset or not isinstance(value, StoreEntry)
 				else materialize_row(value))
-	return store, state, values_cache
+	return store, state, values_cache, digests
 
 
 def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 			   defaults=None, store=None, store_offset=False, last_record_only=False,
-			   header=None):
+			   header=None, policy='warn'):
 	"""Replay a part into an ordered mapping of key to row list.
 
 	Rows are in first-appearance order (§3.4). Each row keeps the width it
@@ -1372,9 +2180,13 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 		store_offset: Deprecated; use :func:`read_offsets`.
 		last_record_only: Deprecated; use :func:`read_last_record`.
 		header: Header comment written **only when creating** a new part.
+		policy: Response to a §15 integrity mismatch — ``'warn'`` (default),
+			``'raise'``, or ``'ignore'``. A part with no ``#_checksum_*_#``
+			markers is never checked (§15.1).
 
 	Returns:
-		MutableMapping: Ordered key→row mapping.
+		MutableMapping: Ordered key→row mapping. Carries a ``_digests``
+		attribute with the §15 result.
 
 	Raises:
 		FileNotFoundError: If the part is absent and ``create`` is False.
@@ -1405,22 +2217,23 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 			DeprecationWarning, stacklevel=2)
 		if store is None:
 			store = OrderedDict()
-		store, state, values_cache = _replay_into(
+		store, state, values_cache, digests = _replay_into(
 			path, store, create=create, encoding=encoding, delimiter=delimiter,
-			defaults=defaults, header=header, store_offset=True)
-		_attach_replay_meta(store, state, values_cache)
+			defaults=defaults, header=header, store_offset=True, policy=policy)
+		_attach_replay_meta(store, state, values_cache, digests)
 		return store
 	if store is None:
 		store = OrderedDict()
-	store, state, _ = _replay_into(
+	store, state, _values, digests = _replay_into(
 		path, store, create=create, encoding=encoding, delimiter=delimiter,
-		defaults=defaults, header=header, store_offset=False)
-	_attach_replay_meta(store, state)
+		defaults=defaults, header=header, store_offset=False, policy=policy)
+	_attach_replay_meta(store, state, None, digests)
 	return store
 
 
 def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
-				 defaults=None, header=None, store=None, cache_values=True):
+				 defaults=None, header=None, store=None, cache_values=True,
+				 policy='warn'):
 	"""Replay a part into a key→byte-offset index instead of materialized rows.
 
 	Offsets address the start of each key's winning record in the *decoded*
@@ -1456,11 +2269,11 @@ def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 	delimiter = delimiter or delimiter_for_path(path)
 	if store is None:
 		store = OrderedDict()
-	store, state, values_cache = _replay_into(
+	store, state, values_cache, digests = _replay_into(
 		path, store, create=create, encoding=encoding, delimiter=delimiter,
 		defaults=defaults, header=header, store_offset=True,
-		cache_values=cache_values)
-	_attach_replay_meta(store, state, values_cache)
+		cache_values=cache_values, policy=policy)
+	_attach_replay_meta(store, state, values_cache, digests)
 	return store, values_cache, state
 
 
@@ -1722,25 +2535,168 @@ def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=N
 		[]
 		>>> os.unlink(path)
 	"""
-	data = read_store(path, encoding=encoding, delimiter=delimiter, store=store)
 	delimiter = delimiter or delimiter_for_path(path)
-	state = getattr(data, '_reader_state', ReaderState())
-	snap = ReaderState()
-	snap.defaults = list(state.defaults)
-	snap.return_on_missing = state.return_on_missing
-	snap.write_ack = state.write_ack
-	header_cols = _parse_columns(header, delimiter)
-	lines = []
-	if header_cols:
-		lines.append(format_header_comment(header_cols, delimiter))
-	lines.extend(build_snapshot_preamble(snap, delimiter))
-	for row in data.values():
-		if isinstance(row, list) and row:
-			lines.append(format_data_row(row, delimiter))
+	# Replay to entries, not materialized rows: §19.4 compensation needs each
+	# row's write-time defaults, which materialization has already folded away.
+	replayed, state = replay_part(path, delimiter, encoding=encoding)
+	data = OrderedDict(
+		(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
+		for key, entry in replayed.items())
+	if store is not None:
+		clear, setitem = _base_mutators(store)
+		clear(store)
+		for key, row in data.items():
+			setitem(store, key, row)
+		_attach_replay_meta(store, state)
+		data = store
+	lines = _snapshot_body(replayed, state, delimiter, header=header)
 	_warn_loose_extension(path, lines, delimiter)
 	_atomic_rewrite(path, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
 					encoding=encoding)
 	return data
+
+
+SnapshotResult = namedtuple(
+	'SnapshotResult', 'path ordinal subsumed rotate_action data')
+
+
+def rotate_parts(parts, action, *, allow_delete=False):
+	"""Apply a §19.5 rotate action to the parts a snapshot superseded.
+
+	Args:
+		parts: :class:`PartName` records to act on.
+		action: ``'keep'``, ``'rename'``, or ``'delete'``.
+		allow_delete: §19.5 lets a conservative processor downgrade
+			``delete`` -> ``rename`` -> ``keep``. This implementation takes
+			that option by default: ``delete`` becomes ``rename`` unless the
+			caller opts in, so a stale marker cannot destroy history.
+
+	Returns:
+		tuple: ``(effective_action, [(old_path, new_path_or_None), ...])``.
+
+	Raises:
+		ValueError: If ``action`` is not a §19.5 action.
+	"""
+	if action not in ROTATE_ACTIONS:
+		raise ValueError(f'rotate action must be one of {ROTATE_ACTIONS}, got {action!r}')
+	if action == ROTATE_DELETE and not allow_delete:
+		action = ROTATE_RENAME
+	changes = []
+	if action == ROTATE_KEEP:
+		return action, changes
+	for part in parts:
+		if action == ROTATE_DELETE:
+			with contextlib.suppress(FileNotFoundError):
+				os.unlink(part.path)
+			changes.append((part.path, None))
+			continue
+		if part.rotated:
+			continue
+		store_base = f'{part.store_path}.{part.format_ext}'
+		target = part_path(store_base, part.ordinal, rotated=True, codec=part.codec)
+		os.replace(part.path, target)
+		changes.append((part.path, target))
+	return action, changes
+
+
+def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
+				   rotate=None, allow_delete=False, quiesce=False,
+				   policy='warn'):
+	"""Compact a multi-part store following the full §19.2 procedure.
+
+	Unlike :func:`snapshot_part`, which rewrites one file in place, this
+	implements the race-free form: it identifies an **immutable prefix**, and
+	emits the snapshot as a *new* part whose ordinal lies strictly between
+	that prefix and the still-live active part. The writer is never paused and
+	never notified; because the snapshot lands in an older slot than the
+	active part, no regression is possible (§19.2.5).
+
+	  ``… prefix parts … | snapshot S | active part (writer still appending)``
+
+	The highest-ordinal part is assumed to be the active one. Pass
+	``quiesce=True`` when no writer is running to fold every part into the
+	snapshot instead (§19.3).
+
+	Rows carry fully resolved values under the §19.4 preamble, so the
+	compacted store reads back identically (see
+	:func:`build_snapshot_preamble`).
+
+	Args:
+		store_path: Store path including its format extension.
+		encoding: Text encoding for read/write.
+		delimiter: Field delimiter; inferred from ``store_path`` when ``None``.
+		header: Optional header comment. Off by default: §19.2.3c says a
+			snapshot contains no comments.
+		rotate: §19.5 action for the subsumed prefix. ``None`` uses the
+			store's ``#_rotate_#`` marker (built-in default ``keep``).
+		allow_delete: Permit the ``delete`` action; otherwise it is downgraded
+			to ``rename``, which §19.5 explicitly sanctions.
+		quiesce: Treat every part as immutable and place the snapshot above
+			them all. Only safe with no live writer (§19.3).
+		policy: Response to a §15 mismatch while replaying the prefix.
+
+	Returns:
+		SnapshotResult | None: ``None`` when there is nothing to compact (a
+		store with no immutable prefix).
+
+	Raises:
+		FileNotFoundError: If the store has no parts.
+		ValueError: If the store is a single unnumbered file (use
+			:func:`snapshot_part`), or if no ordinal fits strictly between the
+			prefix and the active part (§19.3).
+	"""
+	delimiter = delimiter or delimiter_for_path(store_path)
+	parts = store_parts(store_path)
+	if not parts:
+		if os.path.isfile(store_path):
+			raise ValueError(
+				f'{store_path!r} is a single unnumbered file (§17.1); use '
+				f'snapshot_part() for that case.')
+		raise FileNotFoundError(store_path)
+
+	if quiesce:
+		prefix, active = parts, None
+	else:
+		prefix, active = parts[:-1], parts[-1]
+	if not prefix:
+		return None  # only the active part exists; nothing is immutable yet
+
+	# §19.2.2: replay the immutable prefix only -- never the active part.
+	replayed, state, digests = replay_parts(
+		[pn.path for pn in prefix], delimiter, encoding=encoding)
+	report_corruption(digests, store_path, policy)
+	data = OrderedDict(
+		(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
+		for key, entry in replayed.items())
+
+	# §19.3: slot S strictly between the prefix maximum and the active part.
+	low = prefix[-1].ordinal_value
+	width = max(len(pn.ordinal) for pn in parts)
+	if active is None:
+		ordinal_value = low + 1
+	else:
+		high = active.ordinal_value
+		if high - low < 2:
+			raise ValueError(
+				f'no ordinal fits strictly between {prefix[-1].ordinal} and '
+				f'{active.ordinal} (§19.3): use sparse ordinals such as '
+				f'new_ordinal(), or quiesce writes and pass quiesce=True.')
+		ordinal_value = low + (high - low) // 2
+	ordinal = format(ordinal_value, f'0{width}x')
+
+	lines = _snapshot_body(replayed, state, delimiter, header=header)
+
+	target = part_path(store_path, ordinal, codec=prefix[-1].codec)
+	_warn_loose_extension(target, lines, delimiter)
+	# §19.2.3: write it durably before anything else changes.
+	_atomic_rewrite(target, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
+					encoding=encoding)
+
+	# §19.2.4: only once S is durable, dispose of the prefix it subsumes.
+	action = state.rotate if rotate is None else rotate
+	action, _changes = rotate_parts(prefix, action, allow_delete=allow_delete)
+	return SnapshotResult(path=target, ordinal=ordinal, subsumed=[pn.path for pn in prefix],
+						  rotate_action=action, data=data)
 
 
 # ---------------------------------------------------------------------------
@@ -1959,13 +2915,20 @@ class WalStore(_StoreCommon, OrderedDict):
 	``del`` for removals — all persist to the WAL.
 
 	Args:
-		path: Filesystem path of the backing part.
+		path: Filesystem path of the backing part, or -- with
+			``multipart=True`` -- of the store (§17.1).
 		header: Optional column names written when creating the part.
 		create: If True, create a missing part on open.
 		encoding: Text encoding for append I/O.
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
 		defaults: Optional value-column defaults.
-		flush_interval: Seconds between background flush attempts.
+		flush_interval: Longest a queued write waits before the background
+			flusher commits it; also how long a burst may coalesce.
+		write_ack: §18.4 mode, ``'memory'`` or ``'disk'``. ``None`` defers to
+			the part's ``#_write_ack_#`` marker.
+		multipart: If True, treat ``path`` as a §17 store: replay every part
+			in ordinal order, and append to a **new** part opened with a
+			fresh ordinal (§17.7).
 
 	Examples:
 		>>> import os, tempfile, time
@@ -1984,13 +2947,19 @@ class WalStore(_StoreCommon, OrderedDict):
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
 				 delimiter=None, defaults=None, flush_interval=0.01,
-				 write_ack=None):
+				 write_ack=None, multipart=False):
 		super().__init__()
 		self._pending = deque()
 		self._lock = threading.Lock()
 		self._wake = threading.Condition()
 		self._shutdown = threading.Event()
 		self._flush_error = None
+		self.multipart = multipart
+		self.store_path = path
+		if multipart:
+			# §17.7: open a fresh part on startup and treat the existing ones
+			# as immutable. Appends go only to this part; replay spans them all.
+			path = part_path(path, new_ordinal())
 		self._init_common(path, header, create, encoding, delimiter, defaults)
 		self.flush_interval = flush_interval
 		self.reload()
@@ -2017,10 +2986,19 @@ class WalStore(_StoreCommon, OrderedDict):
 		"""
 		loaded = OrderedDict()
 		try:
-			read_store(
-				self.path, create=self.create, encoding=self.encoding,
-				delimiter=self.delimiter, store=loaded, header=self.header or None,
-			)
+			if self.multipart:
+				# §17.4: every part, in ordinal order, as one concatenation.
+				ensure_part_exists(
+					self.path, create=self.create, encoding=self.encoding,
+					delimiter=self.delimiter, header=self.header or None)
+				read_multipart(
+					self.store_path, encoding=self.encoding,
+					delimiter=self.delimiter, store=loaded)
+			else:
+				read_store(
+					self.path, create=self.create, encoding=self.encoding,
+					delimiter=self.delimiter, store=loaded, header=self.header or None,
+				)
 		except FileNotFoundError:
 			if self.create:
 				raise
@@ -2097,6 +3075,13 @@ class WalStore(_StoreCommon, OrderedDict):
 		Returns:
 			WalStore: ``self``, after truncation.
 		"""
+		if self.multipart:
+			# Truncating one part would not empty the store, and rewriting the
+			# earlier parts would break §17.7's immutability. Append a
+			# tombstone per live key instead -- append-only and correct.
+			for key in list(self):
+				del self[key]
+			return self
 		with self._lock:
 			self._pending.clear()
 			super().clear()
@@ -3245,8 +4230,9 @@ def _cli_pretty_format_table(data, delimiter='\t'):
 def __main__():
 	"""Command-line entry point.
 
-	Supported operations: ``read``, ``append``, ``delete``, ``clear``, and
-	``scrub`` (snapshot/compact).
+	Supported operations: ``read``, ``append``, ``delete``, ``clear``,
+	``scrub`` (snapshot/compact), ``verify`` (§15 integrity), and ``parts``
+	(list a §17 store's parts).
 
 	Returns:
 		int: Process exit status — ``0`` on success, ``1`` when ``--strict``
@@ -3256,8 +4242,10 @@ def __main__():
 	parser = argparse.ArgumentParser(description='TSVZ: append-only tabular key–value store (tsvz-spec-v1)')
 	parser.add_argument('filename', type=str, help='The file to read')
 	parser.add_argument(
-		'operation', type=str, nargs='?', choices=['read', 'append', 'delete', 'clear', 'scrub'],
-		help='Operation to perform. scrub = snapshot/compact. Default: read',
+		'operation', type=str, nargs='?',
+		choices=['read', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts'],
+		help='Operation to perform. scrub = snapshot/compact; verify = check '
+			 '§15 checksums; parts = list the §17 parts. Default: read',
 		default='read',
 	)
 	parser.add_argument(
@@ -3278,6 +4266,12 @@ def __main__():
 		'-f', '--force', dest='strict', action='store_false',
 		help='Treat a missing part as empty instead of an error (default).')
 	parser.set_defaults(strict=False)
+	parser.add_argument(
+		'-m', '--multipart', action='store_true',
+		help='Treat FILENAME as a §17 multi-part store rather than one part.')
+	parser.add_argument(
+		'--checksum', metavar='ALGO',
+		help='With append: also close a §15 segment with this digest.')
 	parser.add_argument('-V', '--version', action='version',
 						version=f'%(prog)s {version} @ {COMMIT_DATE} by {author}')
 	try:
@@ -3303,11 +4297,34 @@ def __main__():
 	# `tsvz f.tsvz append k 'a\tb'` means the same thing everywhere.
 	args.line = [_unescape(field) for field in args.line]
 
+	if args.operation == 'parts':
+		for path in store_part_paths(args.filename, include_rotated=True):
+			parsed = parse_part_name(path)
+			tag = ' (rotated)' if parsed is not None and parsed.rotated else ''
+			print(f'{path}{tag}')
+		return 0
+	if args.operation == 'verify':
+		paths = (store_part_paths(args.filename) if args.multipart
+				 else [args.filename])
+		if not paths:
+			print(f'tsvz: no such store: {args.filename}', file=sys.stderr)
+			return 1
+		digests = DigestSet()
+		for path in paths:
+			replay_part(path, args.delimiter, digests=digests)
+		if digests.mismatches:
+			for algo, want, got in digests.mismatches:
+				print(f'tsvz: {algo} mismatch: expected {want}, computed {got}',
+					  file=sys.stderr)
+			return 1
+		scope = 'store' if args.multipart else 'part'
+		print(f'{digests.verified} segment(s) verified across {len(paths)} '
+			  f'{scope} file(s); {len(digests.armed)} algorithm(s) armed')
+		return 0
 	if args.operation == 'read':
 		try:
-			data = read_store(
-				args.filename, delimiter=args.delimiter, defaults=defaults or None,
-			)
+			reader = read_multipart if args.multipart else read_store
+			data = reader(args.filename, delimiter=args.delimiter)
 		except FileNotFoundError:
 			if args.strict:
 				print(f'tsvz: no such part: {args.filename}', file=sys.stderr)
@@ -3320,6 +4337,8 @@ def __main__():
 			args.filename, args.line, create=True, header=header or None,
 			delimiter=args.delimiter,
 		)
+		if args.checksum:
+			append_checksum(args.filename, args.checksum, delimiter=args.delimiter)
 	elif args.operation == 'delete':
 		if not args.line:
 			print('delete needs a key', file=sys.stderr)
@@ -3335,7 +4354,17 @@ def __main__():
 			defaults=defaults or None,
 		)
 	elif args.operation == 'scrub':
-		snapshot_part(args.filename, delimiter=args.delimiter, header=header or None)
+		if args.multipart:
+			result = snapshot_store(args.filename, delimiter=args.delimiter,
+									header=header or None)
+			if result is None:
+				print('tsvz: nothing to compact (no immutable prefix)',
+					  file=sys.stderr)
+				return 0
+			print(f'{result.path} ({len(result.subsumed)} part(s) subsumed, '
+				  f'rotate={result.rotate_action})')
+		else:
+			snapshot_part(args.filename, delimiter=args.delimiter, header=header or None)
 	else:
 		print('Invalid operation', file=sys.stderr)
 		return 2
