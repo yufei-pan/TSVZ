@@ -10,9 +10,14 @@ current specification only; legacy escaping and tombstone conventions are
 not accepted.
 
 Preferred public entry points for new code are :func:`read_store`,
-:func:`append_records`, :class:`WalStore`, and :func:`snapshot_part`.
-Legacy names such as :func:`readTabularFile` and :class:`TSVZed` remain as
-thin compatibility wrappers.
+:func:`read_offsets`, :func:`append_records`, :func:`delete_records`,
+:class:`WalStore`, and :func:`snapshot_part`. Legacy names such as
+:func:`readTabularFile` and :class:`TSVZed` remain as thin compatibility
+wrappers; they emit :class:`DeprecationWarning` and are scheduled for removal
+in TSVZ :data:`LEGACY_REMOVAL_VERSION`.
+
+A ``#``-prefixed key is ordinary data at every layer, written escaped as
+``<#>key`` per §8.3 -- there is no "in-memory only" key convention.
 
 Implemented
 -----------
@@ -28,24 +33,47 @@ Implemented
   ``#_strip_trailing_whites_#``, ``#_fill_empty_with_default_#``,
   ``#_return_defaults_when_missing_#``
 - §13 — field escaping (``<sep>``, ``<LF>``, ``<lt>``, ``<#>``)
-- §14 — defaults, fill-empty, and return-on-missing behaviour
+- §14 — defaults, fill-empty, return-on-missing, and absent-column
+  resolution (§14.3, via :func:`materialize_row`)
 - §16 — transparent compression for ``.gz`` / ``.bz2`` / ``.xz`` / ``.zst``
-- Simplified §19 — :func:`snapshot_part` rewrites one part with a marker
-  preamble and live rows, discarding superseded values, tombstones, and
-  non-header comments
+  (``.zst`` requires Python 3.14+; it never degrades to plaintext)
+- §18 — batched whole-record appends under an exclusive lock (§18.2–§18.3);
+  ``#_write_ack_#`` selects per-batch fsync (§18.4)
+- Simplified §19 — :func:`snapshot_part` atomically rewrites one part with
+  the §19.4 marker preamble and fully resolved live rows, discarding
+  superseded values, tombstones, and non-header comments
 - Stores — :class:`WalStore` (asynchronous append) and :class:`OffsetStore`
-  (key→byte-offset index)
+  (key→byte-offset index; uncompressed parts only)
 
 Not yet implemented
 -------------------
 - §15 integrity — ``#_checksum_<algo>_#`` is classified and ignored (no
   digest arming or verification); unrecognized markers are likewise skipped
   on the data path
-- ``#_rotate_#`` / ``#_write_ack_#`` — recognized as markers but treated as
-  no-ops in :func:`apply_marker`
+- ``#_rotate_#`` — recognized as a marker but treated as a no-op; the §19.5
+  ``keep``/``rename``/``delete`` actions are not applied
 - §17 multi-part stores (``store.tsvz.<ordinal>``, cross-part replay)
 - Full §19 snapshot procedure (ordinal slotting, ``.rotated`` exclusion,
   immutable prefix with an active writer)
+
+Known deviations
+----------------
+- §19.2.3c says a snapshot contains no comments. Passing ``header=`` to
+  :func:`snapshot_part` re-emits the header comment above the preamble; the
+  default (``header=None``) is conformant.
+- §12.4 gives the boolean marker value form as ``true``/``false``.
+  :func:`_parse_bool` also accepts ``yes``/``no``/``on``/``off``/``1``/``0``
+  on read; writers only ever emit ``true``/``false``.
+- v1 has no ``<CR>`` escape token, so a value whose **last** field ends in a
+  literal ``\\r`` is indistinguishable from a CRLF terminator (§4.2) and reads
+  back without it.
+- §5.2 calls a loose extension (``.tsv``, ``.csv``, ...) a fallback with no
+  semantic guarantees. Writers here emit identical bytes for loose and strict
+  parts, but warn once when a write to a loose part actually emits an escape
+  token or a marker -- the cases a generic reader would misread.
+- Invalid UTF-8 is repaired with replacement characters and warned about once
+  per read rather than raising; pass ``errors='strict'`` to
+  :func:`replay_part` / :func:`replay_bytes` to make it an error instead.
 
 Examples:
 	>>> import os, tempfile
@@ -60,12 +88,15 @@ Examples:
 """
 import atexit
 import contextlib
+import functools
 import io
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
+import warnings
 from collections import OrderedDict, deque
 from collections.abc import MutableMapping
 
@@ -78,7 +109,19 @@ __version__ = '4.0.0'
 
 DEFAULT_DELIMITER = '\t'
 MARKER_DEFAULTS = '#_defaults_#'
+MARKER_WRITE_ACK = '#_write_ack_#'
 MAX_SPEC_VERSION = 1
+
+#: §18.4 write-acknowledgement modes. ``memory`` (the spec's built-in default)
+#: acknowledges once a record is in the batch buffer; ``disk`` only after the
+#: batch is fsynced.
+WRITE_ACK_MEMORY = 'memory'
+WRITE_ACK_DISK = 'disk'
+WRITE_ACK_MODES = frozenset({WRITE_ACK_MEMORY, WRITE_ACK_DISK})
+
+#: Longest a Condition-signalled flusher sleeps when its queue is empty. Only a
+#: safety net against a lost wakeup -- writes notify the worker directly.
+_IDLE_WAKE_SECONDS = 1.0
 
 COMPRESSION_EXTENSIONS = frozenset(
 	{'gz', 'gzip', 'bz2', 'bzip2', 'xz', 'lzma', 'zst', 'zstd'})
@@ -91,6 +134,32 @@ OFFICIAL_MARKERS = frozenset({
 	'#_fill_empty_with_default_#', '#_return_defaults_when_missing_#',
 	'#_rotate_#', '#_write_ack_#',
 })
+
+__all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorted
+	# Reading
+	'read_store', 'read_offsets', 'read_last_record', 'replay_bytes', 'replay_part',
+	'process_record', 'classify_record', 'apply_marker', 'committed_payload',
+	'resolve_missing_key', 'materialize_row',
+	# Writing
+	'append_record', 'append_records', 'delete_record', 'delete_records',
+	'truncate_part', 'snapshot_part', 'ensure_part_exists',
+	# Format primitives
+	'decode_field', 'encode_field', 'format_data_row', 'format_tombstone',
+	'format_marker_line', 'format_header_comment', 'build_snapshot_preamble',
+	# Paths and I/O
+	'open_part', 'delimiter_for_path', 'is_strict_store', 'is_compressed_path',
+	# Stores and state
+	'WalStore', 'OffsetStore', 'ReaderState', 'StoreEntry',
+	# Constants
+	'DEFAULT_DELIMITER', 'MARKER_DEFAULTS', 'MAX_SPEC_VERSION', 'OFFICIAL_MARKERS',
+	'STRICT_EXTENSIONS', 'COMPRESSION_EXTENSIONS', '__version__',
+	# Deprecated legacy surface (removal: see LEGACY_REMOVAL_VERSION)
+	'readTabularFile', 'appendTabularFile', 'appendLinesTabularFile',
+	'clearTabularFile', 'scrubTabularFile', 'read_last_valid_line', 'get_delimiter',
+	'getListView', 'TSVZed', 'TSVZedLite',
+	'readTSV', 'appendTSV', 'clearTSV', 'scrubTSV',
+	'LEGACY_REMOVAL_VERSION',
+]
 
 _TOMBSTONE = object()
 
@@ -115,9 +184,13 @@ class ReaderState:
 			``defaults``.
 		return_on_missing (bool): If True, synthesize a defaults row for
 			absent keys instead of raising ``KeyError``.
+		write_ack (str): ``'memory'`` or ``'disk'`` from ``#_write_ack_#``
+			(§18.4). Advisory — it never affects reconstructed data (§12.4.3),
+			only when a writer considers a record acknowledged.
 	"""
 
-	__slots__ = ('defaults', 'fill_empty', 'return_on_missing', 'strip_trailing', 'version')
+	__slots__ = ('defaults', 'fill_empty', 'return_on_missing', 'strip_trailing',
+				 'version', 'write_ack')
 
 	def __init__(self):
 		self.version = 1
@@ -125,6 +198,7 @@ class ReaderState:
 		self.strip_trailing = True
 		self.fill_empty = False
 		self.return_on_missing = True
+		self.write_ack = WRITE_ACK_MEMORY
 
 	def copy(self):
 		"""Return a deep copy of this state (defaults list is independent).
@@ -145,6 +219,7 @@ class ReaderState:
 		s.defaults = list(self.defaults)
 		s.strip_trailing = self.strip_trailing
 		s.fill_empty = self.fill_empty
+		s.write_ack = self.write_ack
 		s.return_on_missing = self.return_on_missing
 		return s
 
@@ -197,6 +272,11 @@ def decode_field(raw, delimiter):
 		>>> decode_field('<future>', '\\t')
 		'<future>'
 	"""
+	if '<' not in raw:
+		# §13.3 forbids a bare '<', so no '<' means no control token and the
+		# field is already its own decoding. Skips the character walk below
+		# for the overwhelming majority of fields.
+		return raw
 	out = []
 	i = 0
 	while i < len(raw):
@@ -221,6 +301,11 @@ def decode_field(raw, delimiter):
 			out.append(raw[i])
 			i += 1
 	return ''.join(out)
+
+
+def _needs_escape(value, delimiter):
+	"""Return True if ``value`` holds a character §13.3 requires escaping."""
+	return delimiter in value or '\n' in value or '<' in value
 
 
 def encode_field(value, delimiter, *, is_key=False):
@@ -253,6 +338,8 @@ def encode_field(value, delimiter, *, is_key=False):
 		''
 	"""
 	value = '' if value is None else str(value)
+	if not (is_key and value.startswith('#')) and not _needs_escape(value, delimiter):
+		return value  # nothing to escape; skip the character walk
 	out = []
 	for i, ch in enumerate(value):
 		if ch == delimiter:
@@ -332,8 +419,9 @@ def classify_record(f0_raw):
 		return 'data'
 	if not MARKER_RE.match(f0_raw):
 		return 'comment'
+	# §12.2.1: marker keys are compared case-insensitively over ASCII.
 	kl = f0_raw.lower()
-	if CHECKSUM_MARKER_RE.match(f0_raw):
+	if CHECKSUM_MARKER_RE.match(kl):
 		return 'ignore'
 	if kl in OFFICIAL_MARKERS:
 		return 'marker'
@@ -389,6 +477,10 @@ def apply_marker(state, f0_raw, value_fields, delimiter):
 	elif kl == '#_return_defaults_when_missing_#':
 		b = _parse_bool(decoded[0] if decoded else '')
 		state.return_on_missing = True if b is None else b
+	elif kl == MARKER_WRITE_ACK:
+		# Advisory only (§12.4.3): recorded for writers, never applied to data.
+		mode = (decoded[0].strip().lower() if decoded else '')
+		state.write_ack = mode if mode in WRITE_ACK_MODES else WRITE_ACK_MEMORY
 
 
 def committed_payload(data):
@@ -459,6 +551,35 @@ def _resolve_value_columns(fields, state, delimiter):
 	return row, list(state.defaults), state.fill_empty
 
 
+def materialize_row(entry):
+	"""Return ``entry``'s row with absent trailing columns resolved (§14.3).
+
+	A row is stored at the width it was written with. Specification §14.3
+	resolves a value column at or beyond that width to the default active at
+	the row's position, so materialization pads the row out to the width of
+	its write-time defaults. Rows written while no defaults were active are
+	returned unchanged, and a row wider than the defaults is never trimmed.
+
+	Args:
+		entry: :class:`StoreEntry` produced during replay.
+
+	Returns:
+		list: ``[key, value…]`` padded to ``len(entry.row_defaults) + 1``.
+
+	Examples:
+		>>> materialize_row(StoreEntry(['k', 'v1'], ['D1', 'D2'], False))
+		['k', 'v1', 'D2']
+		>>> materialize_row(StoreEntry(['k', 'v1'], [], False))
+		['k', 'v1']
+		>>> materialize_row(StoreEntry(['k', 'a', 'b', 'c'], ['D1'], False))
+		['k', 'a', 'b', 'c']
+	"""
+	row = list(entry.row)
+	for j in range(len(row), len(entry.row_defaults) + 1):
+		row.append(_default_at(entry.row_defaults, j))
+	return row
+
+
 def process_record(raw_line, state, store, delimiter, *, offset=None,
 				   store_offset=False, values_cache=None):
 	"""Process one logical line and update ``store``.
@@ -507,7 +628,7 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 	is_tombstone = len(fields) == 1
 	key = decode_field(_strip_field(f0, state.strip_trailing), delimiter)
 	if key == '':
-		return 'data', None
+		return 'ignore', None  # §8.4: empty-key rows are discarded like comments
 	if is_tombstone:
 		store.pop(key, None)
 		if values_cache is not None:
@@ -515,20 +636,82 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 		return 'tombstone', key
 	row, row_defaults, fill_empty = _resolve_value_columns(fields, state, delimiter)
 	entry = StoreEntry(row, row_defaults, fill_empty)
-	if store_offset and offset is not None:
+	if store_offset:
+		if offset is None:
+			raise ValueError('store_offset=True requires an offset')
 		store[key] = offset
 	else:
 		store[key] = entry
 	if values_cache is not None:
-		values_cache[key] = list(row)
+		values_cache[key] = materialize_row(entry)
 	return 'data', entry
 
 
-def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
-				 store_offset=False, values_cache=None):
-	"""Replay committed bytes into a key→entry mapping (last write wins).
+def _iter_records(stream, encoding, *, errors='replace', source=''):
+	"""Yield ``(offset, text)`` for every **committed** record in ``stream``.
 
-	Only the committed payload is processed (see :func:`committed_payload`).
+	Implements the framing rules of §4 once, for every reader:
+
+	- records split on ``\\n`` (§4.2); at most one ``\\r`` immediately before
+	  the terminator is stripped, and a ``\\r`` anywhere else is field data;
+	- the terminating ``\\n`` is the commit marker, so a trailing unterminated
+	  line is discarded whether or not it would parse (§4.3-§4.5);
+	- blank lines are skipped.
+
+	Streams rather than slurping, so peak memory does not include a copy of
+	the whole part. ``offset`` is a byte offset into the *decoded* stream,
+	which is what an offset index needs (§19.7).
+
+	Args:
+		stream: Binary file-like object positioned at the start of the part.
+		encoding: Text encoding (§4.1 mandates UTF-8).
+		errors: Decode error policy. ``'replace'`` (the default) salvages a
+			damaged part but warns once, naming the byte offset; ``'strict'``
+			raises ``UnicodeDecodeError``.
+		source: Path used in the warning message.
+
+	Yields:
+		tuple: ``(offset, text)`` per committed record.
+
+	Examples:
+		>>> import io
+		>>> list(_iter_records(io.BytesIO(b'a\\n\\nb\\r\\ntorn'), 'utf8'))
+		[(0, 'a'), (3, 'b')]
+	"""
+	pos = 0
+	warned = False
+	for raw in stream:
+		if not raw.endswith(b'\n'):
+			break  # §4.3: uncommitted trailing bytes are discarded
+		start = pos
+		pos += len(raw)
+		line = raw[:-1]
+		if line.endswith(b'\r'):  # removesuffix needs 3.9+
+			line = line[:-1]
+		if not line:
+			continue
+		try:
+			text = line.decode(encoding)
+		except UnicodeDecodeError as exc:
+			if errors == 'strict':
+				raise
+			if not warned:
+				warned = True
+				warnings.warn(
+					f'TSVZ: undecodable {encoding} bytes at offset '
+					f'{start + exc.start}'
+					f'{" in " + repr(source) if source else ""}; substituting '
+					f'replacement characters. Further occurrences not reported.',
+					UnicodeWarning, stacklevel=2)
+			text = line.decode(encoding, errors=errors)
+		yield start, text
+
+
+def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
+				 store_offset=False, values_cache=None, errors='replace'):
+	"""Replay committed bytes into a key->entry mapping (last write wins).
+
+	Only the committed payload is processed (§4.3).
 
 	Args:
 		data: Raw part bytes.
@@ -537,7 +720,8 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 		store: Optional existing mapping to update; a new
 			:class:`~collections.OrderedDict` is created when ``None``.
 		store_offset: If True, store byte offsets instead of entries.
-		values_cache: Optional key→row cache filled during replay.
+		values_cache: Optional key->row cache filled during replay.
+		errors: Decode error policy; see :func:`_iter_records`.
 
 	Returns:
 		tuple: ``(store, state)`` where ``state`` is the final
@@ -551,30 +735,21 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 	if store is None:
 		store = OrderedDict()
 	state = ReaderState()
-	payload = committed_payload(data)
-	pos = 0
-	while pos < len(payload):
-		nl = payload.find(b'\n', pos)
-		if nl == -1:
-			break
-		line = payload[pos:nl].decode(encoding, errors='replace')
-		if line.endswith('\r'):  # noqa: FURB188  # removesuffix needs 3.9+
-			line = line[:-1]
-		if line:
-			process_record(
-				line, state, store, delimiter,
-				offset=pos, store_offset=store_offset, values_cache=values_cache,
-			)
-		pos = nl + 1
+	for offset, line in _iter_records(io.BytesIO(data), encoding, errors=errors):
+		process_record(
+			line, state, store, delimiter,
+			offset=offset, store_offset=store_offset, values_cache=values_cache,
+		)
 	return store, state
 
 
 def replay_part(path, delimiter, *, encoding='utf8', store=None,
-				store_offset=False, values_cache=None):
-	"""Replay a part file from disk into a key→entry mapping.
+				store_offset=False, values_cache=None, errors='replace'):
+	"""Replay a part file from disk into a key->entry mapping.
 
-	If ``path`` does not exist, returns an empty store paired with a fresh
-	:class:`ReaderState`. Otherwise delegates to :func:`replay_bytes`.
+	Streams the part rather than reading it whole, so peak memory scales with
+	the live key set rather than with the file. If ``path`` does not exist,
+	returns an empty store paired with a fresh :class:`ReaderState`.
 
 	Args:
 		path: Filesystem path of the part.
@@ -582,22 +757,25 @@ def replay_part(path, delimiter, *, encoding='utf8', store=None,
 		encoding: Text encoding used to decode lines.
 		store: Optional existing mapping to update.
 		store_offset: If True, store byte offsets instead of entries.
-		values_cache: Optional key→row cache filled during replay.
+		values_cache: Optional key->row cache filled during replay.
+		errors: Decode error policy; see :func:`_iter_records`.
 
 	Returns:
 		tuple: ``(store, state)`` after replaying the part.
 	"""
 	if store is None:
 		store = OrderedDict()
+	state = ReaderState()
 	try:
 		with open_part(path, 'rb', encoding=encoding) as f:
-			data = f.read()
+			for offset, line in _iter_records(f, encoding, errors=errors, source=path):
+				process_record(
+					line, state, store, delimiter, offset=offset,
+					store_offset=store_offset, values_cache=values_cache,
+				)
 	except FileNotFoundError:
 		return store, ReaderState()
-	return replay_bytes(
-		data, delimiter, encoding=encoding, store=store,
-		store_offset=store_offset, values_cache=values_cache,
-	)
+	return store, state
 
 
 def resolve_missing_key(key, state):
@@ -721,12 +899,19 @@ def format_header_comment(columns, delimiter):
 def build_snapshot_preamble(state, delimiter):
 	"""Build the marker preamble written at the start of a snapshot (§19).
 
-	Always includes ``#_version_#``. Optional markers are emitted only when
-	their values differ from the built-in defaults, except ``#_defaults_#``
-	which is emitted whenever defaults are non-empty.
+	Implements the always-correct strategy named in §19.4: because a snapshot
+	writes **fully resolved** value cells, it pins ``#_strip_trailing_whites_#``
+	and ``#_fill_empty_with_default_#`` to ``false`` so that no reader
+	re-applies stripping or filling to values that already went through it.
+	``#_defaults_#`` is re-emitted last (§19.2.3a) and remains meaningful as
+	the fallback for absent trailing columns (§14.3).
+
+	Pinning both markers is what makes §19.4 fidelity hold when the source
+	state varied over the life of the compacted prefix — emitting only the
+	final state would silently re-resolve rows written under earlier state.
 
 	Args:
-		state: Reader state whose non-default settings are serialized.
+		state: Reader state whose settings are serialized.
 		delimiter: Field delimiter.
 
 	Returns:
@@ -734,18 +919,20 @@ def build_snapshot_preamble(state, delimiter):
 
 	Examples:
 		>>> build_snapshot_preamble(ReaderState(), '\\t')
-		['#_version_#\\t1']
-		>>> st = ReaderState(); st.fill_empty = True; st.defaults = ['x']
-		>>> build_snapshot_preamble(st, '\\t')
-		['#_version_#\\t1', '#_fill_empty_with_default_#\\ttrue', '#_defaults_#\\tx']
+		['#_version_#\\t1', '#_strip_trailing_whites_#\\tfalse', '#_fill_empty_with_default_#\\tfalse']
+		>>> st = ReaderState(); st.defaults = ['x']; st.return_on_missing = False
+		>>> build_snapshot_preamble(st, '\\t')[-2:]
+		['#_return_defaults_when_missing_#\\tfalse', '#_defaults_#\\tx']
 	"""
-	lines = [format_marker_line('#_version_#', ['1'], delimiter)]
-	if not state.strip_trailing:
-		lines.append(format_marker_line('#_strip_trailing_whites_#', ['false'], delimiter))
-	if state.fill_empty:
-		lines.append(format_marker_line('#_fill_empty_with_default_#', ['true'], delimiter))
+	lines = [
+		format_marker_line('#_version_#', ['1'], delimiter),
+		format_marker_line('#_strip_trailing_whites_#', ['false'], delimiter),
+		format_marker_line('#_fill_empty_with_default_#', ['false'], delimiter),
+	]
 	if not state.return_on_missing:
 		lines.append(format_marker_line('#_return_defaults_when_missing_#', ['false'], delimiter))
+	if state.write_ack != WRITE_ACK_MEMORY:
+		lines.append(format_marker_line(MARKER_WRITE_ACK, [state.write_ack], delimiter))
 	if state.defaults:
 		lines.append(format_marker_line('#_defaults_#', state.defaults, delimiter))
 	return lines
@@ -773,6 +960,62 @@ def _queue_item_to_bytes(item, delimiter, encoding):
 def _strip_compression_suffix(name):
 	base, _, ext = name.lower().rpartition('.')
 	return base if ext in COMPRESSION_EXTENSIONS else name.lower()
+
+
+def _compression_suffix(name):
+	"""Return ``name``'s trailing compression suffix, or ``''`` if uncompressed.
+
+	Examples:
+		>>> _compression_suffix('store.tsvz.gz'), _compression_suffix('store.tsvz')
+		('.gz', '')
+	"""
+	_, _, ext = name.rpartition('.')
+	return f'.{ext}' if ext.lower() in COMPRESSION_EXTENSIONS else ''
+
+
+def is_compressed_path(path):
+	"""Return True when ``path`` carries a recognized compression suffix (§16).
+
+	Examples:
+		>>> is_compressed_path('store.tsvz.gz'), is_compressed_path('store.tsvz')
+		(True, False)
+	"""
+	return bool(_compression_suffix(path))
+
+
+def _warn_loose_extension(path, lines, delimiter):
+	"""Warn when spec-only syntax is written to a loose extension (§5.2).
+
+	A loose extension (``.tsv``, ``.csv``, ...) advertises "a tabular fallback
+	with no semantic guarantees", i.e. that generic delimiter-separated tooling
+	can read it. Escape tokens (§13) and markers (§12) break that promise:
+	a generic reader sees ``a<sep>b`` as the literal seven characters. Plain
+	rows are written to a loose part silently, because those really are
+	interchangeable.
+
+	Args:
+		path: Destination part path.
+		lines: Encoded lines about to be written (without terminators).
+		delimiter: Field delimiter in use.
+
+	Returns:
+		None: Warns via :mod:`warnings` as a side effect.
+	"""
+	if is_strict_store(path):
+		return
+	for line in lines:
+		token = '<' in line
+		marker = line.startswith('#')
+		if token or marker:
+			what = 'an escape token' if token else 'a marker line'
+			warnings.warn(
+				f'wrote {what} to the loose extension {path!r}; §5.2 says such a '
+				f'file carries no semantic guarantees, and generic '
+				f'delimiter-separated tools will read it literally. Use a strict '
+				f'extension ({", ".join(sorted(STRICT_EXTENSIONS))}) for full '
+				f'semantics.',
+				UserWarning, stacklevel=3)
+			return
 
 
 def is_strict_store(path):
@@ -852,35 +1095,40 @@ def open_part(path, mode='rb', *, encoding='utf8', compress_level=1):
 	lower = path.lower()
 	if 'b' not in mode:
 		mode += 't'
+	writing = 'r' not in mode
 	kwargs = {}
-	if 'r' not in mode:
-		if lower.endswith('.xz'):
-			kwargs['preset'] = compress_level
-		elif lower.endswith(('.zst', '.zstd')):
-			kwargs['level'] = compress_level
-		else:
-			kwargs['compresslevel'] = compress_level
 	if 'b' not in mode:
 		kwargs['encoding'] = encoding
 	if lower.endswith(('.xz', '.lzma')):
 		import lzma
-		return lzma.open(path, mode, **kwargs)
+		# lzma.open takes `preset`, never `compresslevel`, for both suffixes.
+		return lzma.open(path, mode, **({'preset': compress_level} if writing else {}), **kwargs)
 	if lower.endswith(('.gz', '.gzip')):
 		import gzip
-		return gzip.open(path, mode, **kwargs)
+		return gzip.open(path, mode, **({'compresslevel': compress_level} if writing else {}), **kwargs)
 	if lower.endswith(('.bz2', '.bzip2')):
 		import bz2
-		return bz2.open(path, mode, **kwargs)
+		return bz2.open(path, mode, **({'compresslevel': compress_level} if writing else {}), **kwargs)
 	if lower.endswith(('.zst', '.zstd')):
 		try:
 			from compression import zstd
-			return zstd.open(path, mode, **kwargs)
 		except ImportError:
-			pass
+			try:
+				import zstandard  # noqa: F401  # third-party fallback probe
+			except ImportError:
+				raise ImportError(
+					f'zstd support is unavailable for {path!r}: needs Python 3.14+ '
+					f'(compression.zstd). Refusing to fall back to plaintext.',
+				) from None
+			raise ImportError(
+				f'zstd support for {path!r} requires the stdlib compression.zstd '
+				f'module (Python 3.14+); the third-party zstandard package is not used.',
+			) from None
+		return zstd.open(path, mode, **({'level': compress_level} if writing else {}), **kwargs)
+	# Uncompressed: builtins.open needs no explicit 't', and 'b' is already
+	# present in every mode that reaches here without one having been added.
 	if 't' in mode:
 		return open(path, mode.replace('t', ''), encoding=encoding)
-	if 'b' not in mode:
-		mode += 'b'
 	return open(path, mode)
 
 
@@ -940,13 +1188,49 @@ def ensure_part_exists(path, *, create=True, encoding='utf8', delimiter=None,
 		return True
 	if not create:
 		raise FileNotFoundError(path)
-	with open_part(path, 'wb', encoding=encoding) as f:
+	try:
+		# 'x' so a concurrent creator's part is never truncated (the isfile
+		# check above is only a fast path, not a guarantee).
+		seed = []
 		if header:
-			f.write(format_header_comment(header, delimiter).encode(encoding, errors='replace') + b'\n')
+			seed.append(format_header_comment(header, delimiter))
 		if defaults:
-			line = format_marker_line(MARKER_DEFAULTS, defaults, delimiter)
-			f.write(line.encode(encoding, errors='replace') + b'\n')
+			seed.append(format_marker_line(MARKER_DEFAULTS, defaults, delimiter))
+		_warn_loose_extension(path, seed, delimiter)
+		with open_part(path, 'xb', encoding=encoding) as f:
+			for line in seed:
+				f.write(line.encode(encoding, errors='replace') + b'\n')
+	except FileExistsError:
+		pass  # another writer won the race; its part is authoritative
 	return True
+
+
+def _base_mutators(store):
+	"""Return ``(clear, setitem)`` that bypass a live store's overrides.
+
+	Replaying into a caller-supplied mapping must not trigger that mapping's
+	side effects: :class:`WalStore` truncates the part in ``clear()`` and
+	queues a WAL append in ``__setitem__``, so populating one directly would
+	destroy the very file being read and then re-append every replayed row.
+	Dict subclasses are therefore filled through the base implementation
+	(``OrderedDict``'s, to keep its linked list consistent).
+
+	Args:
+		store: Target mapping for a replay.
+
+	Returns:
+		tuple: ``(clear(store), setitem(store, key, value))`` callables.
+
+	Examples:
+		>>> clear, setitem = _base_mutators(OrderedDict())
+		>>> clear is OrderedDict.clear, setitem is OrderedDict.__setitem__
+		(True, True)
+	"""
+	if isinstance(store, OrderedDict):
+		return OrderedDict.clear, OrderedDict.__setitem__
+	if isinstance(store, dict):
+		return dict.clear, dict.__setitem__
+	return type(store).clear, type(store).__setitem__
 
 
 def _attach_replay_meta(target, state, values_cache=None):
@@ -989,31 +1273,23 @@ def read_last_record(path, *, encoding='utf8', delimiter=None, store_offset=Fals
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
 	empty = -1 if store_offset else []
-	try:
-		with open_part(path, 'rb', encoding=encoding) as f:
-			data = f.read()
-	except FileNotFoundError:
-		return empty
 	state = ReaderState()
 	result = empty
-	last_offset = -1
-	pos = 0
-	payload = committed_payload(data)
-	while pos < len(payload):
-		nl = payload.find(b'\n', pos)
-		if nl == -1:
-			break
-		line = payload[pos:nl].decode(encoding, errors='replace')
-		if line.endswith('\r'):  # noqa: FURB188  # removesuffix needs 3.9+
-			line = line[:-1]
-		if line:
-			scratch = OrderedDict()
-			kind, entry = process_record(line, state, scratch, delimiter)
-			if kind == 'data' and entry is not None:
-				last_offset = pos
-				result = pos if store_offset else list(entry.row)
-		pos = nl + 1
-	return last_offset if store_offset else result
+	scratch = OrderedDict()
+	# A full forward pass is required, not just a seek to the tail: marker
+	# state is forward-only (§12.1), so the defaults that resolve the last
+	# row's absent columns (§14.3) are only known after replaying everything
+	# before it.
+	try:
+		with open_part(path, 'rb', encoding=encoding) as f:
+			for offset, line in _iter_records(f, encoding, source=path):
+				scratch.clear()
+				kind, entry = process_record(line, state, scratch, delimiter)
+				if kind == 'data' and entry is not None:
+					result = offset if store_offset else materialize_row(entry)
+	except FileNotFoundError:
+		return empty
+	return result
 
 
 def _fit_row(row, column_count):
@@ -1044,34 +1320,64 @@ def _fit_row(row, column_count):
 	return list(row)
 
 
+def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
+				 store_offset, cache_values=True):
+	"""Shared body of :func:`read_store` and :func:`read_offsets`.
+
+	Returns:
+		tuple: ``(store, state, values_cache)``; ``values_cache`` is ``None``
+		unless ``store_offset`` is True.
+	"""
+	header_cols = _parse_columns(header, delimiter) if header else []
+	ensure_part_exists(
+		path, create=create, encoding=encoding, delimiter=delimiter,
+		header=header_cols or None, defaults=_normalize_defaults(defaults),
+	)
+	values_cache = {} if (store_offset and cache_values) else None
+	replayed, state = replay_part(
+		path, delimiter, encoding=encoding, store=OrderedDict(),
+		store_offset=store_offset, values_cache=values_cache,
+	)
+	# Replay is a read: fill the target through its base mapping so a live
+	# store's clear()/__setitem__ side effects (truncate, WAL append) never
+	# fire. See _base_mutators.
+	clear, setitem = _base_mutators(store)
+	clear(store)
+	for key, value in replayed.items():
+		setitem(store, key, value if store_offset or not isinstance(value, StoreEntry)
+				else materialize_row(value))
+	return store, state, values_cache
+
+
 def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 			   defaults=None, store=None, store_offset=False, last_record_only=False,
 			   header=None):
-	"""Replay a part into an ordered mapping of key to row list (or byte offset).
+	"""Replay a part into an ordered mapping of key to row list.
 
-	Each row retains the width it was written with (specification §3.6).
-	Callers that require a fixed schema may pad or trim rows themselves, or
-	use the legacy :func:`readTabularFile` helper.
-
-	When ``store_offset`` is True, values are byte offsets rather than row
-	lists, and a ``_values_cache`` attribute is attached for on-demand
-	materialization. When ``last_record_only`` is True, delegates to
-	:func:`read_last_record`.
+	Rows are in first-appearance order (§3.4). Each row keeps the width it
+	was written with (§3.6), extended only where §14.3 resolves an absent
+	trailing column from the defaults active at that row.
 
 	Args:
 		path: Filesystem path of the part.
 		create: If True, create a missing part before reading.
 		encoding: Text encoding used to decode lines.
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
-		defaults: Optional defaults written when creating a new part.
+		defaults: Defaults marker written **only when creating** a new part;
+			ignored for a part that already exists.
 		store: Optional mapping to populate; a new ordered dict is used
-			when ``None``.
-		store_offset: If True, map keys to byte offsets instead of rows.
-		last_record_only: If True, return only the last committed data row.
-		header: Optional header columns written when creating a new part.
+			when ``None``. Filled through its base mapping, so passing a
+			live :class:`WalStore` neither truncates the part nor queues
+			appends.
+		store_offset: Deprecated; use :func:`read_offsets`.
+		last_record_only: Deprecated; use :func:`read_last_record`.
+		header: Header comment written **only when creating** a new part.
 
 	Returns:
-		MutableMapping: Live key→row (or key→offset) mapping.
+		MutableMapping: Ordered key→row mapping.
+
+	Raises:
+		FileNotFoundError: If the part is absent and ``create`` is False.
 
 	Examples:
 		>>> import os, tempfile
@@ -1082,38 +1388,89 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 		>>> os.unlink(path)
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
-	if store is None:
-		store = OrderedDict()
-	header_cols = _parse_columns(header, delimiter) if header else []
-	ensure_part_exists(
-		path, create=create, encoding=encoding, delimiter=delimiter,
-		header=header_cols or None, defaults=_normalize_defaults(defaults),
-	)
 	if last_record_only:
+		warnings.warn(
+			'read_store(last_record_only=True) is deprecated; call '
+			f'read_last_record() instead. Removal in TSVZ {LEGACY_REMOVAL_VERSION}.',
+			DeprecationWarning, stacklevel=2)
+		ensure_part_exists(path, create=create, encoding=encoding, delimiter=delimiter,
+						   header=_parse_columns(header, delimiter) or None,
+						   defaults=_normalize_defaults(defaults))
 		return read_last_record(path, encoding=encoding, delimiter=delimiter,
 								store_offset=store_offset)
-	values_cache = {} if store_offset else None
-	internal = OrderedDict()
-	replayed, state = replay_part(
-		path, delimiter, encoding=encoding, store=internal,
-		store_offset=store_offset, values_cache=values_cache,
-	)
-	store.clear()
 	if store_offset:
-		store.update(replayed)
+		warnings.warn(
+			'read_store(store_offset=True) is deprecated; call read_offsets() '
+			f'instead. Removal in TSVZ {LEGACY_REMOVAL_VERSION}.',
+			DeprecationWarning, stacklevel=2)
+		if store is None:
+			store = OrderedDict()
+		store, state, values_cache = _replay_into(
+			path, store, create=create, encoding=encoding, delimiter=delimiter,
+			defaults=defaults, header=header, store_offset=True)
 		_attach_replay_meta(store, state, values_cache)
-	else:
-		for key, entry in replayed.items():
-			store[key] = list(entry.row) if isinstance(entry, StoreEntry) else entry
-		_attach_replay_meta(store, state)
+		return store
+	if store is None:
+		store = OrderedDict()
+	store, state, _ = _replay_into(
+		path, store, create=create, encoding=encoding, delimiter=delimiter,
+		defaults=defaults, header=header, store_offset=False)
+	_attach_replay_meta(store, state)
 	return store
+
+
+def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
+				 defaults=None, header=None, store=None, cache_values=True):
+	"""Replay a part into a key→byte-offset index instead of materialized rows.
+
+	Offsets address the start of each key's winning record in the *decoded*
+	byte stream, so they are only meaningful for an uncompressed part.
+
+	Args:
+		path: Filesystem path of the part.
+		create: If True, create a missing part before reading.
+		encoding: Text encoding used to decode lines.
+		delimiter: Field delimiter; inferred from ``path`` when ``None``.
+		defaults: Defaults marker written only when creating a new part.
+		header: Header comment written only when creating a new part.
+		store: Optional mapping to populate with the offsets.
+		cache_values: If True, also materialize every row into a cache and
+			return it. Set False to build the index alone — that is the whole
+			point of an offset index, and it keeps memory proportional to the
+			key count rather than to the data.
+
+	Returns:
+		tuple: ``(offsets, values, state)`` — key→offset mapping, the
+		key→row cache (``None`` when ``cache_values`` is False), and the
+		final :class:`ReaderState`.
+
+	Examples:
+		>>> import os, tempfile
+		>>> fd, path = tempfile.mkstemp(suffix='.tsv'); os.close(fd)
+		>>> _ = open(path, 'w').write('a\\t1\\nb\\t2\\n')
+		>>> offsets, values, _ = read_offsets(path)
+		>>> offsets['b'], values['b']
+		(4, ['b', '2'])
+		>>> os.unlink(path)
+	"""
+	delimiter = delimiter or delimiter_for_path(path)
+	if store is None:
+		store = OrderedDict()
+	store, state, values_cache = _replay_into(
+		path, store, create=create, encoding=encoding, delimiter=delimiter,
+		defaults=defaults, header=header, store_offset=True,
+		cache_values=cache_values)
+	_attach_replay_meta(store, state, values_cache)
+	return store, values_cache, state
 
 
 def _coerce_row(row, delimiter):
 	"""Normalize a row argument to a list of strings.
 
 	A string argument is split on ``delimiter``. Sequence elements are
-	converted with ``str``; falsy elements become empty strings.
+	converted with ``str``; only ``None`` becomes the empty string. Values
+	are passed through verbatim — trailing whitespace is preserved here and
+	stripped (or not) by the reader per ``#_strip_trailing_whites_#`` (§10).
 
 	Args:
 		row: String or sequence of field values.
@@ -1127,10 +1484,12 @@ def _coerce_row(row, delimiter):
 		['a', 'b', 'c']
 		>>> _coerce_row(['a', 1, None], '\\t')
 		['a', '1', '']
+		>>> _coerce_row(['a', 0, False, 'keep  '], '\\t')  # falsy values survive
+		['a', '0', 'False', 'keep  ']
 	"""
 	if isinstance(row, str):
 		return row.split(delimiter)
-	return [str(c).rstrip() if c else '' for c in row]
+	return ['' if c is None else str(c) for c in row]
 
 
 def append_records(path, rows, *, create=False, encoding='utf8', delimiter=None,
@@ -1182,6 +1541,7 @@ def append_records(path, rows, *, create=False, encoding='utf8', delimiter=None,
 					 else format_data_row(row, delimiter))
 	if not lines:
 		return
+	_warn_loose_extension(path, lines, delimiter)
 	with open_part(path, 'ab', encoding=encoding) as f:
 		f.write(('\n'.join(lines) + '\n').encode(encoding, errors='replace'))
 
@@ -1203,6 +1563,51 @@ def append_record(path, row, **kwargs):
 	append_records(path, [row], **kwargs)
 
 
+def delete_records(path, keys, **kwargs):
+	"""Append a tombstone for each key in ``keys`` (specification §9).
+
+	A tombstone is physically a lone-key row, so this is exactly
+	``append_records(path, [[k] for k in keys])`` — but it says at the call
+	site what it does. Prefer it over the bare append form, especially in a
+	single-column store where *every* row is a tombstone (§9.5).
+
+	Deleting an absent key is a harmless no-op on replay (§9.3).
+
+	Args:
+		path: Filesystem path of the part.
+		keys: Iterable of keys to tombstone.
+		**kwargs: Forwarded to :func:`append_records` (``create``,
+			``encoding``, ``delimiter``, ``header``).
+
+	Returns:
+		None: Tombstones are appended to ``path`` as a side effect.
+
+	Examples:
+		>>> import os, tempfile
+		>>> fd, path = tempfile.mkstemp(suffix='.tsvz'); os.close(fd); os.unlink(path)
+		>>> append_records(path, [['a', '1'], ['b', '2']], create=True)
+		>>> delete_records(path, ['a'])
+		>>> dict(read_store(path))
+		{'b': ['b', '2']}
+		>>> os.unlink(path)
+	"""
+	append_records(path, [[key] for key in keys], **kwargs)
+
+
+def delete_record(path, key, **kwargs):
+	"""Append a tombstone for a single key (specification §9).
+
+	Args:
+		path: Filesystem path of the part.
+		key: Key to tombstone.
+		**kwargs: Forwarded to :func:`append_records`.
+
+	Returns:
+		None: A tombstone is appended to ``path`` as a side effect.
+	"""
+	delete_records(path, [key], **kwargs)
+
+
 def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, defaults=None):
 	"""Replace part contents with an optional header comment and defaults marker.
 
@@ -1222,28 +1627,81 @@ def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, default
 	delimiter = delimiter or delimiter_for_path(path)
 	header = _parse_columns(header, delimiter)
 	defaults = _normalize_defaults(defaults)
-	ensure_part_exists(path, create=True, encoding=encoding, delimiter=delimiter)
-	with open_part(path, 'wb', encoding=encoding) as f:
-		if header:
-			f.write(format_header_comment(header, delimiter).encode(encoding, errors='replace') + b'\n')
-		if defaults:
-			line = format_marker_line(MARKER_DEFAULTS, defaults, delimiter)
-			f.write(line.encode(encoding, errors='replace') + b'\n')
+	lines = []
+	if header:
+		lines.append(format_header_comment(header, delimiter))
+	if defaults:
+		lines.append(format_marker_line(MARKER_DEFAULTS, defaults, delimiter))
+	_warn_loose_extension(path, lines, delimiter)
+	payload = ''.join(line + '\n' for line in lines).encode(encoding, errors='replace')
+	_atomic_rewrite(path, payload, encoding=encoding)
+
+
+def _atomic_rewrite(path, payload, *, encoding='utf8'):
+	"""Replace ``path`` with ``payload`` atomically.
+
+	Writes a sibling temporary part, fsyncs it, then :func:`os.replace`\\ s it
+	over ``path``. Readers see either the whole old part or the whole new one,
+	never a truncated intermediate — which matters because §3.1 makes every
+	other write an append, so a half-written rewrite is the one way to lose a
+	whole store.
+
+	Args:
+		path: Destination part path.
+		payload: Complete new part contents, already encoded.
+		encoding: Text encoding forwarded to :func:`open_part`.
+
+	Returns:
+		None: ``path`` is replaced as a side effect.
+	"""
+	directory = os.path.dirname(os.path.abspath(path))
+	# mkstemp, not a PID-derived name: two threads snapshotting the same part
+	# share a PID and would otherwise clobber each other's temporary. The
+	# compression suffix is preserved so open_part picks the same codec as the
+	# destination.
+	fd, tmp = tempfile.mkstemp(dir=directory, prefix=f'.{os.path.basename(path)}.',
+							   suffix=f'.tmp{_compression_suffix(path)}')
+	os.close(fd)
+	try:
+		with open_part(tmp, 'wb', encoding=encoding) as f:
+			f.write(payload)
+			f.flush()
+			with contextlib.suppress(OSError, AttributeError):
+				os.fsync(f.fileno())
+		os.replace(tmp, path)
+	except BaseException:
+		with contextlib.suppress(OSError):
+			os.unlink(tmp)
+		raise
+	with contextlib.suppress(OSError):  # durably link the new name into the dir
+		dir_fd = os.open(directory, os.O_RDONLY)
+		try:
+			os.fsync(dir_fd)
+		finally:
+			os.close(dir_fd)
 
 
 def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=None):
 	"""Materialize live state into a single part (simplified specification §19).
 
-	Rewrites ``path`` in place: superseded values, tombstones, and non-header
-	comments are dropped. The resulting file begins with a ``#_version_#``
-	preamble (and any non-default markers) followed by live rows in
-	first-appearance order.
+	Rewrites ``path``: superseded values, tombstones, and non-header comments
+	are dropped. The result begins with the §19.4 marker preamble followed by
+	live rows in first-appearance order (§3.4), each carrying fully resolved
+	value cells.
+
+	The rewrite is atomic — the new part is built in a sibling temporary file,
+	fsynced, and then :func:`os.replace`\\ d over ``path`` — so a crash mid-
+	snapshot leaves the original intact rather than a truncated store.
+
+	Unlike :class:`WalStore`, which treats a ``#``-prefixed key as an
+	in-memory-only scratch entry, this operates on what is already committed
+	to disk: a key stored as ``<#>key`` per §8.3 is real data and is preserved.
 
 	Args:
 		path: Filesystem path of the part to compact.
 		encoding: Text encoding for read/write.
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
-		header: Optional header retained when truncating before rewrite.
+		header: Optional header re-emitted above the preamble.
 		store: Optional mapping to populate during the pre-snapshot read.
 
 	Returns:
@@ -1257,33 +1715,242 @@ def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=N
 		{'a': ['a', '2']}
 		>>> '#_version_#' in open(path).read()
 		True
+		>>> append_records(path, [['a']])  # tombstone the last live key
+		>>> dict(snapshot_part(path))
+		{}
+		>>> [ln for ln in open(path).read().splitlines() if not ln.startswith('#')]
+		[]
 		>>> os.unlink(path)
 	"""
 	data = read_store(path, encoding=encoding, delimiter=delimiter, store=store)
-	if not data:
-		return data
 	delimiter = delimiter or delimiter_for_path(path)
 	state = getattr(data, '_reader_state', ReaderState())
 	snap = ReaderState()
 	snap.defaults = list(state.defaults)
 	snap.return_on_missing = state.return_on_missing
-	lines = build_snapshot_preamble(snap, delimiter)
-	for key, row in data.items():
-		if str(key).startswith('#'):
-			continue
+	snap.write_ack = state.write_ack
+	header_cols = _parse_columns(header, delimiter)
+	lines = []
+	if header_cols:
+		lines.append(format_header_comment(header_cols, delimiter))
+	lines.extend(build_snapshot_preamble(snap, delimiter))
+	for row in data.values():
 		if isinstance(row, list) and row:
 			lines.append(format_data_row(row, delimiter))
-	truncate_part(path, encoding=encoding, delimiter=delimiter, header=header)
-	with open_part(path, 'ab', encoding=encoding) as f:
-		f.write(('\n'.join(lines) + '\n').encode(encoding, errors='replace'))
+	_warn_loose_extension(path, lines, delimiter)
+	_atomic_rewrite(path, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
+					encoding=encoding)
 	return data
+
+
+# ---------------------------------------------------------------------------
+# Shared store behaviour
+# ---------------------------------------------------------------------------
+
+class _StoreCommon:
+	"""Key, defaults, and removal semantics shared by the two store classes.
+
+	:class:`WalStore` and :class:`OffsetStore` differ only in how they hold
+	rows (in memory vs. by byte offset) and how they persist them (queued vs.
+	synchronous). Everything above that — key normalization, ``#_defaults_#``
+	handling, the constructor-defaults ordering rule, and ``pop``/``popitem``
+	— lives here so a fix lands once rather than in two places.
+
+	Subclasses provide the persistence hooks :meth:`_persist_row`,
+	:meth:`_persist_tombstone`, and :meth:`_persist_defaults`.
+	"""
+
+	def _init_common(self, path, header, create, encoding, delimiter, defaults):
+		self.path = path
+		self.encoding = encoding
+		self.delimiter = delimiter or delimiter_for_path(path)
+		self.header = _parse_columns(header, self.delimiter)
+		self.create = create
+		self._reader_state = ReaderState()
+		self._defaults_row = [MARKER_DEFAULTS]
+		# True once no further §5.2 check is needed: either the part uses a
+		# strict extension, or we have already warned about this one.
+		self._loose_checked = is_strict_store(path)
+		self.set_defaults(defaults)
+
+	def _adopt_constructor_defaults(self, defaults):
+		"""Re-apply and persist constructor defaults after a replay.
+
+		``reload()`` replaces ``_reader_state`` wholesale with whatever the
+		part declared, so defaults passed to ``__init__`` are otherwise
+		silently discarded. They are persisted too, so the next reader
+		resolves rows the same way this one does.
+
+		Args:
+			defaults: The constructor's ``defaults`` argument.
+
+		Returns:
+			None
+		"""
+		wanted = _normalize_defaults(defaults)
+		if wanted and wanted != self._reader_state.defaults:
+			self.set_defaults(wanted)
+			self._persist_defaults(list(self._defaults_row))
+
+	def set_defaults(self, defaults):
+		"""Set value-column defaults (excluding the ``#_defaults_#`` key field).
+
+		Args:
+			defaults: Value-column defaults, or a legacy row beginning with
+				``#_defaults_#``.
+
+		Returns:
+			None: Defaults are stored on ``self``.
+		"""
+		vals = _normalize_defaults(defaults)
+		self._defaults_row = [MARKER_DEFAULTS] + vals if vals else [MARKER_DEFAULTS]
+		self._reader_state.defaults = list(vals)
+
+	@property
+	def defaults(self):
+		"""Return the defaults row with ``#_defaults_#`` as field 0.
+
+		Returns:
+			list: Copy of the defaults row including the marker key.
+		"""
+		return list(self._defaults_row)
+
+	def _check_loose(self, lines):
+		"""Warn once if spec-only syntax reaches a loose extension (§5.2).
+
+		A single boolean test for the recommended strict-extension case, so
+		this costs nothing on the hot write path.
+		"""
+		if self._loose_checked:
+			return
+		_warn_loose_extension(self.path, lines, self.delimiter)
+		self._loose_checked = True
+
+	def _resolve_write_ack(self, write_ack):
+		"""Pick the effective §18.4 acknowledgement mode.
+
+		An explicit constructor argument wins; otherwise the part's own
+		``#_write_ack_#`` marker applies, falling back to the spec's built-in
+		default of ``memory``.
+
+		Args:
+			write_ack: ``'memory'``, ``'disk'``, or ``None`` to defer to the part.
+
+		Returns:
+			str: The effective mode.
+
+		Raises:
+			ValueError: If ``write_ack`` is not a recognized mode.
+		"""
+		if write_ack is None:
+			return self._reader_state.write_ack
+		mode = str(write_ack).strip().lower()
+		if mode not in WRITE_ACK_MODES:
+			raise ValueError(
+				f'write_ack must be one of {sorted(WRITE_ACK_MODES)}, got {write_ack!r}')
+		return mode
+
+	def get(self, key, default=None):
+		"""Return ``self[key]``, or ``default`` if that would raise ``KeyError``.
+
+		Aligned with :meth:`__getitem__`, which is the point: the C-level
+		``dict.get`` bypasses it, so a store with ``return_on_missing`` on
+		would otherwise answer ``None`` from ``get()`` and a synthesized
+		defaults row from ``[]`` for the very same key.
+
+		Note that while ``return_on_missing`` is enabled (§12.4's built-in
+		default) a missing key resolves to a defaults row rather than
+		``default``. Membership stays literal: ``key in store`` and ``len()``
+		count only keys actually stored.
+
+		Args:
+			key: Key to look up.
+			default: Returned only when the lookup raises ``KeyError``.
+
+		Returns:
+			list: The stored row, a synthesized defaults row, or ``default``.
+		"""
+		try:
+			return self[key]
+		except KeyError:
+			return default
+
+	@staticmethod
+	def _normalize_key(key):
+		"""Normalize a key to its stored identity (§10.2 trailing strip)."""
+		return str(key).rstrip(' \t')
+
+	def _prepare_row(self, key, value):
+		"""Coerce an assigned value into a full ``[key, value…]`` row.
+
+		Returns:
+			list | None: The row to persist, or ``None`` when the assignment
+			is a lone key and therefore a deletion (§9.2).
+		"""
+		row = _coerce_row(value, self.delimiter)
+		if not row or row[0] != key:
+			row = [key] + list(row)
+		return None if len(row) == 1 else row
+
+	def pop(self, key, *args):
+		"""Remove ``key`` and persist a tombstone.
+
+		Overrides the C ``pop`` implementations, which do not route through
+		``__delitem__``.
+
+		Args:
+			key: Key to remove.
+			*args: Optional default returned when ``key`` is absent.
+
+		Returns:
+			list: Removed row, or the provided default.
+		"""
+		key = self._normalize_key(key)
+		if key in self:
+			value = self[key]
+			del self[key]
+			return value
+		if args:
+			return args[0]
+		raise KeyError(key)
+
+	def popitem(self, last=True):
+		"""Remove and return a ``(key, value)`` pair, persisting a tombstone.
+
+		Args:
+			last: If True, pop the most recently inserted item.
+
+		Returns:
+			tuple: ``(key, value)`` of the removed item.
+		"""
+		if not len(self):
+			raise KeyError('dictionary is empty')
+		key = next(reversed(self)) if last else next(iter(self))
+		value = self[key]
+		del self[key]
+		return key, value
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		self.close()
+
+	def _persist_row(self, row):
+		raise NotImplementedError
+
+	def _persist_tombstone(self, key):
+		raise NotImplementedError
+
+	def _persist_defaults(self, defaults_row):
+		raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
 # WalStore — in-memory store + async append-only writer (§18)
 # ---------------------------------------------------------------------------
 
-class WalStore(OrderedDict):
+class WalStore(_StoreCommon, OrderedDict):
 	"""Ordered key→row store backed by an append-only part file.
 
 	Mutations are enqueued for a background flusher; :meth:`flush` and
@@ -1316,47 +1983,22 @@ class WalStore(OrderedDict):
 	"""
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
-				 delimiter=None, defaults=None, flush_interval=0.01):
+				 delimiter=None, defaults=None, flush_interval=0.01,
+				 write_ack=None):
 		super().__init__()
-		self.path = path
-		self.encoding = encoding
-		self.delimiter = delimiter or delimiter_for_path(path)
-		self.header = _parse_columns(header, self.delimiter)
-		self.create = create
 		self._pending = deque()
 		self._lock = threading.Lock()
+		self._wake = threading.Condition()
 		self._shutdown = threading.Event()
-		self._reader_state = ReaderState()
-		self._defaults_row = [MARKER_DEFAULTS]
-		self.set_defaults(defaults)
+		self._flush_error = None
+		self._init_common(path, header, create, encoding, delimiter, defaults)
 		self.flush_interval = flush_interval
+		self.reload()
+		self._adopt_constructor_defaults(defaults)
+		self.write_ack = self._resolve_write_ack(write_ack)
 		self._worker = threading.Thread(target=self._flush_worker, daemon=True)
 		self._worker.start()
-		self.reload()
 		atexit.register(self.close)
-
-	def set_defaults(self, defaults):
-		"""Set value-column defaults (excluding the ``#_defaults_#`` key field).
-
-		Args:
-			defaults: Value-column defaults, or a legacy row beginning with
-				``#_defaults_#``.
-
-		Returns:
-			None: Defaults are stored on ``self``.
-		"""
-		vals = _normalize_defaults(defaults)
-		self._defaults_row = [MARKER_DEFAULTS] + vals if vals else [MARKER_DEFAULTS]
-		self._reader_state.defaults = list(vals)
-
-	@property
-	def defaults(self):
-		"""Return the defaults row with ``#_defaults_#`` as field 0.
-
-		Returns:
-			list: Copy of the defaults row including the marker key.
-		"""
-		return list(self._defaults_row)
 
 	def reload(self):
 		"""Discard in-memory state and replay the part from disk.
@@ -1364,142 +2006,170 @@ class WalStore(OrderedDict):
 		Pending writes that have not yet been flushed are preserved across
 		the reload.
 
+		Replay reads into a private mapping and repopulates ``self`` through
+		``OrderedDict.__setitem__``. Handing ``self`` to :func:`read_store`
+		instead would route through this class's :meth:`clear` — which
+		*truncates the part* — and then through :meth:`__setitem__`, re-queuing
+		every replayed row as a fresh append.
+
 		Returns:
 			WalStore: ``self``, after replay.
 		"""
-		prev = self._pending
-		self._pending = deque()
-		super().clear()
+		loaded = OrderedDict()
 		try:
 			read_store(
 				self.path, create=self.create, encoding=self.encoding,
-				delimiter=self.delimiter, store=self, header=self.header or None,
+				delimiter=self.delimiter, store=loaded, header=self.header or None,
 			)
 		except FileNotFoundError:
 			if self.create:
 				raise
-		self._reader_state = getattr(self, '_reader_state', self._reader_state)
-		self._pending = prev
+		super().clear()
+		for key, row in loaded.items():
+			OrderedDict.__setitem__(self, key, row)
+		self._reader_state = getattr(loaded, '_reader_state', self._reader_state)
 		return self
 
 	def __getitem__(self, key):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		try:
-			return super().__getitem__(key)
+			return OrderedDict.__getitem__(self, key)
 		except KeyError:
 			if self._reader_state.return_on_missing:
 				return resolve_missing_key(key, self._reader_state)
 			raise
 
 	def __setitem__(self, key, value):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		if not key:
-			return
-		value = _coerce_row(value, self.delimiter)
-		if not value or value[0] != key:
-			value = [key] + list(value)
-		if len(value) == 1:
+			raise KeyError('empty key')  # §8.4: an empty key can never be stored
+		row = self._prepare_row(key, value)
+		if row is None:  # lone key -- §9.2 deletion
 			del self[key]
 			return
 		if key == MARKER_DEFAULTS:
-			self.set_defaults(value[1:])
-			self._pending.append(list(self._defaults_row))
+			self.set_defaults(row[1:])
+			self._persist_defaults(list(self._defaults_row))
 			return
-		super().__setitem__(key, value)
-		if key.startswith('#'):
-			return
-		self._pending.append(list(value))
+		OrderedDict.__setitem__(self, key, row)
+		self._persist_row(row)
+
+	def _enqueue(self, item):
+		"""Queue one record and wake the flusher.
+
+		The notify is what lets the worker sleep instead of poll; it is
+		unconditional because a "only notify when the queue was empty"
+		optimization can lose a wakeup when two writers race.
+		"""
+		self._pending.append(item)
+		with self._wake:
+			self._wake.notify()
+
+	def _persist_row(self, row):
+		self._enqueue(list(row))
+
+	def _persist_tombstone(self, key):
+		self._enqueue((_TOMBSTONE, key))
+
+	def _persist_defaults(self, defaults_row):
+		self._enqueue(list(defaults_row))
 
 	def __delitem__(self, key):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		if key == MARKER_DEFAULTS:
 			self.set_defaults([])
-			self._pending.append([MARKER_DEFAULTS])
+			self._persist_defaults([MARKER_DEFAULTS])
 			return
 		if key not in self:
-			return
-		super().__delitem__(key)
-		if key.startswith('#'):
-			return
-		self._pending.append((_TOMBSTONE, key))
-
-	def pop(self, key, *args):
-		"""Remove ``key`` and persist a tombstone.
-
-		Overrides the C :meth:`OrderedDict.pop` implementation, which does
-		not invoke :meth:`__delitem__`.
-
-		Args:
-			key: Key to remove.
-			*args: Optional default returned when ``key`` is absent.
-
-		Returns:
-			list: Removed row, or the provided default.
-		"""
-		key = str(key).rstrip()
-		if key in self:
-			value = self[key]
-			del self[key]
-			return value
-		if args:
-			return args[0]
-		raise KeyError(key)
-
-	def popitem(self, last=True):
-		"""Remove and return a ``(key, value)`` pair, persisting a tombstone.
-
-		Overrides the C :meth:`OrderedDict.popitem` implementation, which
-		does not invoke :meth:`__delitem__`.
-
-		Args:
-			last: If True, pop the most recently inserted item.
-
-		Returns:
-			tuple: ``(key, value)`` of the removed item.
-		"""
-		if not self:
-			raise KeyError('dictionary is empty')
-		key = next(reversed(self)) if last else next(iter(self))
-		value = self[key]
-		del self[key]
-		return key, value
+			# §9.3 makes a tombstone for an absent key a harmless no-op on
+			# disk, but `del` must still honour the MutableMapping contract.
+			raise KeyError(key)
+		OrderedDict.__delitem__(self, key)
+		self._persist_tombstone(key)
 
 	def clear(self):
 		"""Clear in-memory state and truncate the part on disk.
 
-		The optional header comment and defaults marker are retained.
+		The optional header comment and defaults marker are retained. The
+		rewrite happens under the same lock the flusher uses, so a concurrent
+		flush cannot interleave rows into the truncated part.
 
 		Returns:
 			WalStore: ``self``, after truncation.
 		"""
-		self._pending.clear()
-		super().clear()
-		truncate_part(self.path, encoding=self.encoding, delimiter=self.delimiter,
-					  header=self.header, defaults=self._reader_state.defaults)
+		with self._lock:
+			self._pending.clear()
+			super().clear()
+			truncate_part(self.path, encoding=self.encoding, delimiter=self.delimiter,
+						  header=self.header, defaults=self._reader_state.defaults)
 		return self
 
 	def flush(self):
-		"""Write all pending append and tombstone lines under an exclusive lock.
+		"""Write pending append and tombstone lines under an exclusive lock.
+
+		Drains at most the number of items queued when the flush began. That
+		bound matters: an unbounded ``while self._pending`` drain never
+		terminates when producers append faster than the writer, and because
+		the drain runs inside the exclusive lock it would starve every other
+		caller (``close``, a snapshot) indefinitely while the queue grows
+		without bound.
+
+		Items that cannot be written are put back at the head of the queue and
+		the underlying ``OSError`` propagates, so a failed flush loses nothing.
 
 		Returns:
 			WalStore: ``self``, after draining the pending queue.
+
+		Raises:
+			OSError: If the part cannot be opened or written.
 		"""
 		if not self._pending:
 			return self
+		batch = []
+		for _ in range(len(self._pending)):
+			try:
+				batch.append(self._pending.popleft())
+			except IndexError:
+				break
+		if not batch:
+			return self
+		# §18.2/§18.3: commit the batch as one append of whole records, then a
+		# single fsync (in _LockedPart.__exit__). A record is never split
+		# across write() calls.
+		encoded = [_queue_item_to_bytes(item, self.delimiter, self.encoding)
+				   for item in batch]
+		if not self._loose_checked:
+			self._check_loose([b.decode(self.encoding, errors='replace').rstrip('\n')
+							   for b in encoded])
+		payload = b''.join(encoded)
 		try:
-			with self._open_locked('ab') as f:
-				buf = io.BufferedWriter(f, buffer_size=65536)
-				while self._pending:
-					buf.write(_queue_item_to_bytes(self._pending.popleft(), self.delimiter, self.encoding))
-				buf.flush()
+			with self._open_locked('ab', fsync=self.write_ack == WRITE_ACK_DISK) as f:
+				f.write(payload)
+				f.flush()
 		except OSError:
-			self._pending.clear()
+			self._pending.extendleft(reversed(batch))  # restore original order
+			raise
 		return self
+
+	@property
+	def last_flush_error(self):
+		"""Return the last ``OSError`` a background flush hit, or ``None``.
+
+		Background flushes cannot propagate to a caller, so the error is
+		recorded here (and warned about once on stderr) instead of being
+		swallowed. Cleared by a subsequent successful :meth:`flush`.
+
+		Returns:
+			OSError | None: The most recent background flush failure.
+		"""
+		return self._flush_error
 
 	def close(self):
 		"""Stop the background flush worker and drain the pending queue.
 
-		Idempotent if already closed.
+		Idempotent if already closed. Unregisters the ``atexit`` hook so a
+		closed store is no longer pinned alive by the interpreter's exit
+		registry.
 
 		Returns:
 			WalStore: ``self``.
@@ -1507,33 +2177,93 @@ class WalStore(OrderedDict):
 		if self._shutdown.is_set():
 			return self
 		self._shutdown.set()
-		self._worker.join()
+		with self._wake:  # a worker parked on the Condition must be woken
+			self._wake.notify_all()
+		if self._worker.is_alive() and self._worker is not threading.current_thread():
+			self._worker.join()
+		atexit.unregister(self.close)
 		return self
-
-	def __enter__(self):
-		return self
-
-	def __exit__(self, *exc):
-		self.close()
 
 	def __del__(self):
 		with contextlib.suppress(AttributeError, RuntimeError, OSError, TypeError):
 			self.close()
 
 	def _flush_worker(self):
-		while not self._shutdown.is_set():
-			self.flush()
-			time.sleep(self.flush_interval)
-		self.flush()
+		"""Drain the queue, waking on writes rather than polling for them.
 
-	def _open_locked(self, mode):
+		Sleeps on a :class:`threading.Condition` that every write notifies, so
+		an idle store costs essentially nothing (the old loop woke
+		``1/flush_interval`` times a second forever -- ~100 Hz at the default).
+		``flush_interval`` now means "how long a burst of writes may coalesce
+		into one batch" (§18.3) and doubles as the retry backoff.
+		"""
+		while not self._shutdown.is_set():
+			with self._wake:
+				if not self._pending:
+					# Timeout is only a lost-wakeup safety net.
+					self._wake.wait(max(self.flush_interval, _IDLE_WAKE_SECONDS))
+			if self._shutdown.is_set():
+				break
+			if not self._pending:
+				continue
+			# Let a write burst accumulate into a single append; back off
+			# harder when the previous attempt failed.
+			backoff = (self.flush_interval if self._flush_error is None
+					   else max(self.flush_interval, _IDLE_WAKE_SECONDS))
+			self._shutdown.wait(backoff)
+			self._flush_quietly()
+		self._flush_quietly()
+
+	def _flush_quietly(self):
+		"""Flush from the background worker, recording rather than raising.
+
+		Catches ``Exception``, not just ``OSError``: subclasses hook extra work
+		into :meth:`flush` (``TSVZed`` runs a periodic snapshot there), and
+		anything escaping would kill the worker thread and silently strand
+		every queued record with nobody left to drain it.
+		"""
+		try:
+			self.flush()
+		except Exception as exc:  # noqa: BLE001  # a dead flusher loses data
+			first = self._flush_error is None
+			self._flush_error = exc
+			if first:
+				print(f'TSVZ: flush to {self.path!r} failed: {exc!r}; '
+					  f'{len(self._pending)} record(s) still queued', file=sys.stderr)
+		else:
+			self._flush_error = None
+
+	def _open_locked(self, mode, *, fsync=True):
+		"""Acquire the thread lock plus an exclusive file lock on the part.
+
+		Args:
+			mode: Open mode passed to :func:`open_part`.
+			fsync: If True, fsync the part when the context exits (§18.4
+				``disk``); if False, only flush to the OS (``memory``).
+
+		Returns:
+			_LockedPart: Context manager that releases both on exit.
+
+		Raises:
+			OSError: If the part cannot be opened or locked. The thread lock
+				is released first, so a failure never wedges later writers.
+		"""
 		self._lock.acquire()
-		f = open_part(self.path, mode, encoding=self.encoding)
-		if os.name == 'posix':
-			fcntl.lockf(f, fcntl.LOCK_EX)
-		elif os.name == 'nt':
-			msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
-		return _LockedPart(f, self._lock)
+		f = None
+		try:
+			f = open_part(self.path, mode, encoding=self.encoding)
+			if os.name == 'posix':
+				fcntl.lockf(f, fcntl.LOCK_EX)
+			elif os.name == 'nt':
+				msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
+		except BaseException:
+			# _LockedPart never gets built, so nothing else will release these.
+			if f is not None:
+				with contextlib.suppress(OSError):
+					f.close()
+			self._lock.release()
+			raise
+		return _LockedPart(f, self._lock, fsync=fsync)
 
 
 class _LockedPart:
@@ -1544,24 +2274,22 @@ class _LockedPart:
 		lock: Threading lock held for the duration of the context.
 	"""
 
-	def __init__(self, file_obj, lock):
+	def __init__(self, file_obj, lock, *, fsync=True):
 		self._file = file_obj
 		self._lock = lock
-
-	def write(self, data):
-		return self._file.write(data)
-
-	def flush(self):
-		return self._file.flush()
+		self._fsync = fsync
 
 	def __enter__(self):
 		return self._file
 
 	def __exit__(self, *exc):
+		# §18.3: at most one fsync per committed batch, and only when the
+		# store is running write_ack='disk' (§18.4).
 		try:
 			self._file.flush()
-			os.fsync(self._file.fileno())
-		except OSError:
+			if self._fsync:
+				os.fsync(self._file.fileno())
+		except (OSError, ValueError, AttributeError):
 			pass
 		if not self._file.closed:
 			if os.name == 'posix':
@@ -1580,12 +2308,23 @@ class _LockedPart:
 # OffsetStore — key→offset index, synchronous append (§18 single-process)
 # ---------------------------------------------------------------------------
 
-class OffsetStore(MutableMapping):
+class OffsetStore(_StoreCommon, MutableMapping):
 	"""Key→byte-offset index with on-demand value materialization.
 
 	Uses less memory than :class:`WalStore` because row contents are read
 	from disk when accessed. Writes are synchronous. Intended for
 	single-process use (specification §18).
+
+	Compressed parts are rejected: an index of byte offsets into the
+	*decoded* stream cannot address a compressed file, so seeking to a stored
+	offset would read garbage and appending would corrupt the container. Use
+	:class:`WalStore` for ``.gz``/``.bz2``/``.xz``/``.zst`` parts.
+
+	Rows are **not** all held in memory: replay builds the offset index only,
+	and values are read from disk on access through a bounded LRU cache
+	(``cache_size``). Caching every row would make this class cost *more*
+	than :class:`WalStore` -- the full row set plus an index -- which defeats
+	the purpose of indexing by offset.
 
 	Args:
 		path: Filesystem path of the backing part.
@@ -1594,19 +2333,26 @@ class OffsetStore(MutableMapping):
 		encoding: Text encoding for append I/O.
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
 		defaults: Optional value-column defaults.
+		write_ack: §18.4 acknowledgement mode, ``'memory'`` or ``'disk'``.
+			``None`` defers to the part's ``#_write_ack_#`` marker.
+		cache_size: Maximum rows retained in the LRU value cache; ``0``
+			disables caching so every read goes to disk.
+
+	Raises:
+		ValueError: If ``path`` carries a compression suffix (§16), or
+			``write_ack`` is not a recognized mode.
 	"""
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
-				 delimiter=None, defaults=None):
-		self.path = path
-		self.encoding = encoding
-		self.delimiter = delimiter or delimiter_for_path(path)
-		self.header = _parse_columns(header, self.delimiter)
-		self.create = create
-		self._reader_state = ReaderState()
-		self._values = {}
+				 delimiter=None, defaults=None, write_ack=None, cache_size=4096):
+		if is_compressed_path(path):
+			raise ValueError(
+				f'OffsetStore cannot index a compressed part ({path!r}): byte '
+				f'offsets do not address a compressed stream. Use WalStore instead.')
+		self._cache_size = max(0, int(cache_size))
+		self._values = OrderedDict()   # bounded LRU: key -> row
 		self._offsets = {}
-		self.set_defaults(defaults)
+		self._init_common(path, header, create, encoding, delimiter, defaults)
 		try:
 			ensure_part_exists(self.path, create=self.create, encoding=self.encoding,
 							   delimiter=self.delimiter, header=self.header)
@@ -1615,36 +2361,76 @@ class OffsetStore(MutableMapping):
 				raise
 			# create=False and missing: empty in-memory index, no real file handle.
 			self._file = open(os.devnull, 'r+b')  # noqa: SIM115
+			self.write_ack = self._resolve_write_ack(write_ack)
 			atexit.register(self.close)
 			return
 		# Long-lived handle; closed via close()/__exit__/atexit.
 		self._file = open(self.path, 'r+b')  # noqa: SIM115
 		self.reload()
+		self._adopt_constructor_defaults(defaults)
+		self.write_ack = self._resolve_write_ack(write_ack)
 		atexit.register(self.close)
 
-	def set_defaults(self, defaults):
-		vals = _normalize_defaults(defaults)
-		self._defaults_row = [MARKER_DEFAULTS] + vals if vals else [MARKER_DEFAULTS]
-		self._reader_state.defaults = list(vals)
-
-	@property
-	def defaults(self):
-		return list(self._defaults_row)
-
 	def reload(self):
+		"""Rebuild the offset index by replaying the part from disk.
+
+		Returns:
+			OffsetStore: ``self``, after replay.
+		"""
 		self._offsets.clear()
 		self._values.clear()
-		loaded = OrderedDict()
-		read_store(self.path, create=self.create, encoding=self.encoding,
-				   delimiter=self.delimiter, store=loaded, store_offset=True)
-		self._offsets.update(loaded)
-		self._values.update(getattr(loaded, '_values_cache', {}))
-		self._reader_state = getattr(loaded, '_reader_state', self._reader_state)
+		offsets, _values, state = read_offsets(
+			self.path, create=self.create, encoding=self.encoding,
+			delimiter=self.delimiter, cache_values=False)
+		self._offsets.update(offsets)
+		self._reader_state = state
+		return self
+
+	def _cache_put(self, key, row):
+		"""Insert ``row`` into the bounded LRU value cache."""
+		if not self._cache_size:
+			return
+		self._values[key] = row
+		self._values.move_to_end(key)
+		while len(self._values) > self._cache_size:
+			self._values.popitem(last=False)
+
+	def _cache_get(self, key):
+		"""Return the cached row for ``key`` and mark it recently used."""
+		row = self._values.get(key)
+		if row is not None:
+			self._values.move_to_end(key)
+		return row
+
+	def flush(self, *, fsync=None):
+		"""Push buffered appends to the OS, fsyncing per §18.4.
+
+		Writes are otherwise only visible to other readers once the handle is
+		closed, since :class:`OffsetStore` keeps one long-lived buffered
+		handle open for the life of the store.
+
+		Args:
+			fsync: Override the store's ``write_ack`` mode for this call.
+				``None`` fsyncs only when ``write_ack == 'disk'``.
+
+		Returns:
+			OffsetStore: ``self``.
+		"""
+		if self._file.closed:
+			return self
+		self._file.flush()
+		if fsync is None:
+			fsync = self.write_ack == WRITE_ACK_DISK
+		if fsync:
+			with contextlib.suppress(OSError, ValueError):
+				os.fsync(self._file.fileno())
 		return self
 
 	def _append_line(self, line):
+		self._check_loose([line])
 		self._file.seek(0, os.SEEK_END)
 		pos = self._file.tell()
+		# §18.2: one whole record, terminated, in a single write().
 		self._file.write(line.encode(self.encoding, errors='replace') + b'\n')
 		return pos
 
@@ -1658,20 +2444,32 @@ class OffsetStore(MutableMapping):
 		return self._append_line(line)
 
 	def _read_at(self, offset, key=None):
-		if key is not None and key in self._values:
-			return list(self._values[key])
+		if key is not None:
+			cached = self._cache_get(key)
+			if cached is not None:
+				return list(cached)
+		if not isinstance(offset, int):
+			raise TypeError(f'offset index for {key!r} is {type(offset).__name__}, not int')
+		self._file.flush()  # buffered appends must be on disk before we seek back
 		self._file.seek(offset)
-		line = self._file.readline().decode(self.encoding, errors='replace').rstrip('\r\n')
+		line = self._file.readline().decode(self.encoding, errors='replace')
+		if line.endswith('\n'):  # §4.2: at most one \r immediately before the \n
+			line = line[:-1]
+			if line.endswith('\r'):  # noqa: FURB188  # removesuffix needs 3.9+
+				line = line[:-1]
 		scratch = OrderedDict()
 		kind, entry = process_record(line, self._reader_state.copy(), scratch, self.delimiter)
 		if kind == 'data' and entry is not None:
-			return list(entry.row)
+			row = materialize_row(entry)
+			if key is not None:
+				self._cache_put(key, list(row))
+			return row
 		if key is not None:
 			raise KeyError(key)
 		return []
 
 	def __getitem__(self, key):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		if key == MARKER_DEFAULTS:
 			return self.defaults
 		if key not in self._offsets:
@@ -1681,73 +2479,40 @@ class OffsetStore(MutableMapping):
 		return self._read_at(self._offsets[key], key)
 
 	def __setitem__(self, key, value):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		if not key:
-			return
-		value = _coerce_row(value, self.delimiter)
-		if not value or value[0] != key:
-			value = [key] + list(value)
-		if len(value) == 1:
+			raise KeyError('empty key')  # §8.4: an empty key can never be stored
+		row = self._prepare_row(key, value)
+		if row is None:  # lone key -- §9.2 deletion
 			del self[key]
 			return
 		if key == MARKER_DEFAULTS:
-			self.set_defaults(value[1:])
+			self.set_defaults(row[1:])
+			self._persist_defaults(list(self._defaults_row))
 			return
-		if key.startswith('#'):
-			self._offsets[key] = value
-			self._values[key] = list(value)
-			return
-		pos = self._write_row(value)
-		self._offsets[key] = pos
-		self._values[key] = list(value)
+		self._offsets[key] = self._persist_row(row)
+		self._cache_put(key, list(row))
 
 	def __delitem__(self, key):
-		key = str(key).rstrip()
+		key = self._normalize_key(key)
 		if key == MARKER_DEFAULTS:
 			self.set_defaults([])
-			self._write_row([MARKER_DEFAULTS])
+			self._persist_defaults([MARKER_DEFAULTS])
 			return
 		if key not in self._offsets:
-			return
+			raise KeyError(key)
 		self._offsets.pop(key, None)
 		self._values.pop(key, None)
-		if not key.startswith('#'):
-			self._write_row([key])
+		self._persist_tombstone(key)
 
-	def pop(self, key, *args):
-		"""Remove ``key`` and persist a tombstone to the part file.
+	def _persist_row(self, row):
+		return self._write_row(row)
 
-		Args:
-			key: Key to remove.
-			*args: Optional default returned when ``key`` is absent.
+	def _persist_tombstone(self, key):
+		self._write_row([key])
 
-		Returns:
-			list: Removed row, or the provided default.
-		"""
-		key = str(key).rstrip()
-		if key in self._offsets:
-			value = self[key]
-			del self[key]
-			return value
-		if args:
-			return args[0]
-		raise KeyError(key)
-
-	def popitem(self, last=True):
-		"""Remove and return a ``(key, value)`` pair, persisting a tombstone.
-
-		Args:
-			last: If True, pop the most recently inserted item.
-
-		Returns:
-			tuple: ``(key, value)`` of the removed item.
-		"""
-		if not self._offsets:
-			raise KeyError('dictionary is empty')
-		key = next(reversed(self._offsets)) if last else next(iter(self._offsets))
-		value = self[key]
-		del self[key]
-		return key, value
+	def _persist_defaults(self, defaults_row):
+		self._write_row(list(defaults_row))
 
 	def __iter__(self):
 		return iter(self._offsets)
@@ -1756,27 +2521,39 @@ class OffsetStore(MutableMapping):
 		return len(self._offsets)
 
 	def __contains__(self, key):
-		return str(key).rstrip() in self._offsets
+		return self._normalize_key(key) in self._offsets
 
 	def clear(self):
+		"""Truncate the part, retaining the header comment and defaults marker.
+
+		Returns:
+			OffsetStore: ``self``, after truncation.
+		"""
 		self._offsets.clear()
 		self._values.clear()
 		self._file.seek(0)
 		self._file.truncate()
 		if self.header:
 			self._append_line(format_header_comment(self.header, self.delimiter))
+		if self._reader_state.defaults:
+			self._write_row(list(self._defaults_row))
+		self.flush(fsync=True)
 		return self
 
 	def close(self):
+		"""Flush buffered appends and release the part handle.
+
+		Idempotent. Unregisters the ``atexit`` hook so a closed store is not
+		pinned alive by the exit registry.
+
+		Returns:
+			OffsetStore: ``self``.
+		"""
 		if not self._file.closed:
+			self.flush(fsync=True)  # closing is a durability point either way
 			self._file.close()
+		atexit.unregister(self.close)
 		return self
-
-	def __enter__(self):
-		return self
-
-	def __exit__(self, *exc):
-		self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1786,6 +2563,51 @@ class OffsetStore(MutableMapping):
 DEFAULTS_INDICATOR_KEY = MARKER_DEFAULTS
 build_scrub_preamble = build_snapshot_preamble
 openFileAsCompressed = open_part
+
+#: Release in which the legacy names below are scheduled for removal.
+LEGACY_REMOVAL_VERSION = '5.0'
+
+
+def _deprecated(replacement):
+	"""Mark a legacy entry point as deprecated in favour of ``replacement``.
+
+	Emits :class:`DeprecationWarning` at the caller's stack level on first
+	use, and appends a note to the wrapped object's docstring.
+
+	Args:
+		replacement: Name of the supported API to use instead.
+
+	Returns:
+		callable: Decorator applying the warning.
+	"""
+	def decorate(obj):
+		note = (f'\n\n.. deprecated:: {__version__}\n'
+				f'\tUse :obj:`{replacement}` instead; scheduled for removal in '
+				f'TSVZ {LEGACY_REMOVAL_VERSION}.\n')
+		if isinstance(obj, type):
+			original_init = obj.__init__
+
+			def __init__(self, *args, **kwargs):
+				warnings.warn(
+					f'{obj.__name__} is deprecated; use {replacement} instead. '
+					f'It will be removed in TSVZ {LEGACY_REMOVAL_VERSION}.',
+					DeprecationWarning, stacklevel=2)
+				original_init(self, *args, **kwargs)
+			__init__.__doc__ = original_init.__doc__
+			obj.__init__ = __init__
+			obj.__doc__ = (obj.__doc__ or '') + note
+			return obj
+
+		@functools.wraps(obj)
+		def wrapper(*args, **kwargs):
+			warnings.warn(
+				f'{obj.__name__}() is deprecated; use {replacement}() instead. '
+				f'It will be removed in TSVZ {LEGACY_REMOVAL_VERSION}.',
+				DeprecationWarning, stacklevel=2)
+			return obj(*args, **kwargs)
+		wrapper.__doc__ = (obj.__doc__ or '') + note
+		return wrapper
+	return decorate
 
 
 def _legacy_delimiter(delimiter=..., file_name='', path=''):
@@ -1826,12 +2648,17 @@ def _legacy_delimiter(delimiter=..., file_name='', path=''):
 	if delimiter == 'null':
 		return '\0'
 	if isinstance(delimiter, str):
+		# unicode_escape round-trips through latin-1, so it mangles any
+		# non-ASCII delimiter ('§' -> 'Â§'). Only unescape pure ASCII.
+		if not delimiter.isascii():
+			return delimiter
 		try:
 			return delimiter.encode().decode('unicode_escape')
 		except UnicodeError:
 			return delimiter
 	return delimiter
 
+@_deprecated('delimiter_for_path')
 def get_delimiter(delimiter=..., file_name=''):
 	"""Legacy alias for :func:`_legacy_delimiter` / :func:`delimiter_for_path`.
 
@@ -1844,6 +2671,7 @@ def get_delimiter(delimiter=..., file_name=''):
 	"""
 	return _legacy_delimiter(delimiter=delimiter, file_name=file_name)
 
+@_deprecated('read_last_record')
 def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None,
 						 strict=False, encoding='utf8', delimiter=..., defaults=...,
 						 storeOffset=False):
@@ -1872,6 +2700,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 		fileName, encoding=encoding, delimiter=d, store_offset=storeOffset,
 	)
 
+@_deprecated('read_store')
 def readTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 					lastLineOnly=False, verifyHeader=True, verbose=False, taskDic=None,
 					encoding='utf8', strict=True, delimiter=..., defaults=...,
@@ -1902,11 +2731,13 @@ def readTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 		MutableMapping | list | int: Live store, last row, or last offset.
 
 	Examples:
-		>>> import os, tempfile
+		>>> import os, tempfile, warnings
 		>>> fd, path = tempfile.mkstemp(suffix='.tsv'); os.close(fd)
 		>>> open(path, 'w').write('a\\t1\\n')
 		4
-		>>> dict(readTabularFile(path, header=['id', 'v', 'extra'], strict=False))
+		>>> with warnings.catch_warnings():
+		...     _ = warnings.simplefilter('ignore', DeprecationWarning)
+		...     dict(readTabularFile(path, header=['id', 'v', 'extra'], strict=False))
 		{'a': ['a', '1', '']}
 		>>> os.unlink(path)
 	"""
@@ -1917,13 +2748,24 @@ def readTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 	cols = correctColumnNum
 	if (cols is None or cols < 0) and header_cols:
 		cols = len(header_cols)
+	defs = defaults if defaults is not ... else None
 	try:
-		result = read_store(
-			fileName, create=createIfNotExist, encoding=encoding, delimiter=d,
-			defaults=defaults if defaults is not ... else None,
-			store=store, store_offset=storeOffset, last_record_only=lastLineOnly,
-			header=header_cols or None,
-		)
+		if lastLineOnly:
+			ensure_part_exists(fileName, create=createIfNotExist, encoding=encoding,
+							   delimiter=d, header=header_cols or None,
+							   defaults=_normalize_defaults(defs))
+			result = read_last_record(fileName, encoding=encoding, delimiter=d,
+									  store_offset=storeOffset)
+		elif storeOffset:
+			result, _values, _state = read_offsets(
+				fileName, create=createIfNotExist, encoding=encoding, delimiter=d,
+				defaults=defs, store=store, header=header_cols or None,
+			)
+		else:
+			result = read_store(
+				fileName, create=createIfNotExist, encoding=encoding, delimiter=d,
+				defaults=defs, store=store, header=header_cols or None,
+			)
 	except FileNotFoundError:
 		if strict and not createIfNotExist:
 			raise
@@ -1933,8 +2775,11 @@ def readTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 			return _fit_row(result, cols)
 		return result
 	if cols and cols > 0 and not storeOffset:
+		# Assign through the base mapping: a live store's __setitem__ would
+		# turn this read into a burst of WAL appends.
+		setter = OrderedDict.__setitem__ if isinstance(result, OrderedDict) else type(result).__setitem__
 		for key in list(result.keys()):
-			result[key] = _fit_row(result[key], cols)
+			setter(result, key, _fit_row(result[key], cols))
 	elif cols and cols > 0 and storeOffset and hasattr(result, '_values_cache'):
 		for key, row in list(result._values_cache.items()):
 			result._values_cache[key] = _fit_row(row, cols)
@@ -1947,6 +2792,7 @@ def readTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 		pass
 	return result
 
+@_deprecated('append_records')
 def appendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header='',
 						   createIfNotExist=False, verifyHeader=True, verbose=False,
 						   encoding='utf8', strict=True, delimiter=...):
@@ -1974,6 +2820,7 @@ def appendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header='',
 		delimiter=d, header=header or None,
 	)
 
+@_deprecated('append_record')
 def appendTabularFile(fileName, lineToAppend, teeLogger=None, header='',
 					  createIfNotExist=False, verifyHeader=True, verbose=False,
 					  encoding='utf8', strict=True, delimiter=...):
@@ -1996,12 +2843,14 @@ def appendTabularFile(fileName, lineToAppend, teeLogger=None, header='',
 	Returns:
 		None: The row is appended as a side effect.
 	"""
-	appendLinesTabularFile(
-		fileName, [lineToAppend], teeLogger=teeLogger, header=header,
-		createIfNotExist=createIfNotExist, verifyHeader=verifyHeader,
-		verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter,
+	_ = (teeLogger, verifyHeader, verbose, strict)
+	append_record(
+		fileName, lineToAppend, create=createIfNotExist, encoding=encoding,
+		delimiter=_legacy_delimiter(delimiter=delimiter, file_name=fileName),
+		header=header or None,
 	)
 
+@_deprecated('truncate_part')
 def clearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
 					 encoding='utf8', strict=False, delimiter=..., defaults=...):
 	"""Legacy truncate; creates the file with an optional ``#`` header comment.
@@ -2025,6 +2874,7 @@ def clearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, ve
 	defs = _normalize_defaults(defaults if defaults is not ... else None)
 	truncate_part(fileName, encoding=encoding, delimiter=d, header=header, defaults=defs)
 
+@_deprecated('snapshot_part')
 def scrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False,
 					 lastLineOnly=False, verifyHeader=True, verbose=False, taskDic=None,
 					 encoding='utf8', strict=False, delimiter=..., defaults=...,
@@ -2055,15 +2905,12 @@ def scrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False
 	_ = (teeLogger, createIfNotExist, lastLineOnly, verifyHeader, verbose, strict, correctColumnNum)
 	d = _legacy_delimiter(delimiter=delimiter, file_name=fileName)
 	if lastLineOnly:
-		return readTabularFile(
-			fileName, header=header, encoding=encoding, delimiter=d,
-			defaults=defaults, taskDic=taskDic, lastLineOnly=True,
-		)
+		return read_last_record(fileName, encoding=encoding, delimiter=d)
 	return snapshot_part(
 		fileName, encoding=encoding, delimiter=d, header=header or None, store=taskDic,
 	)
 
-def getListView(tsvzDic, header=None, delimiter=...):
+def _list_view(tsvzDic, header=None, delimiter=...):
 	"""Return store contents as a list of row lists.
 
 	When ``header`` is provided and does not already appear as the first row,
@@ -2078,14 +2925,14 @@ def getListView(tsvzDic, header=None, delimiter=...):
 		list: Rows as lists, optionally prefixed with ``header``.
 
 	Examples:
-		>>> getListView({'a': ['a', '1']}, header=['id', 'v'])
+		>>> _list_view({'a': ['a', '1']}, header=['id', 'v'])
 		[['id', 'v'], ['a', '1']]
-		>>> getListView({})
+		>>> _list_view({})
 		[]
 	"""
 	if header is None:
 		header = []
-	d = get_delimiter(delimiter=delimiter)
+	d = _legacy_delimiter(delimiter=delimiter)
 	if header:
 		if isinstance(header, str):
 			header = header.split(d)
@@ -2103,11 +2950,13 @@ def getListView(tsvzDic, header=None, delimiter=...):
 		return values
 	return [header] + values
 
+getListView = _deprecated('dict(store).values()')(_list_view)
 readTSV = readTabularFile
 appendTSV = appendTabularFile
 clearTSV = clearTabularFile
 scrubTSV = scrubTabularFile
 
+@_deprecated('WalStore')
 class TSVZed(WalStore):
 	"""Legacy wrapper around :class:`WalStore`.
 
@@ -2191,7 +3040,7 @@ class TSVZed(WalStore):
 		return self
 
 	def getListView(self):
-		return getListView(self, header=self.header, delimiter=self.delimiter)
+		return _list_view(self, header=self.header, delimiter=self.delimiter)
 
 	def load(self):
 		return self.reload()
@@ -2212,6 +3061,12 @@ class TSVZed(WalStore):
 	def hardMapToFile(self):
 		"""Compact the part via :func:`snapshot_part` and refresh memory state.
 
+		The drain and the rewrite both run under the store's write lock, so a
+		background flush cannot land rows in the part between the snapshot's
+		read and its atomic replace — which would otherwise leave data rows
+		ahead of the marker preamble, resolved under the wrong forward-only
+		marker state (§12.1, §19.2).
+
 		Returns:
 			bool: True on success, or False if a rewrite is already in
 			progress.
@@ -2221,18 +3076,18 @@ class TSVZed(WalStore):
 		self._rewriting = True
 		try:
 			WalStore.flush(self)
-			data = snapshot_part(
-				self.path, encoding=self.encoding, delimiter=self.delimiter,
-				header=self.header or None,
-			)
-			self._last_rewrite = time.monotonic()
-			prev = self._pending
-			self._pending = deque()
-			super(WalStore, self).clear()
-			if data:
-				self.update(data)
+			with self._lock:
+				data = snapshot_part(
+					self.path, encoding=self.encoding, delimiter=self.delimiter,
+					header=self.header or None,
+				)
+				self._last_rewrite = time.monotonic()
+				# Repopulate through OrderedDict so the refresh is not itself
+				# re-queued as a fresh batch of appends.
+				super(WalStore, self).clear()
+				for key, row in data.items():
+					OrderedDict.__setitem__(self, key, row)
 				self._reader_state = getattr(data, '_reader_state', self._reader_state)
-			self._pending = prev
 			return True
 		finally:
 			self._rewriting = False
@@ -2263,6 +3118,7 @@ class TSVZed(WalStore):
 		return WalStore.close(self)
 
 
+@_deprecated('OffsetStore')
 class TSVZedLite(OffsetStore):
 	"""Legacy wrapper around :class:`OffsetStore`.
 
@@ -2304,7 +3160,10 @@ class TSVZedLite(OffsetStore):
 			self._file = fileObj
 
 	def getListView(self):
-		return getListView(self._values, header=self.header, delimiter=self.delimiter)
+		# Build from the index, not the LRU cache: the cache is bounded and
+		# holds only recently touched rows.
+		rows = OrderedDict((key, self[key]) for key in self._offsets)
+		return _list_view(rows, header=self.header, delimiter=self.delimiter)
 
 	def clear_file(self):
 		return self.clear()
@@ -2320,6 +3179,10 @@ class TSVZedLite(OffsetStore):
 		Returns:
 			TSVZedLite: ``self``, after switching.
 		"""
+		if is_compressed_path(newFileName):
+			raise ValueError(
+				f'OffsetStore cannot index a compressed part ({newFileName!r}).')
+		self.flush()
 		self._file.close()
 		self.path = newFileName
 		self._fileName = newFileName
@@ -2327,8 +3190,10 @@ class TSVZedLite(OffsetStore):
 			self.create = createIfNotExist
 		if verifyHeader is not ...:
 			self.verifyHeader = verifyHeader
-		self.reload()
+		ensure_part_exists(self.path, create=self.create, encoding=self.encoding,
+						   delimiter=self.delimiter, header=self.header)
 		self._file = open(self.path, 'r+b')  # noqa: SIM115
+		self.reload()
 		return self
 
 
@@ -2361,18 +3226,20 @@ def _cli_pretty_format_table(data, delimiter='\t'):
 	"""
 	try:
 		import multiCMD
+	except ImportError:
+		pass  # standalone install: fall through to the built-in formatter
+	else:
 		return multiCMD.pretty_format_table(data, delimiter=delimiter)
-	except Exception:
-		rows = list(data) if not isinstance(data, list) else data
-		if not rows:
-			return ''
-		lines = []
-		for row in rows:
-			if isinstance(row, (list, tuple)):
-				lines.append(delimiter.join(str(c) for c in row))
-			else:
-				lines.append(str(row))
-		return '\n'.join(lines) + '\n'
+	rows = list(data) if not isinstance(data, list) else data
+	if not rows:
+		return ''
+	lines = []
+	for row in rows:
+		if isinstance(row, (list, tuple)):
+			lines.append(delimiter.join(str(c) for c in row))
+		else:
+			lines.append(str(row))
+	return '\n'.join(lines) + '\n'
 
 
 def __main__():
@@ -2382,7 +3249,8 @@ def __main__():
 	``scrub`` (snapshot/compact).
 
 	Returns:
-		None: Executes the selected CLI operation.
+		int: Process exit status — ``0`` on success, ``1`` when ``--strict``
+		and the part is missing, ``2`` for a usage error.
 	"""
 	import argparse
 	parser = argparse.ArgumentParser(description='TSVZ: append-only tabular key–value store (tsvz-spec-v1)')
@@ -2403,10 +3271,13 @@ def __main__():
 	parser.add_argument('-c', '--header', type=str, help='Header columns separated by --delimiter.')
 	parser.add_argument('--defaults', type=str, help='Default column values separated by --delimiter.')
 	strict_mode = parser.add_mutually_exclusive_group()
-	strict_mode.add_argument('-s', '--strict', dest='strict', action='store_true')
-	strict_mode.add_argument('-f', '--force', dest='strict', action='store_false')
-	parser.set_defaults(strict=True)
-	parser.add_argument('-v', '--verbose', action='store_true')
+	strict_mode.add_argument(
+		'-s', '--strict', dest='strict', action='store_true',
+		help='Fail with a non-zero exit status when the part does not exist.')
+	strict_mode.add_argument(
+		'-f', '--force', dest='strict', action='store_false',
+		help='Treat a missing part as empty instead of an error (default).')
+	parser.set_defaults(strict=False)
 	parser.add_argument('-V', '--version', action='version',
 						version=f'%(prog)s {version} @ {COMMIT_DATE} by {author}')
 	try:
@@ -2415,53 +3286,60 @@ def __main__():
 	except ImportError:
 		pass
 	args = parser.parse_args()
-	args.delimiter = get_delimiter(delimiter=args.delimiter, file_name=args.filename)
-	header = ''
-	if args.header:
+	args.delimiter = _legacy_delimiter(delimiter=args.delimiter, file_name=args.filename)
+
+	def _unescape(text):
+		"""Expand \\t / \\n style escapes in a CLI argument, ASCII only."""
+		if not text or not text.isascii():
+			return text
 		try:
-			header = args.header.encode().decode('unicode_escape')
-		except Exception:
-			header = args.header
-	defaults = []
-	if args.defaults:
-		try:
-			defaults = args.defaults.encode().decode('unicode_escape').split(args.delimiter)
-		except Exception:
-			defaults = args.defaults.split(args.delimiter)
+			return text.encode().decode('unicode_escape')
+		except UnicodeError:
+			return text
+
+	header = _unescape(args.header) if args.header else ''
+	defaults = _unescape(args.defaults).split(args.delimiter) if args.defaults else []
+	# Field values get the same treatment as --header/--defaults, so
+	# `tsvz f.tsvz append k 'a\tb'` means the same thing everywhere.
+	args.line = [_unescape(field) for field in args.line]
 
 	if args.operation == 'read':
-		if not os.path.isfile(args.filename):
-			print(f'File not found: {args.filename}')
-			return
-		data = readTabularFile(
-			args.filename, verifyHeader=False, verbose=args.verbose,
-			strict=args.strict, delimiter=args.delimiter, defaults=defaults,
-		)
+		try:
+			data = read_store(
+				args.filename, delimiter=args.delimiter, defaults=defaults or None,
+			)
+		except FileNotFoundError:
+			if args.strict:
+				print(f'tsvz: no such part: {args.filename}', file=sys.stderr)
+				return 1
+			return 0
 		formatted = _cli_pretty_format_table(data.values(), delimiter=args.delimiter)
 		print(formatted, end='' if formatted.endswith('\n') else '\n')
 	elif args.operation == 'append':
-		appendTabularFile(
-			args.filename, args.line, createIfNotExist=True, header=header,
-			verbose=args.verbose, strict=args.strict, delimiter=args.delimiter,
+		append_record(
+			args.filename, args.line, create=True, header=header or None,
+			delimiter=args.delimiter,
 		)
 	elif args.operation == 'delete':
+		if not args.line:
+			print('delete needs a key', file=sys.stderr)
+			return 2
 		# Spec §9: tombstone = lone key (no value fields).
-		appendTabularFile(
-			args.filename, args.line[:1], createIfNotExist=True, header=header,
-			verbose=args.verbose, strict=args.strict, delimiter=args.delimiter,
+		append_record(
+			args.filename, args.line[:1], create=True, header=header or None,
+			delimiter=args.delimiter,
 		)
 	elif args.operation == 'clear':
-		clearTabularFile(
-			args.filename, header=header, verbose=args.verbose,
-			verifyHeader=args.strict, delimiter=args.delimiter,
+		truncate_part(
+			args.filename, delimiter=args.delimiter, header=header or None,
+			defaults=defaults or None,
 		)
 	elif args.operation == 'scrub':
-		scrubTabularFile(
-			args.filename, verifyHeader=False, verbose=args.verbose,
-			strict=args.strict, delimiter=args.delimiter, defaults=defaults,
-		)
+		snapshot_part(args.filename, delimiter=args.delimiter, header=header or None)
 	else:
 		print('Invalid operation', file=sys.stderr)
+		return 2
+	return 0
 
 
 if __name__ == '__main__':
@@ -2470,4 +3348,4 @@ if __name__ == '__main__':
 		import doctest
 		failures, _ = doctest.testmod(optionflags=doctest.ELLIPSIS)
 		sys.exit(1 if failures else 0)
-	__main__()
+	sys.exit(__main__())
