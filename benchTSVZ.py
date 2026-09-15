@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput benchmark for the spec TSVZ engine (TSVZ_new)."""
+"""Throughput benchmark for the spec TSVZ engine."""
 import argparse
 import os
 import random
@@ -7,7 +7,7 @@ import re
 import shutil
 import time
 
-import TSVZ_new as TSVZ
+import TSVZ
 
 RESOURCE_LIB_AVAILABLE = True
 try:

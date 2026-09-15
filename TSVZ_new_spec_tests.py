@@ -1,16 +1,19 @@
-"""Tests for TSVZ_new.py (tsvz-spec-v1.md core conformance)."""
+"""Tests for TSVZ.py (tsvz-spec-v1 core conformance)."""
 import gzip
 import hashlib
+import io
 import os
+import shutil
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import warnings
 from collections import OrderedDict
 
-import TSVZ_new as TSVZ
+import TSVZ
 
 
 class TempFile:
@@ -331,6 +334,18 @@ class TestWalStore(unittest.TestCase):
 			self.assertIn('<#>scratch', raw)
 			self.assertEqual(TSVZ.read_store(path)['#scratch'], ['#scratch', 'tmp'])
 
+	def test_lookup_honors_strip_false_on_trailing_space_key(self):
+		# §10: with stripping off, 'foo ' and 'foo' are distinct keys.
+		content = '#_strip_trailing_whites_#\tfalse\nfoo \tbar\n'
+		with TempFile(suffix='.tsvz', content=content) as path:
+			db = TSVZ.WalStore(path, create=False, flush_interval=1000)
+			try:
+				self.assertIn('foo ', db)
+				self.assertNotIn('foo', db)
+				self.assertEqual(db['foo '], ['foo ', 'bar'])
+			finally:
+				db.close()
+
 	def test_missing_key_defaults(self):
 		with TempFile(suffix='.tsvz') as path:
 			TSVZ.truncate_part(path, defaults=['guest', '0'])
@@ -382,6 +397,46 @@ class TestOffsetStore(unittest.TestCase):
 			s.close()
 			self.assertIn('<#>note', read_text(path))
 			self.assertEqual(TSVZ.read_store(path)['#note'], ['#note', 'x'])
+
+	def test_lookup_honors_strip_false_on_trailing_space_key(self):
+		content = '#_strip_trailing_whites_#\tfalse\nfoo \tbar\n'
+		with TempFile(suffix='.tsvz', content=content) as path:
+			s = TSVZ.OffsetStore(path, create=False, cache_size=0)
+			try:
+				self.assertIn('foo ', s)
+				self.assertNotIn('foo', s)
+				self.assertEqual(s['foo '], ['foo ', 'bar'])
+				key = next(iter(s))
+				self.assertEqual(s[key], ['foo ', 'bar'])
+			finally:
+				s.close()
+
+	def test_forward_only_binding_of_defaults(self):
+		# §12.4.4 / §14.4: OffsetStore must resolve a row under the markers
+		# in force at that row's offset, not the end-of-file ReaderState.
+		content = '#_defaults_#\tA1\tA2\nk\tv\n#_defaults_#\tB1\tB2\tB3\n'
+		with TempFile(suffix='.tsvz', content=content) as path:
+			want = TSVZ.read_store(path)['k']
+			self.assertEqual(want, ['k', 'v', 'A2'])
+			s = TSVZ.OffsetStore(path, create=False, cache_size=0)
+			try:
+				self.assertEqual(s['k'], want)
+			finally:
+				s.close()
+
+	def test_forward_only_binding_of_fill_empty(self):
+		content = (
+			'#_defaults_#\tD1\n#_fill_empty_with_default_#\ttrue\n'
+			'k\t\tz\n#_fill_empty_with_default_#\tfalse\n'
+		)
+		with TempFile(suffix='.tsvz', content=content) as path:
+			want = TSVZ.read_store(path)['k']
+			self.assertEqual(want, ['k', 'D1', 'z'])
+			s = TSVZ.OffsetStore(path, create=False, cache_size=0)
+			try:
+				self.assertEqual(s['k'], want)
+			finally:
+				s.close()
 
 
 class TestWriterHelpers(unittest.TestCase):
@@ -534,6 +589,30 @@ class TestCompressionSuffixes(unittest.TestCase):
 				self.assertIn('#_version_#', f.read())
 			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '2']})
 
+	def test_atomic_rewrite_fsyncs_complete_gzip(self):
+		# fsync must happen after the codec footer is written, otherwise a
+		# crash can leave a truncated gzip that gzip.open rejects.
+		import stat as _stat
+		with TempFile(suffix='.tsvz.gz') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			sizes = []
+			real = os.fsync
+
+			def spy(fd):
+				info = os.fstat(fd)
+				if _stat.S_ISREG(info.st_mode):
+					sizes.append(info.st_size)
+				return real(fd)
+
+			os.fsync = spy
+			try:
+				TSVZ.snapshot_part(path)
+			finally:
+				os.fsync = real
+			self.assertTrue(sizes, 'snapshot never fsynced the temp part')
+			self.assertEqual(sizes[-1], os.path.getsize(path))
+
 
 class TestWalStoreDurability(unittest.TestCase):
 	def _store(self, path, **kw):
@@ -592,6 +671,43 @@ class TestWalStoreDurability(unittest.TestCase):
 				self.assertFalse(db._lock.locked())  # lock released on failure
 			finally:
 				db.path = path
+				db.close()
+
+	def test_clear_does_not_resurrect_an_in_flight_flush(self):
+		# Drain must hold _lock through the write; otherwise clear() truncates
+		# and the popped batch is appended afterwards.
+		with TempFile(suffix='.tsvz') as path:
+			db = self._store(path, flush_interval=1000)
+			entered = threading.Event()
+			release = threading.Event()
+			real_open = db._open_locked
+			try:
+				db['gone'] = ['gone', '2']
+
+				def delayed(mode, **kw):
+					entered.set()
+					if not release.wait(3.0):
+						raise RuntimeError('test gate timed out')
+					return real_open(mode, **kw)
+
+				db._open_locked = delayed
+				flusher = threading.Thread(target=db.flush)
+				clearer = threading.Thread(target=db.clear)
+				flusher.start()
+				self.assertTrue(entered.wait(3.0), 'flush never reached the write')
+				clearer.start()
+				# If drain is outside the lock, clear runs now and the write
+				# that follows resurrected the row. If drain holds the lock,
+				# clear blocks until the write finishes, then truncates it.
+				time.sleep(0.05)
+				release.set()
+				flusher.join(timeout=5)
+				clearer.join(timeout=5)
+				self.assertEqual(dict(db), {})
+				self.assertEqual(dict(TSVZ.read_store(path)), {})
+			finally:
+				release.set()
+				db._open_locked = real_open
 				db.close()
 
 	def test_close_does_not_wait_a_whole_interval(self):
@@ -770,8 +886,9 @@ class TestDeprecations(unittest.TestCase):
 				(TSVZ.get_delimiter, (), {'file_name': path}),
 			]
 			for fn, args, kw in cases:
-				with self.subTest(fn=fn.__name__), self.assertWarns(DeprecationWarning):
+				with self.subTest(fn=fn.__name__), self.assertWarns(DeprecationWarning) as ctx:
 					fn(*args, **kw)
+				self.assertIn('TSVZ_old', str(ctx.warning))
 
 	def test_legacy_classes_warn(self):
 		with TempFile(suffix='.tsvz') as path:
@@ -902,11 +1019,24 @@ class TestPublicSurface(unittest.TestCase):
 
 	def test_star_import_leaks_no_stdlib(self):
 		ns = {}
-		exec('from TSVZ_new import *', ns)  # noqa: S102
+		exec('from TSVZ import *', ns)  # noqa: S102
 		leaked = [n for n in ('os', 'sys', 're', 'time', 'threading', 'atexit',
 							  'contextlib', 'functools', 'warnings', 'deque',
 							  'OrderedDict', 'MutableMapping') if n in ns]
 		self.assertEqual(leaked, [])
+
+
+class TestTsvzNewShim(unittest.TestCase):
+	def test_preview_import_warns_and_reexports(self):
+		sys.modules.pop('TSVZ_new', None)
+		with self.assertWarns(DeprecationWarning) as ctx:
+			import TSVZ_new  # noqa: PLC0415
+		try:
+			self.assertIn('import TSVZ', str(ctx.warning))
+			self.assertIn('TSVZ_old', str(ctx.warning))
+			self.assertIs(TSVZ_new.WalStore, TSVZ.WalStore)
+		finally:
+			sys.modules.pop('TSVZ_new', None)
 
 
 class TestFlusherIsEventDriven(unittest.TestCase):
@@ -1037,6 +1167,34 @@ class TestWriteAck(unittest.TestCase):
 		with TempFile(suffix='.tsvz', content='#_write_ack_#\tdisk\nk\tv\n') as path:
 			TSVZ.snapshot_part(path)
 			self.assertIn('#_write_ack_#\tdisk', read_text(path))
+
+	def test_snapshot_reemits_non_default_rotate(self):
+		st = TSVZ.ReaderState()
+		st.rotate = TSVZ.ROTATE_RENAME
+		lines = TSVZ.build_snapshot_preamble(st, '\t')
+		self.assertIn('#_rotate_#\trename', lines)
+		self.assertNotIn('#_rotate_#\tkeep', lines)
+		st.defaults = ['x']
+		self.assertTrue(TSVZ.build_snapshot_preamble(st, '\t')[-1].startswith('#_defaults_#'))
+
+	def test_disk_ack_propagates_fsync_failure(self):
+		with TempFile(suffix='.tsvz') as path:
+			db = TSVZ.WalStore(path, create=True, flush_interval=1000, write_ack='disk')
+			real = os.fsync
+
+			def boom(_fd):
+				raise OSError(28, 'No space left on device')
+
+			try:
+				db['k'] = ['k', 'v']
+				os.fsync = boom
+				with self.assertRaises(OSError):
+					db.flush()
+				self.assertEqual(len(db._pending), 1)
+				self.assertFalse(db._lock.locked())
+			finally:
+				os.fsync = real
+				db.close()
 
 
 class TestRecordIterator(unittest.TestCase):
@@ -1303,7 +1461,7 @@ class TestAtomicRewriteConcurrency(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-	MOD = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'TSVZ_new.py')
+	MOD = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'TSVZ.py')
 
 	def run_cli(self, *args):
 		import subprocess
@@ -1343,10 +1501,69 @@ class TestCli(unittest.TestCase):
 		r = self.run_cli('--help')
 		self.assertNotIn('--verbose', r.stdout)
 
+	def test_help_lists_breaking_changes(self):
+		r = self.run_cli('--help')
+		self.assertIn('TSVZ_old', r.stdout)
+		self.assertIn('not compatible with TSVZ 3.x', r.stdout)
+		self.assertIn('tombstone', r.stdout.lower())
+
 	def test_field_escapes_are_expanded(self):
 		with TempFile(suffix='.tsvz') as path:
 			self.run_cli(path, 'append', 'k', 'a\\tb')
 			self.assertEqual(TSVZ.read_store(path)['k'], ['k', 'a\tb'])
+
+	def _numbered_store(self):
+		d = tempfile.mkdtemp()
+		base = os.path.join(d, 'st.tsvz')
+		ords = sorted(TSVZ.new_ordinal() for _ in range(2))
+		TSVZ.append_records(TSVZ.part_path(base, ords[0]), [['a', '1']], create=True)
+		TSVZ.append_records(TSVZ.part_path(base, ords[1]), [['b', '2']], create=True)
+		return d, base, ords
+
+	def test_append_to_numbered_store_without_m(self):
+		import shutil
+		d, base, ords = self._numbered_store()
+		try:
+			r = self.run_cli(base, 'append', 'c', '3')
+			self.assertEqual(r.returncode, 0, r.stderr)
+			self.assertFalse(os.path.isfile(base), 'must not create a ghost unnumbered file')
+			self.assertEqual(dict(TSVZ.read_multipart(base))['c'], ['c', '3'])
+			self.assertIn('c\t3', read_text(TSVZ.part_path(base, ords[-1])))
+		finally:
+			shutil.rmtree(d, ignore_errors=True)
+
+	def test_read_numbered_store_without_m(self):
+		import shutil
+		d, base, _ords = self._numbered_store()
+		try:
+			out = self.run_cli(base, 'read').stdout
+			self.assertIn('1', out)
+			self.assertIn('2', out)
+		finally:
+			shutil.rmtree(d, ignore_errors=True)
+
+	def test_scrub_numbered_store_without_m(self):
+		import shutil
+		d, base, _ords = self._numbered_store()
+		try:
+			r = self.run_cli(base, 'scrub')
+			self.assertEqual(r.returncode, 0, r.stderr)
+			self.assertIn('subsumed', r.stdout)
+			self.assertEqual(sorted(TSVZ.read_multipart(base)), ['a', 'b'])
+		finally:
+			shutil.rmtree(d, ignore_errors=True)
+
+	def test_clear_numbered_store_tombstones_newest_part(self):
+		import shutil
+		d, base, ords = self._numbered_store()
+		try:
+			r = self.run_cli(base, 'clear')
+			self.assertEqual(r.returncode, 0, r.stderr)
+			self.assertFalse(os.path.isfile(base))
+			self.assertEqual(dict(TSVZ.read_multipart(base)), {})
+			self.assertTrue(os.path.isfile(TSVZ.part_path(base, ords[0])))
+		finally:
+			shutil.rmtree(d, ignore_errors=True)
 
 
 class TestFlusherSurvivesFailures(unittest.TestCase):
@@ -1783,6 +2000,14 @@ class TestSnapshotStore(unittest.TestCase):
 			f.write('#_rotate_#\trename\n')
 		self.assertEqual(TSVZ.snapshot_store(self.base).rotate_action, 'rename')
 
+	def test_part_path_argument_writes_into_the_store(self):
+		part = TSVZ.part_path(self.base, self.ords[0])
+		res = TSVZ.snapshot_store(part)
+		parsed = TSVZ.parse_part_name(res.path)
+		self.assertIsNotNone(parsed, res.path)
+		self.assertEqual(f'{parsed.store_path}.{parsed.format_ext}', self.base)
+		self.assertIn(res.path, TSVZ.store_part_paths(self.base))
+
 	def test_refuses_when_no_ordinal_fits(self):
 		tight = os.path.join(self.dir, 'tight.tsvz')
 		TSVZ.append_records(TSVZ.part_path(tight, 1), [['a', '1']], create=True)
@@ -1832,6 +2057,875 @@ class TestSnapshotStore(unittest.TestCase):
 		once = dict(TSVZ.read_multipart(self.base))
 		TSVZ.snapshot_store(self.base, quiesce=True)
 		self.assertEqual(dict(TSVZ.read_multipart(self.base)), once)
+
+
+class TestUtf8Bom(unittest.TestCase):
+	"""§4.1 — UTF-8 with no byte-order mark."""
+
+	def test_writer_does_not_emit_bom(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			with open(path, 'rb') as f:
+				self.assertFalse(f.read().startswith(b'\xef\xbb\xbf'))
+
+	def test_leading_bom_is_field_data_not_stripped(self):
+		# Files must not have a BOM; a leading U+FEFF is therefore a key char.
+		rows, _ = replay('\ufeffk\tv\n')
+		self.assertEqual(list(rows), ['\ufeffk'])
+		self.assertNotIn('k', rows)
+
+
+class TestVersionSwitching(unittest.TestCase):
+	"""§6.3–§6.4 — effective version is per-line and degrades gracefully."""
+
+	def test_empty_version_resets_to_one(self):
+		_, state = replay('#_version_#\t9\n#_version_#\n')
+		self.assertEqual(state.version, 1)
+
+	def test_blank_version_value_resets_to_one(self):
+		_, state = replay('#_version_#\t9\n#_version_#\t\n')
+		self.assertEqual(state.version, 1)
+
+	def test_invalid_version_resets_to_one(self):
+		_, state = replay('#_version_#\tnot-a-number\n')
+		self.assertEqual(state.version, 1)
+
+	def test_mid_file_switch_keeps_every_row(self):
+		# §6.4: 1 → 99 → 1; each row is read under the version in force there.
+		# This reader implements only v1, so 99 clamps (§6.3) and still yields data.
+		rows, state = replay(
+			'#_version_#\t1\na\t1\n#_version_#\t99\nb\t2\n#_version_#\t1\nc\t3\n')
+		self.assertEqual(dict(rows), {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']})
+		self.assertEqual(state.version, 1)
+
+	def test_unknown_token_under_clamped_future_version_passes_through(self):
+		# §6.4 + §13.4: a construct newer than the effective version is literal.
+		rows, _ = replay('#_version_#\t99\nk\t<future-token>\n')
+		self.assertEqual(rows['k'], ['k', '<future-token>'])
+
+
+class TestBoolSynonyms(unittest.TestCase):
+	"""Marker booleans accept the documented synonyms, not only true/false."""
+
+	def test_truthy_synonyms_enable_fill_empty(self):
+		for word in ('true', 'YES', 'on', '1'):
+			with self.subTest(word=word):
+				_, state = replay(f'#_fill_empty_with_default_#\t{word}\n')
+				self.assertTrue(state.fill_empty)
+
+	def test_falsy_synonyms_disable_strip(self):
+		for word in ('false', 'NO', 'off', '0'):
+			with self.subTest(word=word):
+				_, state = replay(f'#_strip_trailing_whites_#\t{word}\n')
+				self.assertFalse(state.strip_trailing)
+
+	def test_unrecognized_value_keeps_the_builtin_default(self):
+		_, state = replay('#_fill_empty_with_default_#\tmaybe\n')
+		self.assertFalse(state.fill_empty)
+
+
+class TestBz2AndZstd(unittest.TestCase):
+	"""§16 — bz2 round-trip; zstd refuses a plaintext fallback."""
+
+	def test_bz2_roundtrip(self):
+		with TempFile(suffix='.tsvz.bz2') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			self.assertEqual(dict(TSVZ.read_store(path)), {'k': ['k', 'v']})
+
+	def test_bzip2_suffix_roundtrip(self):
+		with TempFile(suffix='.tsvz.bzip2') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			self.assertEqual(dict(TSVZ.read_store(path)), {'k': ['k', 'v']})
+
+	def test_gzip_alias_suffix_roundtrip(self):
+		with TempFile(suffix='.tsvz.gzip') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			self.assertEqual(dict(TSVZ.read_store(path)), {'k': ['k', 'v']})
+
+	def test_zst_refuses_plaintext_when_stdlib_is_missing(self):
+		try:
+			from compression import zstd  # noqa: F401
+		except ImportError:
+			pass
+		else:
+			self.skipTest('compression.zstd is available; cannot probe the refusal')
+		with TempFile(suffix='.tsvz.zst') as path:
+			with self.assertRaises(ImportError) as cm:
+				TSVZ.open_part(path, 'wb')
+			self.assertIn('plaintext', str(cm.exception).lower())
+
+	def test_zst_does_not_use_third_party_zstandard(self):
+		try:
+			from compression import zstd  # noqa: F401
+		except ImportError:
+			pass
+		else:
+			self.skipTest('compression.zstd is available; third-party probe is dead code')
+		sys.modules['zstandard'] = types.ModuleType('zstandard')
+		try:
+			with TempFile(suffix='.tsvz.zst') as path:
+				with self.assertRaises(ImportError) as cm:
+					TSVZ.open_part(path, 'wb')
+				self.assertIn('not used', str(cm.exception).lower())
+		finally:
+			sys.modules.pop('zstandard', None)
+
+
+class TestStreamAppendCompressed(unittest.TestCase):
+	"""§16.4 — repeated appends to a compressed active part stay readable."""
+
+	def test_walstore_gz_flushes_remain_one_readable_store(self):
+		with TempFile(suffix='.tsvz.gz') as path:
+			os.unlink(path)
+			db = TSVZ.WalStore(path, create=True, flush_interval=600)
+			try:
+				db['a'] = ['a', '1']
+				db.flush()
+				db['b'] = ['b', '2']
+				db.flush()
+			finally:
+				db.close()
+			self.assertEqual(dict(TSVZ.read_store(path)),
+							 {'a': ['a', '1'], 'b': ['b', '2']})
+			with gzip.open(path, 'rt') as f:
+				text = f.read()
+			self.assertIn('a\t1', text)
+			self.assertIn('b\t2', text)
+
+	def test_open_close_per_write_gz_still_roundtrips(self):
+		# The spec prefers a held stream; open/close per write must not lose rows.
+		with TempFile(suffix='.tsvz.gz') as path:
+			os.unlink(path)
+			TSVZ.append_record(path, ['a', '1'], create=True)
+			TSVZ.append_record(path, ['b', '2'])
+			self.assertEqual(dict(TSVZ.read_store(path)),
+							 {'a': ['a', '1'], 'b': ['b', '2']})
+
+	def test_walstore_bz2_stream_append(self):
+		with TempFile(suffix='.tsvz.bz2') as path:
+			os.unlink(path)
+			db = TSVZ.WalStore(path, create=True, flush_interval=600)
+			try:
+				db['a'] = ['a', '1']
+				db.flush()
+				db['b'] = ['b', '2']
+				db.flush()
+			finally:
+				db.close()
+			self.assertEqual(dict(TSVZ.read_store(path)),
+							 {'a': ['a', '1'], 'b': ['b', '2']})
+
+
+class TestBlake3(unittest.TestCase):
+	"""§15 — blake3 is optional; missing it must not affect reconstructed data."""
+
+	def test_missing_module_makes_the_marker_inert(self):
+		injected = 'blake3' not in sys.modules
+		if TSVZ.new_digest('blake3') is not None:
+			self.skipTest('blake3 is installed; inert path is not taken')
+		self.assertIsNone(TSVZ.new_digest('blake3'))
+		body = b'#_checksum_blake3_#\na\t1\n#_checksum_blake3_#\tdeadbeef\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			d = TSVZ.verify_part(path)
+			self.assertEqual((d.armed, d.mismatches), (frozenset(), []))
+			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '1']})
+		_ = injected
+
+	def test_round_trip_when_an_accumulator_exists(self):
+		injected = False
+		if TSVZ.new_digest('blake3') is None:
+			class Acc:
+				def __init__(self):
+					self._b = b''
+
+				def update(self, data):
+					self._b += bytes(data)
+
+				def hexdigest(self):
+					return hashlib.sha256(self._b).hexdigest()
+
+			fake = types.ModuleType('blake3')
+			fake.blake3 = Acc
+			sys.modules['blake3'] = fake
+			injected = True
+		try:
+			self.assertIsNotNone(TSVZ.new_digest('blake3'))
+			with TempFile(suffix='.tsvz') as path:
+				TSVZ.append_records(path, [['a', '1']], create=True)
+				TSVZ.append_checksum(path, 'blake3')
+				TSVZ.append_records(path, [['b', '2']])
+				self.assertNotEqual(TSVZ.append_checksum(path, 'blake3'), '')
+				self.assertEqual(TSVZ.verify_part(path).verified, 1)
+				self.assertEqual(dict(TSVZ.read_store(path)),
+								 {'a': ['a', '1'], 'b': ['b', '2']})
+		finally:
+			if injected:
+				sys.modules.pop('blake3', None)
+
+
+class TestSnapshotHeaderComment(unittest.TestCase):
+	"""snapshot_part(header=) writes a # comment; live data must not change."""
+
+	def test_optional_header_is_a_comment_not_a_key(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			TSVZ.snapshot_part(path, header=['id', 'val'])
+			text = read_text(path)
+			self.assertIn('#id\tval', text.splitlines())
+			self.assertEqual(dict(TSVZ.read_store(path)), {'k': ['k', 'v']})
+			self.assertNotIn('id', TSVZ.read_store(path))
+
+
+class TestIntegrityPolicyAndRotate(unittest.TestCase):
+	def test_report_corruption_rejects_unknown_policy(self):
+		with self.assertRaises(ValueError):
+			TSVZ.report_corruption(TSVZ.DigestSet(), 'x', policy='nope')
+
+	def test_report_corruption_noop_when_clean(self):
+		self.assertEqual(TSVZ.report_corruption(None, 'x'), [])
+		self.assertEqual(TSVZ.report_corruption(TSVZ.DigestSet(), 'x'), [])
+
+	def test_rotate_parts_rejects_unknown_action(self):
+		with self.assertRaises(ValueError):
+			TSVZ.rotate_parts([], 'explode')
+
+	def test_rotate_rename_skips_already_rotated_parts(self):
+		d = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+		base = os.path.join(d, 'ev.tsvz')
+		live = TSVZ.part_path(base, 1)
+		rotated = TSVZ.part_path(base, 2, rotated=True)
+		TSVZ.append_records(live, [['a', '1']], create=True)
+		TSVZ.append_records(rotated, [['z', 'ghost']], create=True)
+		parts = TSVZ.store_parts(base, include_rotated=True)
+		action, changes = TSVZ.rotate_parts(parts, 'rename')
+		self.assertEqual(action, 'rename')
+		self.assertTrue(os.path.isfile(rotated), 'already-rotated part must stay put')
+		self.assertFalse(os.path.isfile(live))
+		self.assertTrue(any(new and new.endswith('.rotated') for _, new in changes))
+
+	def test_failed_atomic_rewrite_does_not_leave_a_temp(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			directory = os.path.dirname(os.path.abspath(path))
+			before = set(os.listdir(directory))
+			real = os.replace
+
+			def boom(*_a, **_k):
+				raise OSError('injected replace failure')
+
+			os.replace = boom
+			try:
+				with self.assertRaises(OSError):
+					TSVZ.snapshot_part(path)
+			finally:
+				os.replace = real
+			leftovers = [n for n in set(os.listdir(directory)) - before if '.tmp' in n]
+			self.assertEqual(leftovers, [])
+			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '1']})
+
+	def test_snapshot_store_missing_raises(self):
+		with self.assertRaises(FileNotFoundError):
+			TSVZ.snapshot_store(os.path.join(tempfile.gettempdir(),
+											 'no-such-tsvz-store-xyz.tsvz'))
+
+	def test_store_parts_missing_directory_is_empty(self):
+		self.assertEqual(TSVZ.store_parts('/no/such/tsvz-dir/x.tsvz'), [])
+
+	def test_unnumbered_file_beside_parts_is_ignored_with_a_warning(self):
+		d = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+		base = os.path.join(d, 'st.tsvz')
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
+		with open(base, 'w') as f:
+			f.write('ghost\t9\n')
+		with warnings.catch_warnings(record=True) as caught:
+			warnings.simplefilter('always', UserWarning)
+			paths = TSVZ.store_part_paths(base)
+			data = dict(TSVZ.read_multipart(base))
+		self.assertTrue(any('numbered parts' in str(w.message) for w in caught))
+		self.assertNotIn(base, paths)
+		self.assertEqual(data, {'a': ['a', '1']})
+
+	def test_replay_of_a_missing_part_is_empty(self):
+		store, state = TSVZ.replay_part(
+			os.path.join(tempfile.gettempdir(), 'no-such-tsvz-part.tsvz'), '\t')
+		self.assertEqual(len(store), 0)
+		self.assertEqual(state.version, 1)
+
+	def test_read_last_record_missing_file(self):
+		missing = os.path.join(tempfile.gettempdir(), 'no-such-tsvz-part.tsvz')
+		self.assertEqual(TSVZ.read_last_record(missing), [])
+		self.assertEqual(TSVZ.read_last_record(missing, store_offset=True), -1)
+
+
+class TestPopAndContext(unittest.TestCase):
+	def _open(self, path, cls):
+		if cls is TSVZ.WalStore:
+			return cls(path, create=True, flush_interval=600)
+		return cls(path, create=True)
+
+	def test_pop_persists_a_tombstone(self):
+		for cls in (TSVZ.WalStore, TSVZ.OffsetStore):
+			with self.subTest(cls=cls.__name__), TempFile(suffix='.tsvz') as path:
+				db = self._open(path, cls)
+				try:
+					db['a'] = ['a', '1']
+					db['b'] = ['b', '2']
+					self.assertEqual(db.pop('a'), ['a', '1'])
+					self.assertNotIn('a', db)
+					self.assertEqual(db.pop('missing', 'd'), 'd')
+					with self.assertRaises(KeyError):
+						db.pop('missing')
+				finally:
+					db.close()
+				self.assertEqual(dict(TSVZ.read_store(path)), {'b': ['b', '2']})
+
+	def test_popitem_last_and_first(self):
+		for cls in (TSVZ.WalStore, TSVZ.OffsetStore):
+			with self.subTest(cls=cls.__name__), TempFile(suffix='.tsvz') as path:
+				db = self._open(path, cls)
+				try:
+					db['a'] = ['a', '1']
+					db['b'] = ['b', '2']
+					key, row = db.popitem()
+					self.assertEqual((key, row), ('b', ['b', '2']))
+					key, row = db.popitem(last=False)
+					self.assertEqual((key, row), ('a', ['a', '1']))
+					with self.assertRaises(KeyError):
+						db.popitem()
+				finally:
+					db.close()
+				self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_walstore_context_manager_flushes(self):
+		with TempFile(suffix='.tsvz') as path:
+			with TSVZ.WalStore(path, create=True, flush_interval=600) as db:
+				db['k'] = ['k', 'v']
+			self.assertEqual(dict(TSVZ.read_store(path)), {'k': ['k', 'v']})
+
+	def test_empty_key_cannot_be_stored(self):
+		for cls in (TSVZ.WalStore, TSVZ.OffsetStore):
+			with self.subTest(cls=cls.__name__), TempFile(suffix='.tsvz') as path:
+				db = self._open(path, cls)
+				try:
+					with self.assertRaises(KeyError):
+						db[''] = ['', 'x']
+				finally:
+					db.close()
+
+	def test_lone_key_assignment_is_a_delete(self):
+		for cls in (TSVZ.WalStore, TSVZ.OffsetStore):
+			with self.subTest(cls=cls.__name__), TempFile(suffix='.tsvz') as path:
+				db = self._open(path, cls)
+				try:
+					db['k'] = ['k', 'v']
+					db['k'] = ['k']
+					self.assertNotIn('k', db)
+				finally:
+					db.close()
+				self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_defaults_mapping_key_updates_marker_state(self):
+		for cls in (TSVZ.WalStore, TSVZ.OffsetStore):
+			with self.subTest(cls=cls.__name__), TempFile(suffix='.tsvz') as path:
+				db = self._open(path, cls)
+				try:
+					db[TSVZ.MARKER_DEFAULTS] = [TSVZ.MARKER_DEFAULTS, 'NA']
+					self.assertEqual(db['missing'], ['missing', 'NA'])
+					del db[TSVZ.MARKER_DEFAULTS]
+					self.assertEqual(db.get('missing'), ['missing'])
+				finally:
+					db.close()
+
+
+class TestOffsetStoreExtras(unittest.TestCase):
+	def test_clear_keeps_header_and_defaults(self):
+		with TempFile(suffix='.tsvz') as path:
+			s = TSVZ.OffsetStore(path, header=['id', 'v'], defaults=['NA'], create=True)
+			try:
+				s['k'] = ['k', '1']
+				s.clear()
+				self.assertEqual(len(s), 0)
+			finally:
+				s.close()
+			text = read_text(path)
+			self.assertIn('#id\tv', text)
+			self.assertIn('#_defaults_#\tNA', text)
+			self.assertNotIn('k\t1', text)
+
+	def test_create_false_on_missing_file_is_empty(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			s = TSVZ.OffsetStore(path, create=False)
+			try:
+				self.assertEqual(len(s), 0)
+			finally:
+				s.close()
+
+	def test_crlf_row_is_readable_by_offset(self):
+		with TempFile(suffix='.tsvz', content=b'k\tv\r\n') as path:
+			s = TSVZ.OffsetStore(path, create=False)
+			try:
+				self.assertEqual(s['k'], ['k', 'v'])
+			finally:
+				s.close()
+
+	def test_flush_on_a_closed_store_is_a_noop(self):
+		with TempFile(suffix='.tsvz') as path:
+			s = TSVZ.OffsetStore(path, create=True)
+			s.close()
+			self.assertIs(s.flush(), s)
+
+	def test_walstore_create_false_missing_file_is_empty(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			db = TSVZ.WalStore(path, create=False, flush_interval=600)
+			try:
+				self.assertEqual(len(db), 0)
+			finally:
+				db.close()
+
+	def test_open_part_text_mode_roundtrips(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			with TSVZ.open_part(path, 'r') as f:
+				self.assertIn('k\tv', f.read())
+
+	def test_ensure_part_exists_writes_defaults_marker(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			self.assertTrue(TSVZ.ensure_part_exists(path, create=True, defaults=['NA']))
+			self.assertIn('#_defaults_#\tNA', read_text(path))
+
+
+class TestTsvzedHardMapAndSwitch(unittest.TestCase):
+	def test_hardmap_collapses_superseded_rows(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True, append_check_delay=600)
+			try:
+				db['a'] = ['a', '1']
+				db['a'] = ['a', '2']
+				db.flush()
+				self.assertTrue(db.hardMapToFile())
+				self.assertEqual(read_text(path).count('a\t'), 1)
+				self.assertIn('a\t2', read_text(path))
+				self.assertTrue(db.rewrite())
+			finally:
+				db.close()
+
+	def test_hardmap_returns_false_when_already_rewriting(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True, append_check_delay=600)
+			try:
+				db._rewriting = True
+				self.assertFalse(db.hardMapToFile())
+			finally:
+				db._rewriting = False
+				db.close()
+
+	def test_rewrite_on_load_compacts(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1'], ['a', '2']], create=True)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, rewrite_on_load=True, append_check_delay=600)
+			try:
+				self.assertEqual(db['a'], ['a', '2'])
+				self.assertEqual(read_text(path).count('a\t'), 1)
+			finally:
+				db.close()
+
+	def test_rewrite_on_exit_compacts(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True, rewrite_on_exit=True,
+								 append_check_delay=600)
+				db['a'] = ['a', '1']
+				db['a'] = ['a', '2']
+				db.flush()
+				db.close()
+			self.assertEqual(read_text(path).count('a\t'), 1)
+
+	def test_flush_honours_rewrite_interval(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True, rewrite_interval=0.001,
+								 append_check_delay=600)
+			try:
+				db['a'] = ['a', '1']
+				db['a'] = ['a', '2']
+				db._last_rewrite = 0
+				db.flush()
+				self.assertEqual(read_text(path).count('a\t'), 1)
+			finally:
+				db.close()
+
+	def test_legacy_aliases_still_work(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True, append_check_delay=600)
+			try:
+				db['k'] = ['k', 'v']
+				self.assertIs(db.commitAppendToFile(), db)
+				self.assertIs(db.load(), db)
+				self.assertIs(db.checkExternalChanges(), db)
+				self.assertEqual(db.getListView(), [['k', 'v']])
+				self.assertIs(db.clear_file(), db)
+			finally:
+				db.stopAppendThread()
+			self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_lite_switch_file(self):
+		with TempFile(suffix='.tsvz') as p1, TempFile(suffix='.tsvz') as p2:
+			TSVZ.append_records(p2, [['x', '9']], create=True)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				lite = TSVZ.TSVZedLite(p1, createIfNotExist=True)
+			try:
+				lite['a'] = ['a', '1']
+				lite.switchFile(p2)
+				self.assertEqual(lite['x'], ['x', '9'])
+				self.assertNotIn('a', lite)
+				with self.assertRaises(ValueError):
+					lite.switchFile(p2 + '.gz')
+			finally:
+				lite.close()
+
+	def test_lite_adopts_an_open_handle(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			fh = open(path, 'r+b')  # noqa: SIM115
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				lite = TSVZ.TSVZedLite(path, fileObj=fh)
+			try:
+				self.assertEqual(lite['k'], ['k', 'v'])
+			finally:
+				lite.close()
+
+
+class TestLegacyMore(unittest.TestCase):
+	def test_symbolic_delimiter_names(self):
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter='comma'), ',')
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter='tab'), '\t')
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter='pipe'), '|')
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter='null'), '\0')
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter=''), '\t')
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter=...), '\t')
+
+	def test_read_last_valid_line(self):
+		with TempFile(suffix='.tsvz', content='a\t1\nb\t2\n') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				self.assertEqual(
+					TSVZ.read_last_valid_line(path, {}, -1), ['b', '2'])
+
+	def test_read_tabular_missing_is_lenient_when_not_strict(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				self.assertEqual(dict(TSVZ.readTabularFile(path, strict=False)), {})
+				self.assertEqual(
+					TSVZ.readTabularFile(path, lastLineOnly=True, strict=False), [])
+
+	def test_read_tabular_last_line_pads_to_header_width(self):
+		with TempFile(suffix='.tsvz', content='k\tv\n') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				row = TSVZ.readTabularFile(
+					path, lastLineOnly=True, header=['id', 'v', 'extra'])
+			self.assertEqual(row, ['k', 'v', ''])
+
+	def test_read_tabular_store_offset(self):
+		with TempFile(suffix='.tsvz', content='k\tv\n') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				offsets = TSVZ.readTabularFile(path, storeOffset=True)
+			self.assertEqual(offsets['k'], 0)
+
+	def test_append_lines_tabular_file(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				TSVZ.appendLinesTabularFile(
+					path, [['a', '1'], ['b', '2']], createIfNotExist=True)
+			self.assertEqual(dict(TSVZ.read_store(path)),
+							 {'a': ['a', '1'], 'b': ['b', '2']})
+
+	def test_list_view_with_header_and_empty_store(self):
+		self.assertEqual(TSVZ._list_view({}, header=['id', 'v']), [['id', 'v']])
+		self.assertEqual(TSVZ._list_view({}), [])
+		self.assertEqual(
+			TSVZ._list_view({'a': ['a', '1']}, header=['id', 'v']),
+			[['id', 'v'], ['a', '1']])
+
+
+class TestCliInProcess(unittest.TestCase):
+	"""Drive __main__ in-process so coverage.py sees the CLI."""
+
+	def run_main(self, *argv):
+		buf_out, buf_err = io.StringIO(), io.StringIO()
+		old = sys.argv, sys.stdout, sys.stderr
+		sys.argv = ['TSVZ.py', *argv]
+		sys.stdout, sys.stderr = buf_out, buf_err
+		try:
+			code = TSVZ.__main__()
+		except SystemExit as exc:
+			code = exc.code if isinstance(exc.code, int) else 1
+		finally:
+			sys.argv, sys.stdout, sys.stderr = old
+		return code, buf_out.getvalue(), buf_err.getvalue()
+
+	def _numbered(self):
+		d = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+		base = os.path.join(d, 'st.tsvz')
+		ords = sorted(TSVZ.new_ordinal() for _ in range(2))
+		TSVZ.append_records(TSVZ.part_path(base, ords[0]), [['a', '1']], create=True)
+		TSVZ.append_records(TSVZ.part_path(base, ords[1]), [['b', '2']], create=True)
+		return base, ords
+
+	def test_version_flag(self):
+		code, out, _err = self.run_main('--version')
+		self.assertEqual(code, 0)
+		self.assertIn(TSVZ.version, out)
+		self.assertIn('TSVZ_old', out)
+
+	def test_round_trip_and_default_read(self):
+		with TempFile(suffix='.tsvz') as path:
+			self.assertEqual(self.run_main(path, 'append', 'k', 'v1', 'v2')[0], 0)
+			code, out, _err = self.run_main(path)
+			self.assertEqual(code, 0)
+			self.assertIn('v1', out)
+			self.assertEqual(self.run_main(path, 'delete', 'k')[0], 0)
+			self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_header_on_append_and_defaults_on_clear(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			code, _out, err = self.run_main(
+				path, 'append', '-c', 'id\\tval', 'k', 'v')
+			self.assertEqual(code, 0, err)
+			self.assertIn('#id\tval', read_text(path))
+			code, _out, err = self.run_main(path, 'clear', '--defaults', 'NA')
+			self.assertEqual(code, 0, err)
+			self.assertIn('#_defaults_#\tNA', read_text(path))
+
+	def test_checksum_append_and_verify(self):
+		with TempFile(suffix='.tsvz') as path:
+			self.assertEqual(self.run_main(path, 'append', 'a', '1')[0], 0)
+			self.assertEqual(self.run_main(path, 'append', '--checksum', 'crc32', 'b', '2')[0], 0)
+			code, out, err = self.run_main(path, 'verify')
+			self.assertEqual(code, 0, err)
+			self.assertIn('verified', out)
+
+	def test_verify_mismatch_exits_nonzero(self):
+		body = b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t00000000\n'
+		with TempFile(suffix='.tsvz', content=body) as path:
+			code, _out, err = self.run_main(path, 'verify')
+			self.assertEqual(code, 1)
+			self.assertIn('mismatch', err)
+
+	def test_verify_missing_part_reports_zero_segments(self):
+		# Unnumbered missing path: replay is empty, so verify is a no-op success.
+		code, out, _err = self.run_main(
+			os.path.join(tempfile.gettempdir(), 'no-such-tsvz-cli.tsvz'), 'verify')
+		self.assertEqual(code, 0)
+		self.assertIn('0 segment', out)
+
+	def test_verify_missing_multipart_store_exits_nonzero(self):
+		code, _out, err = self.run_main(
+			os.path.join(tempfile.gettempdir(), 'no-such-tsvz-cli.tsvz'),
+			'verify', '-m')
+		self.assertEqual(code, 1)
+		self.assertIn('no such store', err)
+
+	def test_clear_and_scrub(self):
+		with TempFile(suffix='.tsvz') as path:
+			self.run_main(path, 'append', 'a', '1')
+			self.run_main(path, 'append', 'a', '2')
+			self.assertEqual(self.run_main(path, 'scrub')[0], 0)
+			self.assertEqual(read_text(path).count('a\t'), 1)
+			self.assertEqual(self.run_main(path, 'clear')[0], 0)
+			self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_force_missing_read(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			code, _out, _err = self.run_main(path, 'read', '--force')
+			self.assertEqual(code, 0)
+
+	def test_non_ascii_field_is_not_unescaped(self):
+		with TempFile(suffix='.tsvz') as path:
+			self.assertEqual(self.run_main(path, 'append', 'k', 'café')[0], 0)
+			self.assertEqual(TSVZ.read_store(path)['k'], ['k', 'café'])
+
+	def test_parts_lists_rotated(self):
+		base, ords = self._numbered()
+		TSVZ.append_records(TSVZ.part_path(base, ords[0], rotated=True),
+							[['z', 'ghost']], create=True)
+		code, out, err = self.run_main(base, 'parts')
+		self.assertEqual(code, 0, err)
+		self.assertIn(ords[0], out)
+		self.assertIn('rotated', out)
+
+	def test_multipart_verify_and_explicit_m(self):
+		base, _ords = self._numbered()
+		code, out, err = self.run_main(base, 'verify', '-m')
+		self.assertEqual(code, 0, err)
+		self.assertIn('store', out)
+
+	def test_multipart_scrub_and_delete(self):
+		base, ords = self._numbered()
+		code, out, err = self.run_main(base, 'scrub')
+		self.assertEqual(code, 0, err)
+		self.assertIn('subsumed', out)
+		code, _out, err = self.run_main(base, 'delete', 'a')
+		self.assertEqual(code, 0, err)
+		self.assertNotIn('a', TSVZ.read_multipart(base))
+		self.assertTrue(os.path.isfile(TSVZ.part_path(base, ords[-1])))
+
+	def test_multipart_scrub_with_no_prefix_is_quiet(self):
+		d = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+		base = os.path.join(d, 'one.tsvz')
+		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
+		code, _out, err = self.run_main(base, 'scrub')
+		self.assertEqual(code, 0)
+		self.assertIn('nothing to compact', err)
+
+	def test_csv_delimiter_flag(self):
+		with TempFile(suffix='.csvz') as path:
+			code, _out, err = self.run_main(path, 'append', '-d', 'comma', 'k', 'a,b')
+			self.assertEqual(code, 0, err)
+			self.assertEqual(TSVZ.read_store(path)['k'], ['k', 'a,b'])
+
+	def test_strict_missing_read_in_process(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			code, _out, err = self.run_main(path, 'read', '--strict')
+			self.assertEqual(code, 1)
+			self.assertIn('no such part', err)
+
+	def test_pretty_table_empty_and_scalars(self):
+		self.assertEqual(TSVZ._cli_pretty_format_table([]), '')
+		self.assertEqual(TSVZ._cli_pretty_format_table(['solo']), 'solo\n')
+
+
+class TestMorePublicEdges(unittest.TestCase):
+	def test_store_parts_normalizes_a_part_path(self):
+		d = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+		base = os.path.join(d, 'ev.tsvz')
+		p0 = TSVZ.part_path(base, 1)
+		p1 = TSVZ.part_path(base, 2)
+		TSVZ.append_records(p0, [['a', '1']], create=True)
+		TSVZ.append_records(p1, [['b', '2']], create=True)
+		self.assertEqual([pn.path for pn in TSVZ.store_parts(p0)], [p0, p1])
+
+	def test_snapshot_part_fills_a_caller_store(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1'], ['a', '2']], create=True)
+			plain = {}
+			out = TSVZ.snapshot_part(path, store=plain)
+			self.assertIs(out, plain)
+			self.assertEqual(plain, {'a': ['a', '2']})
+
+	def test_append_records_from_a_mapping_and_skips_empty(self):
+		with TempFile(suffix='.tsvz') as path:
+			os.unlink(path)
+			TSVZ.append_records(path, {'k': ['v'], 'u': ['u', '2']}, create=True)
+			TSVZ.append_records(path, [[], ['z', '9']])
+			self.assertEqual(dict(TSVZ.read_store(path)),
+							 {'k': ['k', 'v'], 'u': ['u', '2'], 'z': ['z', '9']})
+
+	def test_read_store_store_offset_builds_an_index(self):
+		with TempFile(suffix='.tsvz', content='k\tv\n') as path:
+			with self.assertWarns(DeprecationWarning):
+				idx = TSVZ.read_store(path, store_offset=True)
+			self.assertEqual(idx['k'], 0)
+
+	def test_tombstone_drops_the_offset_cache_entry(self):
+		with TempFile(suffix='.tsvz', content='a\t1\na\n') as path:
+			offsets, values, _state = TSVZ.read_offsets(path)
+			self.assertNotIn('a', offsets)
+			self.assertNotIn('a', values)
+
+	def test_last_flush_error_starts_clear(self):
+		with TempFile(suffix='.tsvz') as path:
+			db = TSVZ.WalStore(path, create=True, flush_interval=600)
+			try:
+				self.assertIsNone(db.last_flush_error)
+			finally:
+				db.close()
+
+	def test_fit_row_truncates_and_leaves_non_lists(self):
+		with TempFile(suffix='.tsvz', content='k\ta\tb\tc\n') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				row = TSVZ.readTabularFile(path, lastLineOnly=True, correctColumnNum=2)
+				wide = TSVZ.readTabularFile(
+					path, storeOffset=True, header=['id', 'v', 'extra'])
+		self.assertEqual(row, ['k', 'a'])
+		self.assertEqual(wide._values_cache['k'], ['k', 'a', 'b'])
+
+	def test_list_view_header_shapes(self):
+		self.assertEqual(
+			TSVZ._list_view({'a': ['id', 'v']}, header=['id', 'v']),
+			[['id', 'v']])
+		self.assertEqual(
+			TSVZ._list_view({'a': ['a', '1']}, header=('id', 'v')),
+			[['id', 'v'], ['a', '1']])
+		self.assertEqual(TSVZ._list_view({'a': ['a']}, header=1), [['a']])
+
+	def test_legacy_delimiter_incomplete_escape_stays_literal(self):
+		self.assertEqual(TSVZ._legacy_delimiter(delimiter='\\x'), '\\x')
+
+	def test_lite_indexes_override_and_listview(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['k', 'v']], create=True)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				lite = TSVZ.TSVZedLite(path, indexes={})
+			try:
+				self.assertEqual(len(lite), 0)
+				self.assertEqual(lite.getListView(), [])
+				self.assertIs(lite.clear_file(), lite)
+			finally:
+				lite.close()
+
+	def test_lite_switch_file_overrides_create_flag(self):
+		with TempFile(suffix='.tsvz') as p1, TempFile(suffix='.tsvz') as p2:
+			os.unlink(p2)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				lite = TSVZ.TSVZedLite(p1, createIfNotExist=True)
+			try:
+				lite.switchFile(p2, createIfNotExist=True, verifyHeader=False)
+				self.assertFalse(lite.verifyHeader)
+				self.assertTrue(os.path.isfile(p2))
+			finally:
+				lite.close()
+
+	def test_scrub_tabular_last_line_only(self):
+		with TempFile(suffix='.tsvz', content='a\t1\nb\t2\n') as path:
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				self.assertEqual(TSVZ.scrubTabularFile(path, lastLineOnly=True),
+								 ['b', '2'])
 
 
 if __name__ == '__main__':

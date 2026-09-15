@@ -5,25 +5,55 @@ values file as a key-value store**. The first column of every row is a unique
 key; the file behaves like an ordered dictionary that is transparently
 persisted to disk.
 
-For the strict `.tsvz` WAL format, see **[tsvz-spec-v1.md](tsvz-spec-v1.md)**.
+**Version 4.0** is the [tsvz-spec-v1.md](tsvz-spec-v1.md) reference
+implementation. It requires **Python 3.8+** and is **not a drop-in replacement
+for 3.x**. The frozen 3.39 API remains as `TSVZ_old` (that module still runs on
+3.6).
 
-Two front-ends are provided:
+Preferred 4.0 front-ends:
 
-- **`TSVZed`** — an in-memory `OrderedDict` backed by the file, with a
-  background worker that does **non-blocking, append-only** writes, optional
-  periodic / on-exit rewrites, file locking for multi-process access, and
-  transparent (de)compression.
-- **`TSVZedLite`** — a `MutableMapping` that keeps only a **key → byte-offset
-  index** in memory and reads values from disk on demand. Minimal footprint,
-  single-process, append-only.
+- **`WalStore`** — in-memory `OrderedDict` with a background append-only writer
+  (§18), optional `#_write_ack_#` fsync, multi-part stores, and compression.
+- **`OffsetStore`** — key → byte-offset index; values are read from disk on
+  demand. Uncompressed single-part only.
 
-It is a single self-contained module (`TSVZ.py`) — drop it next to your code and
-`import TSVZ`, or install it.
+`TSVZed` / `TSVZedLite` still exist as thin wrappers around those classes. They
+emit `DeprecationWarning` and are scheduled for removal in 5.0. They follow
+**4.0 file semantics**, not 3.x.
+
+It is a self-contained module (`TSVZ.py`) — drop it next to your code and
+`import TSVZ`, or install it. `TSVZ_old.py` ships in the same package.
 
 ```bash
 pip install tsvz          # from PyPI
 pip install -e .          # editable, from this directory
 ```
+
+---
+
+## Breaking changes in 4.0
+
+TSVZ 4.0 reads and writes **tsvz-spec-v1** only. Existing 3.x files will
+silently reconstruct **wrong**:
+
+| 3.x | 4.0 |
+|---|---|
+| Non-`#` first line is a header | It is a **data key** (`id` in `id\tname\tval`) |
+| `key\t\t` (empty value columns) is a delete | Only a **lone** `key\n` is a tombstone; `key\t\t` is live empty cells, so 3.x deletes **resurrect** |
+| `</sep/>` / `</LF/>` escapes | Unknown tokens pass through; spec tokens are `<sep>`, `<LF>`, `<lt>`, `<#>` |
+| `#` keys were RAM-only scratch | They persist as `<#>key` |
+| `defaults='#_defaults_#\tNA'` is one TSV line | A string is split **character-by-character** — pass a list |
+| `rewrite_on_load=True` by default | **`False`** |
+| CLI `-s/--strict` = column checks; `-v` verbose | `-s` = missing file is an error; **`-v` is gone** |
+
+To keep 3.x behaviour:
+
+```python
+import TSVZ_old as TSVZ
+```
+
+`import TSVZ` itself is silent. The CLI (`tsvz --help` / `--version`) and the
+legacy wrappers (`TSVZed`, `readTabularFile`, …) print this warning.
 
 ---
 
@@ -34,35 +64,33 @@ pip install -e .          # editable, from this directory
 ```python
 import TSVZ
 
-# Opens (creating if needed), loads into memory, starts the async writer.
-# Per tsvz-spec-v1.md the column header is a # comment; the reference
-# implementation still accepts a legacy non-# first line (see Implementation notes).
-db = TSVZ.TSVZed('data.tsv', header='id\tname\tscore')
-
-db['alice'] = ['alice', 'Alice', '10']   # value as a list
-db['bob']   = 'bob\tBob\t20'             # ...or a delimited string
+db = TSVZ.WalStore('data.tsvz', header=['id', 'name', 'score'], create=True)
+db['alice'] = ['alice', 'Alice', '10']
+db['bob'] = ['bob', 'Bob', '20']
 db['alice'] = ['alice', 'Alice', '11']   # last write wins
-del db['bob']                            # deletes (and persists the deletion)
-
-print(db['alice'])        # ['alice', 'Alice', '11']
-db.close()                # flush the queue and stop the worker (also runs atexit)
+del db['bob']                            # appends a tombstone (lone key)
+print(db['alice'])                       # ['alice', 'Alice', '11']
+db.close()
 ```
 
-There are also stateless helper functions if you just want to touch a file once:
-`readTabularFile`, `appendTabularFile`, `appendLinesTabularFile`,
-`clearTabularFile`, `scrubTabularFile` (and `readTSV` / `appendTSV` / … aliases).
+Stateless helpers: `read_store`, `append_records`, `delete_records`,
+`snapshot_part`, `read_multipart`. The 3.x names (`readTabularFile`, …) still
+work and warn.
 
 ### From the command line
 
 ```bash
-tsvz data.tsv                          # read + pretty-print
-tsvz data.tsv append alice Alice 10    # append/update a row keyed by "alice"
-tsvz data.tsv delete alice             # delete the row keyed by "alice"
-tsvz data.tsv clear                    # truncate to just the header
-tsvz data.tsv scrub                    # compact (snapshot) — drops comments, applies last-wins
+tsvz data.tsvz                         # read + pretty-print
+tsvz data.tsvz append alice Alice 10   # append/update
+tsvz data.tsvz delete alice            # tombstone
+tsvz data.tsvz clear                   # truncate
+tsvz data.tsvz scrub                   # compact (snapshot)
+tsvz data.tsvz verify                  # §15 checksums
+tsvz data.tsvz parts                   # list §17 parts
 
-tsvz data.csv -d comma append k v1 v2  # pick a delimiter explicitly
+tsvz data.csvz -d comma append k v1 v2
 tsvz -h
+tsvz -V
 ```
 
 ---
@@ -74,8 +102,8 @@ The strict `.tsvz` / `.csvz` / `.nsvz` / `.psvz` formats are defined in
 That document is the canonical reference for any conformant reader or writer — not
 just this library.
 
-> **Status:** The spec is draft; the reference implementation in `TSVZ.py` does not
-> fully conform yet (see *Implementation notes*).
+> **Status:** Format spec v1 is draft; `TSVZ.py` 4.0 is the reference
+> implementation (see *Known deviations* below). TSVZ 3.39 is `TSVZ_old.py`.
 
 ### What the format is
 
@@ -140,98 +168,48 @@ A worked replay example appears in Appendix C of
 
 ## API
 
-### `TSVZed(fileName, …)`
+### `WalStore(path, …)`
 
-An `OrderedDict` subclass that auto-syncs to `fileName`. Selected options:
+An `OrderedDict` subclass that auto-syncs to `path` with a background append
+worker. Selected options: `header`, `create`, `delimiter`, `defaults`,
+`flush_interval`, `write_ack` (`'memory'` or `'disk'`), `multipart`.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `header` | `''` | Header line (string or list) for creation/validation. |
-| `createIfNotExist` | `True` | Create the file if missing. |
-| `verifyHeader` | `True` | Check the file's first line against `header`. |
-| `delimiter` | auto | Delimiter; inferred from the extension if omitted. |
-| `defaults` | `None` | Per-column default values. |
-| `strict` | `False` | Enforce column counts / header; reject malformed rows. |
-| `rewrite_on_load` | `True` | Compact the file once when opened. |
-| `rewrite_on_exit` | `False` | Compact the file when closed. |
-| `rewrite_interval` | `0` | Min seconds between periodic compactions (`0` = never). |
-| `monitor_external_changes` | `True` | Detect / merge other processes' writes. |
-| `encoding` | `'utf8'` | File encoding. |
+`#` keys are ordinary data, persisted as `<#>key`.
 
-Writes are queued and flushed by a background thread; call `close()` (or use it
-as a context manager) to flush and stop cleanly. Keys starting with `#` are kept
-in memory only (handy for scratch state) and are never written.
+### `OffsetStore(path, …)`
 
-### `TSVZedLite(fileName, …)`
+A `MutableMapping` that stores only a key→offset index and seeks for each read.
+Uncompressed single-part only; rejects `.gz` / `.bz2` / `.xz` / `.zst`.
 
-A `MutableMapping` that stores only a key→offset index in RAM and seeks into the
-file for each read. Append-only; single-process; no compression, no background
-thread, no external-change monitoring. Good for very large, mostly-write,
-seek-cheap (SSD) workloads. An external index dict can be supplied to skip the
-initial full scan (turning it into a small key-value store).
+### Legacy wrappers
 
-### Module functions
-
+`TSVZed` → `WalStore`; `TSVZedLite` → `OffsetStore`.
 `readTabularFile`, `appendTabularFile`, `appendLinesTabularFile`,
-`clearTabularFile`, `scrubTabularFile`, `get_delimiter`, `pretty_format_table`,
-plus the legacy `readTSV` / `appendTSV` / `clearTSV` / `scrubTSV` aliases.
+`clearTabularFile`, `scrubTabularFile`, `get_delimiter`, plus `readTSV` /
+`appendTSV` / `clearTSV` / `scrubTSV`. All warn; removal target 5.0.
 
 ---
 
-## Implementation notes (reference behavior vs. [tsvz-spec-v1.md](tsvz-spec-v1.md))
+## Known deviations (4.0 vs [tsvz-spec-v1.md](tsvz-spec-v1.md))
 
-[tsvz-spec-v1.md](tsvz-spec-v1.md) is the target definition. The current
-`TSVZed` / `TSVZedLite` implementation differs or only partially implements it in
-these areas — useful to know, and candidates for a future alignment pass:
+Documented in the `TSVZ.py` module docstring. The important ones:
 
-- **Tombstones.** The spec (§9) deletes only on a delimiter-free row (`key\n`).
-  The reference code also treats all-empty value columns as deletion.
-- **Escaping.** The spec (§13) uses `<sep>`, `<LF>`, `<lt>`, and `<#>` with no
-  lossy cases. The reference code uses the older `</sep/>` / `</LF/>` scheme and
-  does not encode `<` or leading `#` in keys.
-- **Markers.** Only `#_defaults_#` is partially recognized today. The spec (§12)
-  defines `#_version_#`, `#_strip_trailing_whites_#`, `#_fill_empty_with_default_#`,
-  `#_return_defaults_when_missing_#`, `#_rotate_#`, `#_write_ack_#`, and
-  `#_checksum_<algo>_#` — none of which are implemented yet.
-- **Column normalization.** Rather than variable-length rows with absent trailing
-  columns resolved at read time (spec §14), the classes detect a column count
-  (from the header or first row) and, in non-strict mode, pad/trim rows to it;
-  `strict` mode rejects mismatches.
-- **Header.** The reference classes still use a *non*-`#` first line as the
-  header (validated via `verifyHeader`), whereas spec §11 defines the header as an
-  ordinary `#` comment. Existing files written by older versions use the non-`#`
-  header.
-- **Strict vs. loose extensions.** `get_delimiter` infers from `.tsv`/`.csv`/`.nsv`/`.psv`
-  only; `.csvz`/`.nsvz`/`.psvz` currently fall back to tab (`.tsvz` happens to
-  land on tab). The code does not yet key behavior off the `z` suffix or enforce
-  the strict WAL contract separately for strict extensions.
-- **Multi-part, snapshots, integrity.** No multi-part read/write, no spec §19
-  snapshot procedure (ordinal slotting, `.rotated` exclusion), and no checksum
-  markers (spec §15).
-- **Rewrite-on-load.** `rewrite_on_load` / `mapToFile` perform in-place compaction
-  on open, which conflicts with the strict append-only model for `.tsvz` files
-  (spec §3.1, §19).
-
-### Open implementation questions
-
-Raised by aligning the reference code with the spec; not yet decided in
-`TSVZ.py`:
-
-1. **Strict contract gating.** Should `TSVZed`/`TSVZedLite` key append-only WAL
-   behavior off the `z` extension (`.tsv` = lenient table, `.tsvz` = spec §3), or
-   treat all extensions the same?
-2. **Rewrite machinery.** A strict `.tsvz` arguably forbids in-place rewrite
-   (`rewrite_on_load` / `mapToFile`) except via the spec §19 snapshot procedure.
-3. **History retention.** If keeping the full append log matters, compaction must
-   be an explicit, separate action — and may emit a snapshot part rather than
-   mutating the active log in place.
+- `snapshot_part(header=)` re-emits a `#` header comment (§19.2.3c says no comments).
+- Boolean markers accept `yes`/`no`/`on`/`off`/`1`/`0` on read; writers emit `true`/`false`.
+- No `<CR>` escape token.
+- Loose extensions write the same bytes as strict ones, but warn once if a write
+  actually emits an escape token or marker.
+- Invalid UTF-8 is replaced (and warned) unless `errors='strict'`.
+- `#_rotate_# delete` is downgraded to `rename` unless `allow_delete=True`.
+- `.zst` needs Python 3.14 `compression.zstd`; it never falls back to plaintext.
 
 ## Tests
 
 ```bash
-python -m pytest test_TSVZ.py            # regression suite
-python test_TSVZ.py                      # or run directly
-python benchTSVZ.py data.tsv -n 100000   # throughput benchmark (not a test)
+python -m pytest TSVZ_new_spec_tests.py  # spec v1 / TSVZ 4.0
+python TSVZ.py --doctest
+python -m pytest test_TSVZ.py            # frozen 3.39 (TSVZ_old)
+python benchTSVZ.py data.tsvz -n 100000  # throughput benchmark (not a test)
 ```
 
 ## License
