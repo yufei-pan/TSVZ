@@ -1,17 +1,16 @@
 #! /usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 # /// script
-# requires-python = ">=3.8"
+# requires-python = ">=3.6"
 # dependencies = [
 # ]
 # ///
 """
 TSVZ 4.0 — reference implementation of tsvz-spec-v1.
 
-Requires **Python 3.8+**. This is a spec-v1 rewrite and is **not a drop-in
-replacement for TSVZ 3.x**. The frozen 3.39 API remains as ``TSVZ_old``
-(that module still runs on 3.6). See the README section *Breaking changes
-in 4.0*, or ``tsvz --help``.
+Requires **Python 3.6+**. This is a spec-v1 rewrite and is **not a drop-in
+replacement for TSVZ 3.x**. The frozen 3.39 API remains as ``TSVZ_old``.
+See the README section *Breaking changes in 4.0*, or ``tsvz --help``.
 
 This module provides an append-only write-ahead log (WAL) for tabular
 key–value data. Compaction is performed by :func:`snapshot_part` (a
@@ -3598,7 +3597,9 @@ class OffsetStore(_StoreCommon, MutableMapping):
 		return iter(self._offsets)
 
 	def __reversed__(self):
-		return reversed(self._offsets)
+		if sys.version_info >= (3, 8):  # noqa: UP036  # dict is reversible from 3.8
+			return reversed(self._offsets)
+		return reversed(list(self._offsets))
 
 	def __len__(self):
 		return len(self._offsets)
@@ -3696,6 +3697,20 @@ def _deprecated(replacement):
 	return decorate
 
 
+def _is_ascii(text):
+	"""Return True if ``text`` is pure ASCII (``str.isascii`` needs 3.7+).
+
+	Examples:
+		>>> _is_ascii('a\\\\tb'), _is_ascii('§'), _is_ascii('')
+		(True, False, True)
+	"""
+	try:
+		text.encode('ascii')
+	except UnicodeEncodeError:
+		return False
+	return True
+
+
 def _legacy_delimiter(delimiter=..., file_name='', path=''):
 	"""Map legacy ``get_delimiter`` calling conventions to a concrete delimiter.
 
@@ -3736,7 +3751,7 @@ def _legacy_delimiter(delimiter=..., file_name='', path=''):
 	if isinstance(delimiter, str):
 		# unicode_escape round-trips through latin-1, so it mangles any
 		# non-ASCII delimiter ('§' -> 'Â§'). Only unescape pure ASCII.
-		if not delimiter.isascii():
+		if not _is_ascii(delimiter):
 			return delimiter
 		try:
 			return delimiter.encode().decode('unicode_escape')
@@ -4324,6 +4339,37 @@ def _cli_pretty_format_table(data, delimiter='\t'):
 	return '\n'.join(lines) + '\n'
 
 
+# Option-looking CLI tokens; negative numbers are data, as argparse treats them.
+_ARGPARSE_OPTION_RE = re.compile(r'^-(?!\d+$|\d*\.\d+$).')
+
+
+def _cli_force_utf8():
+	"""Emulate PEP 538/540 on Python 3.6 under the C/POSIX locale.
+
+	3.7+ coerces an ASCII locale to UTF-8; 3.6 decodes argv as ASCII
+	(non-ASCII bytes become surrogates) and crashes printing non-ASCII.
+	"""
+	if sys.version_info >= (3, 7):  # noqa: UP036  # 3.7+ coerces the locale itself
+		return
+	import codecs
+	if codecs.lookup(sys.getfilesystemencoding()).name != 'ascii':
+		return
+
+	def redecode(arg):
+		try:
+			return os.fsencode(arg).decode('utf-8', 'surrogateescape')
+		except UnicodeEncodeError:
+			return arg  # already real text, e.g. sys.argv set in-process
+
+	sys.argv = [redecode(a) for a in sys.argv]
+	for name in ('stdout', 'stderr'):
+		stream = getattr(sys, name)
+		if hasattr(stream, 'buffer') and codecs.lookup(stream.encoding).name == 'ascii':
+			setattr(sys, name, io.TextIOWrapper(
+				stream.buffer, encoding='utf-8', errors='backslashreplace',
+				line_buffering=stream.line_buffering))
+
+
 def __main__():
 	"""Command-line entry point.
 
@@ -4336,6 +4382,7 @@ def __main__():
 		and the part is missing, ``2`` for a usage error.
 	"""
 	import argparse
+	_cli_force_utf8()
 	epilog = (
 		f'{BREAKING_CHANGES_4_0}\n'
 		'Breaking changes vs 3.x:\n'
@@ -4392,12 +4439,19 @@ def __main__():
 		argcomplete.autocomplete(parser, always_complete_options='long')
 	except ImportError:
 		pass
-	args = parser.parse_args()
+	args, extras = parser.parse_known_args()
+	# Before 3.12 (gh-59317) argparse won't resume the nargs='*' `line`
+	# positional after an interleaved option: `f append -d , k v` leaves `k v`
+	# unparsed. Re-attach them the way 3.12+ does; anything else is an error.
+	if extras:
+		if args.line or any(_ARGPARSE_OPTION_RE.match(e) for e in extras):
+			parser.error('unrecognized arguments: ' + ' '.join(extras))
+		args.line = extras
 	args.delimiter = _legacy_delimiter(delimiter=args.delimiter, file_name=args.filename)
 
 	def _unescape(text):
 		"""Expand \\t / \\n style escapes in a CLI argument, ASCII only."""
-		if not text or not text.isascii():
+		if not text or not _is_ascii(text):
 			return text
 		try:
 			return text.encode().decode('unicode_escape')

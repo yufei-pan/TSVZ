@@ -6,9 +6,8 @@ key; the file behaves like an ordered dictionary that is transparently
 persisted to disk.
 
 **Version 4.0** is the [tsvz-spec-v1.md](tsvz-spec-v1.md) reference
-implementation. It requires **Python 3.8+** and is **not a drop-in replacement
-for 3.x**. The frozen 3.39 API remains as `TSVZ_old` (that module still runs on
-3.6).
+implementation. It requires **Python 3.6+** and is **not a drop-in replacement
+for 3.x**. The frozen 3.39 API remains as `TSVZ_old`.
 
 Preferred 4.0 front-ends:
 

@@ -51,7 +51,8 @@ def replay(content, delimiter='\t'):
 
 def decode_header_line(line, delimiter='\t'):
 	fields = [TSVZ.decode_field(f, delimiter) for f in line.split(delimiter)]
-	fields[0] = fields[0].removeprefix('#')
+	if fields[0].startswith('#'):  # noqa: FURB188  # removeprefix needs 3.9+
+		fields[0] = fields[0][1:]
 	return fields
 
 
@@ -1465,8 +1466,11 @@ class TestCli(unittest.TestCase):
 
 	def run_cli(self, *args):
 		import subprocess
-		return subprocess.run([sys.executable, self.MOD, *args],
-							  capture_output=True, text=True, check=False)
+		# capture_output needs 3.7+; explicit utf-8 because 3.6 under LANG=C
+		# would decode the child's UTF-8 output as ASCII.
+		return subprocess.run([sys.executable, self.MOD, *args],  # noqa: UP022
+							  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+							  encoding='utf-8', check=False)
 
 	def test_missing_part_is_lenient_by_default(self):
 		with TempFile(suffix='.tsvz') as path:

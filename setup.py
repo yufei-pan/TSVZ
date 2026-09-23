@@ -25,12 +25,12 @@ setup(
     },
     classifiers=[
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.6',
         'License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)',
         'Operating System :: OS Independent',
     ],
-    python_requires='>=3.8',
-	long_description=open('README.md').read(),
+    python_requires='>=3.6',
+	long_description=open('README.md', encoding='utf-8').read(),
 	long_description_content_type='text/markdown',
 	license='GPLv3+',
 )
