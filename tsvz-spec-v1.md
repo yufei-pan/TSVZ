@@ -63,8 +63,9 @@ and are marked accordingly.
 ## 3. Data model
 
 3.1 Every mutation is an **append**. During normal operation a part is only ever
-appended to; no byte previously written is modified. The sole exception is the
-snapshot procedure (§19).
+appended to; no byte previously written is modified. The exceptions are the
+snapshot procedure (§19) and clearing a part, both of which modify existing bytes
+only under exclusive access (§18.6, §19.8).
 
 3.2 The store is **key–value**, not relational. Field 0 is the key; value columns
 0..∞ follow. There is no schema and no header semantics beyond the comment rule
@@ -633,7 +634,12 @@ open as a stream, appending requires rewriting it as a whole.
 
 17.1 A store **MAY** be split across multiple parts sharing the same path up to the
 format extension, distinguished by an ordinal suffix. Multi-part is purely an
-addressing convention; a single-file store is the one-part case.
+addressing convention; a single-file store is the one-part case. An unnumbered
+file (`<store-path>.<format-ext>[.<compression>]`) that exists alongside numbered
+parts of the same store is **part 0**: it is ordered before every numbered part,
+including one whose ordinal is `0`. This is the shape a single-file store takes
+once promoted (§19.9). Renamed by `#_rotate_# rename`, it becomes
+`<store-path>.<format-ext>.0.rotated[.<compression>]`.
 
 17.2 **Filename grammar.**
 
@@ -684,8 +690,9 @@ scheme throughout.
 
 ## 18. Concurrency and durability (recommendations)
 
-The following are recommendations, not normative format rules; they are what make
-the end-of-file recovery guarantee of §4 sound.
+Except for §18.7, the following are recommendations, not normative format rules;
+they are what make the end-of-file recovery guarantee of §4 sound and in-place
+maintenance (§19.8) safe.
 
 18.1 **Single writer per part.** A part SHOULD have exactly one appending writer.
 Concurrency SHOULD be expressed as multiple parts (§17), not as concurrent appends
@@ -720,6 +727,35 @@ two parts (no cross-part overwrite of a key), or (b) the application tolerates t
 last-wins-across-parts **regression** that independent appends can produce, since
 cross-writer append order may not reflect real time. Otherwise, writes SHOULD be
 funneled through one handler (§18.3).
+
+18.6 **Access and append locks.** A producer that modifies a part in place
+(§19.8) SHOULD coordinate through two independent advisory locks per part:
+
+   - the **access lock** — held *shared* by every handle for as long as it has the
+     part open (readers, writers, and live stores alike), and *exclusive* only
+     while the part is truncated or rewritten in place. Exclusive access therefore
+     means that no other handle has the part open;
+   - the **append lock** — held exclusively for the duration of one batch append
+     (§18.2), so appends from different handles never interleave.
+
+   The two locks SHOULD be distinct byte ranges of the part (for example, one byte
+   each at offsets 0 and 1), so that appending never waits on readers. Locks owned
+   by the open file description (Linux OFD locks) are RECOMMENDED: process-owned
+   POSIX record locks are released as soon as the process closes *any* descriptor
+   for the file, and do not exclude other handles in the same process.
+
+18.7 **Parts are never replaced.** A producer **MUST NOT** replace an existing part
+by renaming another file over it. Handles that still have the old file open keep
+appending to it, and those appends are silently lost; the part's permissions,
+ownership, ACLs, extended attributes, and links are lost too. New content goes
+into a new part (§17, §19.2) or into the same file in place under exclusive access
+(§19.8). A producer that creates a part on a store's behalf SHOULD give it the
+ownership, permissions, and extended attributes of the part it continues.
+
+18.8 **Busy parts.** Maintenance that cannot obtain exclusive access within a
+bounded wait SHOULD either fail without modifying the part, or fall back to an
+append-only equivalent — for example, clearing by appending a tombstone for every
+live key (§9).
 
 ---
 
@@ -795,6 +831,23 @@ Readers that retain only a part identifier and byte offset per key (rather than
 materialized values) work unchanged: both can serve reads from the immutable parts
 while the snapshot is produced.
 
+19.8 **In-place compaction.** Where §19.2 is not available — typically a
+single-file store — a producer MAY compact a part in place instead: replace its
+contents with the snapshot content of §19.2.3 and truncate it to the new length.
+A part MAY likewise be cleared in place, keeping only a header comment and the
+active markers. Either is permitted **only while holding exclusive access** to the
+part (§18.6), and the file itself is kept (§18.7). Unlike §19.2, an in-place
+rewrite is not crash-atomic: a crash during it can damage the part. A producer
+SHOULD therefore build the complete new content before modifying the file,
+reserve space for it first, write it from offset 0, then truncate and `fsync`.
+
+19.9 **Promotion.** Snapshotting a single unnumbered file (§17.1) by the §19.2
+procedure promotes the store to multi-part: with exclusive access to the file held
+for the duration (quiescing, §19.3), write the snapshot as a new numbered part,
+then apply the `#_rotate_#` action (§19.5) to the file, which is now part 0.
+Writers MUST thereafter append only to numbered parts: a record appended to part 0
+would be ordered before the snapshot and lost to it.
+
 ---
 
 ## Appendix A. Filename grammar (ABNF)
@@ -809,7 +862,9 @@ store-path    = <any valid path up to the format extension>
 ```
 
 Parts are ordered by the integer value of `ordinal`, ascending. Parts bearing the
-`.rotated` component are excluded from loading.
+`.rotated` component are excluded from loading. An unnumbered
+`store-path "." format-ext [ "." codec ]` file beside numbered parts is part 0 and
+precedes them all (§17.1).
 
 ---
 

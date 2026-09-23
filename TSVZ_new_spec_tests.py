@@ -663,16 +663,22 @@ class TestWalStoreDurability(unittest.TestCase):
 	def test_flush_failure_requeues_instead_of_dropping(self):
 		with TempFile(suffix='.tsvz') as path:
 			db = self._store(path, flush_interval=1000)
+			real_append = db._handle.append
 			try:
 				db['a'] = ['a', '1']
-				db.path = os.path.join(path + '.nodir', 'x.tsvz')
+
+				def boom(*_a, **_k):
+					raise OSError('injected write failure')
+
+				db._handle.append = boom
 				with self.assertRaises(OSError):
 					db.flush()
 				self.assertEqual(len(db._pending), 1)
 				self.assertFalse(db._lock.locked())  # lock released on failure
 			finally:
-				db.path = path
+				db._handle.append = real_append
 				db.close()
+			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '1']})
 
 	def test_clear_does_not_resurrect_an_in_flight_flush(self):
 		# Drain must hold _lock through the write; otherwise clear() truncates
@@ -2028,11 +2034,11 @@ class TestSnapshotStore(unittest.TestCase):
 		TSVZ.append_records(TSVZ.part_path(one, 1), [['a', '1']], create=True)
 		self.assertIsNone(TSVZ.snapshot_store(one))
 
-	def test_unnumbered_file_points_at_snapshot_part(self):
+	def test_unnumbered_file_is_refused_without_promote(self):
 		plain = os.path.join(self.dir, 'plain.tsvz')
 		TSVZ.append_records(plain, [['a', '1']], create=True)
 		with self.assertRaises(ValueError):
-			TSVZ.snapshot_store(plain)
+			TSVZ.snapshot_store(plain, promote=False)
 
 	def test_compensates_for_varying_defaults(self):
 		# §19.4: hoisting #_defaults_# must not change how earlier rows resolve.
@@ -2311,25 +2317,25 @@ class TestIntegrityPolicyAndRotate(unittest.TestCase):
 		self.assertFalse(os.path.isfile(live))
 		self.assertTrue(any(new and new.endswith('.rotated') for _, new in changes))
 
-	def test_failed_atomic_rewrite_does_not_leave_a_temp(self):
+	def test_snapshot_rewrites_in_place_without_renames(self):
 		with TempFile(suffix='.tsvz') as path:
-			TSVZ.append_records(path, [['a', '1']], create=True)
+			TSVZ.append_records(path, [['a', '1'], ['a', '2']], create=True)
 			directory = os.path.dirname(os.path.abspath(path))
 			before = set(os.listdir(directory))
-			real = os.replace
+			inode = os.stat(path).st_ino
+			real_replace, real_rename = os.replace, os.rename
 
 			def boom(*_a, **_k):
-				raise OSError('injected replace failure')
+				raise AssertionError('a part must never be renamed over')
 
-			os.replace = boom
+			os.replace = os.rename = boom
 			try:
-				with self.assertRaises(OSError):
-					TSVZ.snapshot_part(path)
+				TSVZ.snapshot_part(path)
+				TSVZ.truncate_part(path)
 			finally:
-				os.replace = real
-			leftovers = [n for n in set(os.listdir(directory)) - before if '.tmp' in n]
-			self.assertEqual(leftovers, [])
-			self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '1']})
+				os.replace, os.rename = real_replace, real_rename
+			self.assertEqual(os.stat(path).st_ino, inode)
+			self.assertEqual(set(os.listdir(directory)) - before, set())
 
 	def test_snapshot_store_missing_raises(self):
 		with self.assertRaises(FileNotFoundError):
@@ -2339,20 +2345,19 @@ class TestIntegrityPolicyAndRotate(unittest.TestCase):
 	def test_store_parts_missing_directory_is_empty(self):
 		self.assertEqual(TSVZ.store_parts('/no/such/tsvz-dir/x.tsvz'), [])
 
-	def test_unnumbered_file_beside_parts_is_ignored_with_a_warning(self):
+	def test_unnumbered_file_beside_parts_is_part_zero(self):
 		d = tempfile.mkdtemp()
 		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
 		base = os.path.join(d, 'st.tsvz')
 		TSVZ.append_records(TSVZ.part_path(base, 1), [['a', '1']], create=True)
 		with open(base, 'w') as f:
-			f.write('ghost\t9\n')
-		with warnings.catch_warnings(record=True) as caught:
-			warnings.simplefilter('always', UserWarning)
-			paths = TSVZ.store_part_paths(base)
-			data = dict(TSVZ.read_multipart(base))
-		self.assertTrue(any('numbered parts' in str(w.message) for w in caught))
-		self.assertNotIn(base, paths)
-		self.assertEqual(data, {'a': ['a', '1']})
+			f.write('old\t9\na\t0\n')
+		paths = TSVZ.store_part_paths(base)
+		self.assertEqual(paths, [base, TSVZ.part_path(base, 1)])
+		self.assertEqual(TSVZ.store_parts(base)[0].ordinal_value, 0)
+		# Part 0 replays first, so the numbered part wins for 'a'.
+		self.assertEqual(dict(TSVZ.read_multipart(base)),
+						 {'old': ['old', '9'], 'a': ['a', '1']})
 
 	def test_replay_of_a_missing_part_is_empty(self):
 		store, state = TSVZ.replay_part(
@@ -2559,20 +2564,31 @@ class TestTsvzedHardMapAndSwitch(unittest.TestCase):
 				db.close()
 			self.assertEqual(read_text(path).count('a\t'), 1)
 
-	def test_flush_honours_rewrite_interval(self):
+	def test_rewrite_interval_is_deprecated_and_ignored(self):
 		with TempFile(suffix='.tsvz') as path:
-			with warnings.catch_warnings():
-				warnings.simplefilter('ignore', DeprecationWarning)
+			with warnings.catch_warnings(record=True) as caught:
+				warnings.simplefilter('always', DeprecationWarning)
 				db = TSVZ.TSVZed(path, createIfNotExist=True, rewrite_interval=0.001,
 								 append_check_delay=600)
 			try:
+				self.assertTrue(any('rewrite_interval' in str(w.message) for w in caught))
+				self.assertTrue(any(w.filename == __file__ for w in caught
+									if 'rewrite_interval' in str(w.message)))
 				db['a'] = ['a', '1']
 				db['a'] = ['a', '2']
-				db._last_rewrite = 0
+				time.sleep(0.01)
 				db.flush()
-				self.assertEqual(read_text(path).count('a\t'), 1)
+				self.assertEqual(read_text(path).count('a\t'), 2)  # no rewrite
 			finally:
 				db.close()
+
+	def test_rewrite_interval_zero_does_not_warn(self):
+		with TempFile(suffix='.tsvz') as path:
+			with warnings.catch_warnings(record=True) as caught:
+				warnings.simplefilter('always', DeprecationWarning)
+				db = TSVZ.TSVZed(path, createIfNotExist=True)
+			db.close()
+			self.assertFalse(any('rewrite_interval' in str(w.message) for w in caught))
 
 	def test_legacy_aliases_still_work(self):
 		with TempFile(suffix='.tsvz') as path:
@@ -2930,6 +2946,384 @@ class TestMorePublicEdges(unittest.TestCase):
 				warnings.simplefilter('ignore', DeprecationWarning)
 				self.assertEqual(TSVZ.scrubTabularFile(path, lastLineOnly=True),
 								 ['b', '2'])
+
+
+
+def _identity(path):
+	"""What an in-place rewrite must keep: inode, mode bits, owner, group."""
+	st = os.stat(path)
+	return st.st_ino, st.st_mode & 0o7777, st.st_uid, st.st_gid
+
+
+def _tsvz_cli(*args):
+	import subprocess
+	cli = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'TSVZ.py')
+	return subprocess.run([sys.executable, cli, *args], stdout=subprocess.PIPE,  # noqa: UP022
+						  stderr=subprocess.PIPE, encoding='utf-8', check=False)
+
+
+class _ScratchDir(unittest.TestCase):
+	def setUp(self):
+		self.dir = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+		self.addCleanup(os.umask, os.umask(0o022))
+
+	def part(self, name='s.tsvz', mode=0o664, rows=None):
+		path = os.path.join(self.dir, name)
+		TSVZ.append_records(path, rows or [['a', '1'], ['a', '2'], ['b', 'x'], ['b']],
+							create=True)
+		os.chmod(path, mode)
+		return path
+
+	def hold(self, path):
+		"""Keep ``path`` open, as another process's reader or store would."""
+		handle = TSVZ._PartHandle(path)
+		self.addCleanup(handle.close)
+		return handle
+
+
+class TestInPlaceMaintenance(_ScratchDir):
+	"""Clear and scrub rewrite the part in place: never a new file (§18)."""
+
+	def test_every_rewrite_keeps_the_file_identity(self):
+		def walstore_clear(p):
+			TSVZ.WalStore(p).clear().close()
+
+		def offsetstore_clear(p):
+			TSVZ.OffsetStore(p).clear().close()
+
+		def hardmap(p):
+			db = TSVZ.TSVZed(p, append_check_delay=600)
+			db['c'] = ['c', '3']
+			self.assertTrue(db.hardMapToFile())
+			db.close()
+
+		def rewrite_on_load(p):
+			TSVZ.TSVZed(p, rewrite_on_load=True).close()
+
+		ops = [('truncate_part', TSVZ.truncate_part), ('snapshot_part', TSVZ.snapshot_part),
+			   ('WalStore.clear', walstore_clear), ('OffsetStore.clear', offsetstore_clear),
+			   ('hardMapToFile', hardmap), ('rewrite_on_load', rewrite_on_load),
+			   ('cli clear', lambda p: _tsvz_cli(p, 'clear')),
+			   ('cli scrub', lambda p: _tsvz_cli(p, 'scrub'))]
+		with warnings.catch_warnings():
+			warnings.simplefilter('ignore', DeprecationWarning)
+			for name, op in ops:
+				with self.subTest(name):
+					path = self.part(name.replace(' ', '_') + '.tsvz')
+					before = _identity(path)
+					op(path)
+					self.assertEqual(_identity(path), before)
+					self.assertEqual(os.listdir(self.dir).count(os.path.basename(path)), 1)
+
+	def test_symlinked_store_stays_a_symlink(self):
+		target = self.part('real.tsvz')
+		link = os.path.join(self.dir, 'link.tsvz')
+		os.symlink(target, link)
+		TSVZ.snapshot_part(link)
+		self.assertTrue(os.path.islink(link))
+		self.assertNotIn('b\n', read_text(target))  # the target itself was compacted
+		self.assertEqual(dict(TSVZ.read_store(link)), {'a': ['a', '2']})
+
+	def test_hard_links_keep_sharing_the_part(self):
+		path = self.part()
+		alias = os.path.join(self.dir, 'alias.tsvz')
+		os.link(path, alias)
+		TSVZ.snapshot_part(path)
+		self.assertTrue(os.path.samefile(path, alias))
+		self.assertEqual(dict(TSVZ.read_store(alias)), {'a': ['a', '2']})
+
+	def test_extended_attributes_survive(self):
+		path = self.part()
+		try:
+			os.setxattr(path, 'user.tsvz-test', b'kept')
+		except (AttributeError, OSError):
+			self.skipTest('user xattrs are not supported here')
+		TSVZ.snapshot_part(path)
+		TSVZ.truncate_part(path)
+		self.assertEqual(os.getxattr(path, 'user.tsvz-test'), b'kept')
+
+	def test_compressed_part_is_rewritten_in_place(self):
+		path = os.path.join(self.dir, 's.tsvz.gz')
+		TSVZ.append_records(path, [['a', '1'], ['a', '2']], create=True)
+		before = _identity(path)
+		TSVZ.snapshot_part(path)
+		self.assertEqual(_identity(path), before)
+		self.assertEqual(dict(TSVZ.read_store(path)), {'a': ['a', '2']})
+
+	def test_a_rewrite_that_grows_the_part_is_complete(self):
+		# Baking varying defaults (§19.4) can make a snapshot larger than the log.
+		path = os.path.join(self.dir, 'grow.tsvz')
+		with open(path, 'w') as f:
+			f.write('k1\tv\n#_defaults_#\t' + '\t'.join('D' * 40 for _ in range(20)) + '\n')
+		before = dict(TSVZ.read_store(path))
+		size = os.path.getsize(path)
+		TSVZ.snapshot_part(path)
+		self.assertGreater(os.path.getsize(path), size)
+		after = dict(TSVZ.read_store(path))
+		# Baked rows may gain explicitly-empty trailing cells (§3.6).
+		self.assertEqual({k: [c for c in v if c] for k, v in after.items()},
+						 {k: [c for c in v if c] for k, v in before.items()})
+
+
+class TestExclusiveAccess(_ScratchDir):
+	"""Maintenance needs every other handle closed; stores fall back to appends."""
+
+	def test_busy_error_is_a_timeout_error(self):
+		self.assertTrue(issubclass(TSVZ.StoreBusyError, TimeoutError))
+
+	def test_truncate_and_snapshot_refuse_while_the_part_is_open(self):
+		path = self.part()
+		text = read_text(path)
+		self.hold(path)
+		for fn in (TSVZ.truncate_part, TSVZ.snapshot_part):
+			with self.subTest(fn.__name__), self.assertRaises(TSVZ.StoreBusyError):
+				fn(path, lock_timeout=0.05)
+		self.assertEqual(read_text(path), text)
+
+	def test_maintenance_waits_for_a_brief_holder(self):
+		path = self.part()
+		handle = TSVZ._PartHandle(path)
+		timer = threading.Timer(0.1, handle.close)
+		timer.start()
+		try:
+			TSVZ.truncate_part(path, lock_timeout=10)
+		finally:
+			timer.join()
+		self.assertEqual(read_text(path), '')
+
+	def test_a_failed_upgrade_keeps_the_shared_lock(self):
+		path = self.part()
+		mine = TSVZ._PartHandle(path, write=True)
+		self.addCleanup(mine.close)
+		other = TSVZ._PartHandle(path)
+		self.assertFalse(mine.upgrade(0.02))
+		other.close()
+		with self.assertRaises(TSVZ.StoreBusyError):  # `mine` is still shared
+			TSVZ._PartHandle(path, write=True, exclusive=True, timeout=0.02).close()
+		self.assertTrue(mine.upgrade(0.02))
+		mine.downgrade()
+
+	def test_a_read_only_handle_cannot_upgrade(self):
+		with self.assertRaises(PermissionError):
+			self.hold(self.part()).upgrade(0)
+
+	def test_readers_do_not_block_each_other_or_appends(self):
+		path = self.part()
+		self.hold(path)
+		self.hold(path)
+		TSVZ.append_records(path, [['c', '3']])
+		self.assertEqual(TSVZ.read_store(path)['c'], ['c', '3'])
+
+	def test_walstore_clear_falls_back_to_tombstones_when_busy(self):
+		path = self.part()
+		db = TSVZ.WalStore(path, flush_interval=600, lock_timeout=0.05)
+		try:
+			other = self.hold(path)
+			TSVZ.append_records(path, [['z', 'written elsewhere']])
+			db.clear()
+			db.flush()
+			self.assertEqual(dict(db), {})
+			self.assertEqual(dict(TSVZ.read_store(path)), {})
+			self.assertIn('a\t2', read_text(path))  # appended to, not truncated
+			other.close()
+			db.clear()  # now exclusive: truncates
+			self.assertNotIn('a\t2', read_text(path))
+		finally:
+			db.close()
+		self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_offsetstore_clear_falls_back_to_tombstones_when_busy(self):
+		path = self.part()
+		s = TSVZ.OffsetStore(path, lock_timeout=0.05)
+		try:
+			self.hold(path)
+			s.clear()
+			self.assertEqual(len(s), 0)
+		finally:
+			s.close()
+		self.assertIn('a\t2', read_text(path))
+		self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_hardmap_appends_the_dump_when_busy(self):
+		path = self.part()
+		with warnings.catch_warnings():
+			warnings.simplefilter('ignore', DeprecationWarning)
+			db = TSVZ.TSVZed(path, append_check_delay=600, lock_timeout=0.05)
+		try:
+			db['c'] = ['c', '3']
+			other = self.hold(path)
+			TSVZ.append_records(path, [['ghost', '1']])
+			self.assertFalse(db.hardMapToFile())
+			# The in-memory store is authoritative: the external key is gone.
+			self.assertEqual(dict(TSVZ.read_store(path)), dict(db))
+			size = os.path.getsize(path)
+			self.assertFalse(db.hardMapToFile())
+			self.assertEqual(os.path.getsize(path), size)  # already agrees: no-op
+			other.close()
+			self.assertTrue(db.hardMapToFile())
+			self.assertEqual(read_text(path).count('a\t'), 1)
+		finally:
+			db.close()
+		self.assertEqual(dict(TSVZ.read_store(path)),
+						 {'a': ['a', '2'], 'c': ['c', '3']})
+
+	def test_rewrite_on_exit_while_busy_still_persists_everything(self):
+		path = self.part()
+		with warnings.catch_warnings():
+			warnings.simplefilter('ignore', DeprecationWarning)
+			db = TSVZ.TSVZed(path, rewrite_on_exit=True, append_check_delay=600,
+							 lock_timeout=0.05)
+		db['c'] = ['c', '3']
+		self.hold(path)
+		db.close()
+		self.assertEqual(dict(TSVZ.read_store(path)),
+						 {'a': ['a', '2'], 'c': ['c', '3']})
+
+	def test_cli_clear_and_scrub_report_a_busy_store(self):
+		path = self.part()
+		text = read_text(path)
+		holder = self.hold(path)
+		for op in ('clear', 'scrub'):
+			with self.subTest(op):
+				r = _tsvz_cli(path, op, '--lock-timeout', '0.1')
+				self.assertEqual(r.returncode, 1)
+				self.assertIn('still open', r.stderr)
+				self.assertEqual(read_text(path), text)
+		holder.close()
+		self.assertEqual(_tsvz_cli(path, 'clear').returncode, 0)
+		self.assertEqual(dict(TSVZ.read_store(path)), {})
+
+	def test_offset_store_is_protected_from_a_concurrent_scrub(self):
+		# Before §18 locking, `tsvz scrub` replaced the file under an open
+		# store, and the store's later writes went to the orphaned inode.
+		path = self.part()
+		s = TSVZ.OffsetStore(path)
+		try:
+			self.assertEqual(_tsvz_cli(path, 'scrub', '--lock-timeout', '0.1').returncode, 1)
+			s['x'] = ['x', 'after scrub']
+		finally:
+			s.close()
+		self.assertEqual(TSVZ.read_store(path)['x'], ['x', 'after scrub'])
+
+	def test_no_write_is_lost_to_a_scrubbing_process(self):
+		import subprocess
+		path = self.part()
+		here = os.path.dirname(os.path.abspath(__file__))
+		scrubber = subprocess.Popen([sys.executable, '-c', (
+			f'import sys, time; sys.path.insert(0, {here!r}); import TSVZ\n'
+			'end = time.time() + 1.0\n'
+			'while time.time() < end:\n'
+			'    try:\n'
+			f'        TSVZ.snapshot_part({path!r}, lock_timeout=0.01)\n'
+			'    except TSVZ.StoreBusyError:\n'
+			'        pass\n')])
+		written = 0
+		with TSVZ.WalStore(path, flush_interval=0.001) as db:
+			end = time.monotonic() + 1.0
+			while time.monotonic() < end:
+				db[f'k{written}'] = [f'k{written}', 'v']
+				written += 1
+				if written % 200 == 0:
+					time.sleep(0.001)
+		scrubber.wait()
+		keys = [k for k in TSVZ.read_store(path) if k.startswith('k')]
+		self.assertEqual(len(keys), written)
+
+
+class TestPromotion(_ScratchDir):
+	"""(b): snapshotting a single unnumbered file makes it a multi-part store."""
+
+	def single(self, name='p.tsvz', mode=0o640):
+		return self.part(name, mode=mode)
+
+	def test_snapshot_store_promotes_a_single_file(self):
+		base = self.single()
+		before = dict(TSVZ.read_store(base))
+		res = TSVZ.snapshot_store(base)
+		self.assertIsNotNone(TSVZ.parse_part_name(res.path))
+		self.assertEqual(res.subsumed, [base])
+		self.assertEqual(res.rotate_action, 'keep')
+		self.assertTrue(os.path.isfile(base), 'keep leaves the file as part 0')
+		self.assertEqual(TSVZ.store_part_paths(base), [base, res.path])
+		self.assertEqual(dict(TSVZ.read_multipart(base)), before)
+		self.assertEqual(os.stat(res.path).st_mode & 0o777, 0o640)
+
+	def test_rotate_rename_and_delete_part_zero(self):
+		base = self.single()
+		before = dict(TSVZ.read_store(base))
+		TSVZ.snapshot_store(base, rotate='rename')
+		self.assertFalse(os.path.exists(base))
+		self.assertTrue(os.path.isfile(TSVZ.part_path(base, '0', rotated=True)))
+		self.assertEqual(dict(TSVZ.read_multipart(base)), before)
+		other = self.single('q.tsvz')
+		TSVZ.snapshot_store(other, rotate='delete', allow_delete=True)
+		self.assertEqual([n for n in os.listdir(self.dir) if n.startswith('q.tsvz')
+						  and TSVZ.parse_part_name(os.path.join(self.dir, n)) is None], [])
+
+	def test_a_promoted_store_is_used_as_multipart(self):
+		base = self.single()
+		TSVZ.snapshot_store(base)
+		part0 = read_text(base)
+		with TSVZ.WalStore(base, flush_interval=0.001) as db:
+			self.assertTrue(db.multipart)
+			db['c'] = ['c', '3']
+		TSVZ.append_records(base, [['d', '4']])
+		self.assertEqual(read_text(base), part0, 'part 0 is never appended to')
+		data = TSVZ.read_store(base)  # the whole store, not just part 0
+		self.assertEqual((data['c'], data['d']), (['c', '3'], ['d', '4']))
+		for part in TSVZ.store_part_paths(base):
+			self.assertEqual(os.stat(part).st_mode & 0o777, 0o640, part)
+		with self.assertRaises(ValueError):
+			TSVZ.OffsetStore(base)
+		with self.assertRaises(ValueError):
+			TSVZ.truncate_part(base)
+
+	def test_promotion_needs_exclusive_access(self):
+		base = self.single()
+		self.hold(base)
+		with self.assertRaises(TSVZ.StoreBusyError):
+			TSVZ.snapshot_store(base, lock_timeout=0.05)
+		self.assertEqual(TSVZ.store_parts(base), [])
+
+	def test_compressed_single_file_promotes(self):
+		base = os.path.join(self.dir, 'z.tsvz.gz')
+		TSVZ.append_records(base, [['a', '1'], ['a', '2']], create=True)
+		res = TSVZ.snapshot_store(base)
+		self.assertTrue(res.path.endswith('.gz'))
+		self.assertEqual(TSVZ.store_part_paths(base), [base, res.path])
+		self.assertEqual(dict(TSVZ.read_multipart(base)), {'a': ['a', '2']})
+
+	def test_quiesce_refuses_a_live_writer(self):
+		base = os.path.join(self.dir, 'm.tsvz')
+		TSVZ.append_records(TSVZ.part_path(base, TSVZ.new_ordinal()), [['a', '1']],
+							create=True)
+		db = TSVZ.WalStore(base, multipart=True, flush_interval=600)
+		try:
+			with self.assertRaises(TSVZ.StoreBusyError):
+				TSVZ.snapshot_store(base, quiesce=True, lock_timeout=0.05)
+		finally:
+			db.close()
+		self.assertIsNotNone(TSVZ.snapshot_store(base, quiesce=True))
+
+	def test_new_parts_inherit_access_instead_of_0600(self):
+		base = os.path.join(self.dir, 'n.tsvz')
+		first = TSVZ.part_path(base, TSVZ.new_ordinal())
+		TSVZ.append_records(first, [['a', '1']], create=True)
+		os.chmod(first, 0o664)
+		with TSVZ.WalStore(base, multipart=True, flush_interval=0.001) as db:
+			active = db.path
+			db['b'] = ['b', '2']
+		self.assertEqual(os.stat(active).st_mode & 0o777, 0o664)
+		res = TSVZ.snapshot_store(base)
+		self.assertEqual(os.stat(res.path).st_mode & 0o777, 0o664)
+
+	def test_cli_scrub_keeps_a_single_file_single(self):
+		base = self.single()
+		before = _identity(base)
+		self.assertEqual(_tsvz_cli(base, 'scrub').returncode, 0)
+		self.assertEqual(_identity(base), before)
+		self.assertEqual(TSVZ.store_parts(base), [])
 
 
 if __name__ == '__main__':

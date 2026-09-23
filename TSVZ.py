@@ -51,15 +51,20 @@ Implemented
 - §16 — transparent compression for ``.gz`` / ``.bz2`` / ``.xz`` / ``.zst``
   (``.zst`` requires Python 3.14+; it never degrades to plaintext)
 - §17 — multi-part stores: the Appendix A filename grammar, hexadecimal
-  ordinal ordering, ``.rotated`` exclusion, UUIDv7 ordinals, and replay of
-  the parts as one concatenation (:func:`read_multipart`, ``WalStore(
-  multipart=True)``)
-- §18 — batched whole-record appends under an exclusive lock (§18.2–§18.3);
-  ``#_write_ack_#`` selects per-batch fsync (§18.4)
-- §19 — both forms of compaction: :func:`snapshot_part` rewrites a single
-  file atomically, and :func:`snapshot_store` performs the full race-free
-  procedure (immutable prefix, ordinal slotting between prefix and active
-  part, §19.4 compensation, and the §19.5 ``#_rotate_#`` actions)
+  ordinal ordering, ``.rotated`` exclusion, UUIDv7 ordinals, an unnumbered
+  file beside numbered parts as part 0, and replay of the parts as one
+  concatenation (:func:`read_multipart`, ``WalStore(multipart=True)``)
+- §18 — batched whole-record appends under the append lock (§18.2–§18.3);
+  ``#_write_ack_#`` selects per-batch fsync (§18.4); a shared access lock
+  held by every open handle, taken exclusively for in-place maintenance
+  (§18.6); parts are never replaced (§18.7); busy maintenance fails with
+  :class:`StoreBusyError` or falls back to appends (§18.8)
+- §19 — compaction in both forms: :func:`snapshot_store` performs the full
+  race-free procedure (immutable prefix, ordinal slotting between prefix and
+  active part, §19.4 compensation, the §19.5 ``#_rotate_#`` actions, and
+  §19.9 promotion of a single file), and :func:`snapshot_part` /
+  :func:`truncate_part` compact or clear one part in place under exclusive
+  access (§19.8)
 - Stores — :class:`WalStore` (asynchronous append) and :class:`OffsetStore`
   (key→byte-offset index; uncompressed, single-part)
 
@@ -97,6 +102,11 @@ Known deviations
   *value* is preserved exactly; a row narrower than the marker gains
   explicitly-empty trailing cells, which §3.6 permits since a reconstructed
   row has no guaranteed width.
+- §18.6 locks are Linux open-file-description locks. Elsewhere they fall
+  back to POSIX ``lockf()``, which the kernel releases when the process
+  closes *any* descriptor for the file: opening a store with plain ``open()``
+  while a TSVZ handle has it open weakens exclusivity in that process. The
+  access lock is not enforced on Windows.
 
 Examples:
 	>>> import os, tempfile
@@ -111,6 +121,7 @@ Examples:
 """
 import atexit
 import contextlib
+import errno
 import functools
 import hashlib
 import io
@@ -118,8 +129,8 @@ import os
 import re
 import secrets
 import stat
+import struct
 import sys
-import tempfile
 import threading
 import time
 import warnings
@@ -201,6 +212,8 @@ __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorte
 	'open_part', 'delimiter_for_path', 'is_strict_store', 'is_compressed_path',
 	# Stores and state
 	'WalStore', 'OffsetStore', 'ReaderState', 'StoreEntry',
+	# §18 locking
+	'StoreBusyError', 'DEFAULT_LOCK_TIMEOUT',
 	# Constants
 	'DEFAULT_DELIMITER', 'MARKER_DEFAULTS', 'MARKER_WRITE_ACK', 'MAX_SPEC_VERSION',
 	'OFFICIAL_MARKERS', 'STRICT_EXTENSIONS', 'COMPRESSION_EXTENSIONS',
@@ -677,8 +690,9 @@ def append_checksum(path, algo, *, encoding='utf8', delimiter=None, preceding=No
 	key = checksum_marker_key(algo)
 	line = format_marker_line(key, [value], delimiter) if value else key
 	_warn_loose_extension(path, [line], delimiter)
-	with open_part(path, 'ab', encoding=encoding) as f:
-		f.write((line + '\n').encode(encoding, errors='replace'))
+	ensure_part_exists(path, create=True, encoding=encoding, delimiter=delimiter)
+	with _PartHandle(path, write=True) as handle, handle.append_lock():
+		handle.append((line + '\n').encode(encoding, errors='replace'))
 	return value
 
 
@@ -1235,15 +1249,25 @@ def replay_part(path, delimiter, *, encoding='utf8', store=None,
 	if state is None:
 		state = ReaderState()
 	try:
-		with open_part(path, 'rb', encoding=encoding) as f:
-			for offset, line, raw in _iter_records(f, encoding, errors=errors, source=path):
-				process_record(
-					line, state, store, delimiter, offset=offset,
-					store_offset=store_offset, values_cache=values_cache,
-					bound_states=bound_states, digests=digests, raw_bytes=raw,
-				)
+		handle = _PartHandle(path)  # shared: waits out an in-place rewrite
 	except FileNotFoundError:
 		return store, state
+	with handle, handle.stream() as f:
+		_replay_stream(f, path, delimiter, encoding=encoding, store=store, state=state,
+					   store_offset=store_offset, values_cache=values_cache,
+					   bound_states=bound_states, errors=errors, digests=digests)
+	return store, state
+
+
+def _replay_stream(f, path, delimiter, *, encoding, store, state, store_offset=False,
+				   values_cache=None, bound_states=None, errors='replace', digests=None):
+	"""Replay the committed records of an open, decompressed part stream."""
+	for offset, line, raw in _iter_records(f, encoding, errors=errors, source=path):
+		process_record(
+			line, state, store, delimiter, offset=offset,
+			store_offset=store_offset, values_cache=values_cache,
+			bound_states=bound_states, digests=digests, raw_bytes=raw,
+		)
 	return store, state
 
 
@@ -1765,6 +1789,10 @@ def store_parts(store_path, *, include_rotated=False):
 			accepted too and normalized back to its store.
 		include_rotated: If True, also return ``.rotated`` parts.
 
+	An unnumbered file beside numbered parts is **part 0** (§17.1): it orders
+	before every numbered part. That is the shape a single-file store takes
+	once :func:`snapshot_store` promotes it to a multi-part store.
+
 	Returns:
 		list[PartName]: Parts in ascending ordinal order. Empty when the store
 		is a single unnumbered file or does not exist.
@@ -1772,6 +1800,8 @@ def store_parts(store_path, *, include_rotated=False):
 	parsed = parse_part_name(store_path)
 	if parsed is not None:
 		store_path = f'{parsed.store_path}.{parsed.format_ext}'
+	else:
+		store_path = store_path[:len(store_path) - len(_compression_suffix(store_path))]
 	directory = os.path.dirname(store_path) or '.'
 	base = os.path.basename(store_path)
 	try:
@@ -1779,9 +1809,13 @@ def store_parts(store_path, *, include_rotated=False):
 	except (FileNotFoundError, NotADirectoryError):
 		return []
 	found = []
+	unnumbered = []
 	for name in names:
 		candidate = parse_part_name(os.path.join(directory, name))
 		if candidate is None:
+			if name == base or (name.startswith(base + '.')
+								and _compression_suffix(name) == name[len(base):]):
+				unnumbered.append(os.path.join(directory, name))
 			continue
 		if os.path.basename(f'{candidate.store_path}.{candidate.format_ext}') != base:
 			continue
@@ -1790,14 +1824,52 @@ def store_parts(store_path, *, include_rotated=False):
 		found.append(candidate)
 	# §17.3: integer ordering; path breaks ties so the result is deterministic.
 	found.sort(key=lambda pn: (pn.ordinal_value, pn.path))
+	if found:
+		found[:0] = [_part_zero(path) for path in sorted(unnumbered)
+					 if os.path.isfile(path)]
 	return found
+
+
+def _part_zero(path):
+	"""Describe the unnumbered file ``path`` as part 0 of its store (§17.1)."""
+	codec = _compression_suffix(path).lstrip('.')
+	match = re.match(r'^(?P<store>.+)\.(?P<ext>[A-Za-z]+)$',
+					 path[:len(path) - len(codec) - 1] if codec else path)
+	store, ext = (match.group('store'), match.group('ext')) if match else (path, '')
+	return PartName(path=path, store_path=store, format_ext=ext, ordinal='0',
+					ordinal_value=0, rotated=False, codec=codec)
+
+
+def _is_part_zero(part):
+	"""True when ``part`` is the unnumbered file of a multi-part store."""
+	return parse_part_name(part.path) is None
+
+
+def _promoted_parts(path):
+	"""Numbered parts beside the unnumbered file ``path``, or ``[]``.
+
+	Non-empty means ``path`` is no longer a whole store but part 0 of a
+	multi-part one (§17.1), so writing to it would land before newer parts.
+	"""
+	if parse_part_name(path) is not None:
+		return []
+	return store_parts(path)
+
+
+def _reject_promoted(path, what):
+	"""Raise if ``path`` is part 0 of a promoted store, which ``what`` can't handle."""
+	if _promoted_parts(path):
+		raise ValueError(
+			f'{path!r} is part 0 of a multi-part store (§17.1): {what} cannot '
+			f'address the whole store. Use read_multipart() or WalStore instead.')
 
 
 def store_part_paths(store_path, *, include_rotated=False):
 	"""Return the paths making up a store, in replay order.
 
 	Falls back to ``[store_path]`` for the single-file case of §17.1 when no
-	numbered parts exist.
+	numbered parts exist. An unnumbered file beside numbered parts comes first,
+	as part 0.
 
 	Args:
 		store_path: Store path including its format extension.
@@ -1808,11 +1880,6 @@ def store_part_paths(store_path, *, include_rotated=False):
 	"""
 	parts = store_parts(store_path, include_rotated=include_rotated)
 	if parts:
-		if os.path.isfile(store_path):
-			warnings.warn(
-				f'{store_path!r} exists alongside numbered parts; the numbered '
-				f'parts are the store (§17.1) and the unnumbered file is ignored.',
-				UserWarning, stacklevel=2)
 		return [pn.path for pn in parts]
 	return [store_path] if os.path.isfile(store_path) else []
 
@@ -1943,26 +2010,497 @@ def open_part(path, mode='rb', *, encoding='utf8', compress_level=1):
 		import bz2
 		return bz2.open(path, mode, **({'compresslevel': compress_level} if writing else {}), **kwargs)
 	if lower.endswith(('.zst', '.zstd')):
-		try:
-			from compression import zstd
-		except ImportError:
-			try:
-				import zstandard  # noqa: F401  # third-party fallback probe
-			except ImportError:
-				raise ImportError(
-					f'zstd support is unavailable for {path!r}: needs Python 3.14+ '
-					f'(compression.zstd). Refusing to fall back to plaintext.',
-				) from None
-			raise ImportError(
-				f'zstd support for {path!r} requires the stdlib compression.zstd '
-				f'module (Python 3.14+); the third-party zstandard package is not used.',
-			) from None
+		zstd = _zstd_module(path)
 		return zstd.open(path, mode, **({'level': compress_level} if writing else {}), **kwargs)
 	# Uncompressed: builtins.open needs no explicit 't', and 'b' is already
 	# present in every mode that reaches here without one having been added.
 	if 't' in mode:
 		return open(path, mode.replace('t', ''), encoding=encoding)
 	return open(path, mode)
+
+
+def _zstd_module(path):
+	"""Return the stdlib ``compression.zstd`` module, or raise for ``path``.
+
+	§16 forbids degrading to plaintext, so a missing codec is an error.
+	"""
+	try:
+		from compression import zstd
+	except ImportError:
+		try:
+			import zstandard  # noqa: F401  # third-party fallback probe
+		except ImportError:
+			raise ImportError(
+				f'zstd support is unavailable for {path!r}: needs Python 3.14+ '
+				f'(compression.zstd). Refusing to fall back to plaintext.',
+			) from None
+		raise ImportError(
+			f'zstd support for {path!r} requires the stdlib compression.zstd '
+			f'module (Python 3.14+); the third-party zstandard package is not used.',
+		) from None
+	return zstd
+
+
+def _codec_of(path):
+	"""Return the canonical §16 codec for ``path``: gz, bz2, xz, zst, or ''.
+
+	Examples:
+		>>> _codec_of('s.tsvz.GZIP'), _codec_of('s.tsvz.lzma'), _codec_of('s.tsvz')
+		('gz', 'xz', '')
+	"""
+	ext = _compression_suffix(path).lstrip('.').lower()
+	return {'gzip': 'gz', 'bzip2': 'bz2', 'lzma': 'xz', 'zstd': 'zst'}.get(ext, ext)
+
+
+def _compress(data, codec, path, level=1):
+	"""Encode ``data`` as one complete ``codec`` stream (a gzip member, …).
+
+	Concatenated streams decode as one (§16.4), so an append is simply one more
+	stream written after the existing ones.
+	"""
+	if codec == 'gz':
+		import gzip
+		return gzip.compress(data, compresslevel=level)
+	if codec == 'bz2':
+		import bz2
+		return bz2.compress(data, compresslevel=level)
+	if codec == 'xz':
+		import lzma
+		return lzma.compress(data, preset=level)
+	if codec == 'zst':
+		return _zstd_module(path).compress(data, level=level)
+	return data
+
+
+def _decoding_reader(stream, codec, path):
+	"""Wrap a binary ``stream`` so reads return decompressed bytes."""
+	if codec == 'gz':
+		import gzip
+		return gzip.GzipFile(fileobj=stream, mode='rb')
+	if codec == 'bz2':
+		import bz2
+		return bz2.BZ2File(stream, 'rb')
+	if codec == 'xz':
+		import lzma
+		return lzma.LZMAFile(stream, 'rb')
+	if codec == 'zst':
+		return _zstd_module(path).ZstdFile(stream, 'rb')
+	return stream
+
+
+# ---------------------------------------------------------------------------
+# §18 advisory locking and in-place part I/O
+# ---------------------------------------------------------------------------
+
+#: Seconds that maintenance -- clear, scrub, ``hardMapToFile``, promotion --
+#: waits for exclusive access to a part before giving up.
+DEFAULT_LOCK_TIMEOUT = 10.0
+
+# Each part carries two independent advisory locks, as one-byte fcntl ranges.
+# The offsets are lock identities, not data: advisory locks never block I/O.
+_ACCESS_LOCK_BYTE = 0   # shared while a part is open; exclusive for maintenance
+_APPEND_LOCK_BYTE = 1   # exclusive around each batch append
+_LOCK_POLL_MAX = 0.05
+# Windows locks are mandatory -- they block I/O on the locked bytes -- so the
+# append lock sits far past any ordinary part's data instead of at byte 1.
+_NT_APPEND_LOCK_OFFSET = 2 ** 31 - 2
+
+# Open-file-description locks (Linux 3.15+) belong to the open file, not the
+# process: closing some other descriptor of the same file does not drop them,
+# and two handles in one process conflict exactly like two processes. POSIX
+# lockf() has neither property, so it is only the fallback.
+_F_OFD_SETLK = None
+if os.name == 'posix':
+	_F_OFD_SETLK = getattr(fcntl, 'F_OFD_SETLK',
+						   37 if sys.platform.startswith('linux') else None)
+_ofd_supported = _F_OFD_SETLK is not None
+_lock_warned = False
+
+# Handles open in this process, keyed by (st_dev, st_ino). Only consulted in
+# the lockf() fallback, where the kernel cannot tell same-process handles apart.
+# Reentrant: a handle's __del__ may run from garbage collection while this
+# thread is already inside a locked section.
+_handles_lock = threading.RLock()
+_open_handles = {}
+_append_mutexes = {}
+
+
+class StoreBusyError(TimeoutError):
+	"""Exclusive access to a part could not be obtained within the timeout.
+
+	Maintenance that truncates or rewrites a part in place needs every other
+	handle -- in this process or any other -- to have closed it first (§18).
+	"""
+
+
+def _try_lock(fd, kind, byte):
+	"""Make one non-blocking attempt at a lock; ``kind`` is sh, ex, or un.
+
+	Returns:
+		bool: True if the lock is now held (or released), False if another
+		handle holds a conflicting one.
+	"""
+	global _ofd_supported
+	if os.name == 'nt':
+		return _try_lock_nt(fd, kind, byte)
+	if os.name != 'posix':
+		return True
+	if _ofd_supported:
+		l_type = {'sh': fcntl.F_RDLCK, 'ex': fcntl.F_WRLCK, 'un': fcntl.F_UNLCK}[kind]
+		try:
+			fcntl.fcntl(fd, _F_OFD_SETLK,
+						struct.pack('hhqqi', l_type, os.SEEK_SET, byte, 1, 0))
+			return True
+		except OSError as exc:
+			if exc.errno in (errno.EAGAIN, errno.EACCES):
+				return False
+			if exc.errno != errno.EINVAL:
+				if exc.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+					return _locking_unavailable(exc)
+				raise
+			_ofd_supported = False  # kernel predates OFD locks: use lockf()
+	cmd = {'sh': fcntl.LOCK_SH, 'ex': fcntl.LOCK_EX, 'un': fcntl.LOCK_UN}[kind]
+	try:
+		fcntl.lockf(fd, cmd if kind == 'un' else cmd | fcntl.LOCK_NB, 1, byte, os.SEEK_SET)
+		return True
+	except OSError as exc:
+		if exc.errno in (errno.EAGAIN, errno.EACCES):
+			return False
+		if exc.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+			return _locking_unavailable(exc)
+		raise
+
+
+def _try_lock_nt(fd, kind, byte):
+	"""Windows: only the append lock exists (msvcrt has no shared locks)."""
+	if byte != _APPEND_LOCK_BYTE:
+		return True
+	position = os.lseek(fd, 0, os.SEEK_CUR)
+	os.lseek(fd, _NT_APPEND_LOCK_OFFSET, os.SEEK_SET)
+	try:
+		msvcrt.locking(fd, msvcrt.LK_UNLCK if kind == 'un' else msvcrt.LK_NBLCK, 1)
+		return True
+	except OSError:
+		return kind == 'un'
+	finally:
+		os.lseek(fd, position, os.SEEK_SET)
+
+
+def _locking_unavailable(exc):
+	"""Proceed unlocked on a filesystem without advisory locks, warning once."""
+	global _lock_warned
+	if not _lock_warned:
+		_lock_warned = True
+		warnings.warn(f'TSVZ: advisory file locking is unavailable ({exc}); '
+					  f'exclusive access to parts cannot be enforced.',
+					  RuntimeWarning, stacklevel=3)
+	return True
+
+
+def _acquire(fd, kind, byte, timeout):
+	"""Take a lock, waiting up to ``timeout`` seconds (``None``: forever).
+
+	Returns:
+		bool: True once held, False if ``timeout`` expired first.
+	"""
+	if _try_lock(fd, kind, byte):
+		return True
+	if timeout is not None and timeout <= 0:
+		return False
+	deadline = None if timeout is None else time.monotonic() + timeout
+	delay = 0.001
+	while True:
+		pause = delay if deadline is None else min(delay, deadline - time.monotonic())
+		if pause > 0:
+			time.sleep(pause)
+		if _try_lock(fd, kind, byte):
+			return True
+		if deadline is not None and time.monotonic() >= deadline:
+			return False
+		delay = min(delay * 2, _LOCK_POLL_MAX)
+
+
+def _write_all(fd, data):
+	"""``os.write`` until every byte of ``data`` is written."""
+	view = memoryview(data)
+	while view:
+		view = view[os.write(fd, view):]
+
+
+def _fsync_dir(path):
+	"""Durably record a directory entry change for ``path`` (best effort)."""
+	with contextlib.suppress(OSError):
+		dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+		try:
+			os.fsync(dir_fd)
+		finally:
+			os.close(dir_fd)
+
+
+class _PartHandle:
+	"""One open part plus the §18 advisory locks held through it.
+
+	Every access to a part goes through a handle holding the *access* lock:
+	shared while the part is merely open, exclusive while it is truncated or
+	rewritten in place. Exclusive therefore means that no other handle, in this
+	process or any other, has the part open. Appends also take the *append*
+	lock for the duration of one batch, so concurrent writers never interleave.
+
+	A part is never replaced by renaming another file over it. In-place
+	rewrites keep the inode, so its mode, owner, ACLs, extended attributes,
+	hard links, and every other handle's view of the file stay intact.
+
+	Without OFD locks the POSIX ``lockf()`` fallback applies, and closing any
+	descriptor for the file drops this process's locks on it; closes made
+	through a handle restore the others' locks, a plain ``open()`` elsewhere in
+	the process does not. On Windows only the append lock exists; the access
+	lock is not enforced there.
+
+	Args:
+		path: Filesystem path of an existing part.
+		write: Open read-write when permitted; otherwise read-only.
+		exclusive: Take the access lock exclusively instead of shared.
+		timeout: Seconds to wait for the access lock; ``None`` waits forever.
+
+	Raises:
+		StoreBusyError: If the access lock was not obtained within ``timeout``.
+	"""
+
+	def __init__(self, path, *, write=False, exclusive=False, timeout=None):
+		self.path = path
+		self.codec = _codec_of(path)
+		flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
+		self.writable = False
+		if write:
+			try:
+				self.fd = os.open(path, os.O_RDWR | flags)
+				self.writable = True
+			except PermissionError:
+				if exclusive:
+					raise
+				self.fd = os.open(path, os.O_RDONLY | flags)
+		else:
+			self.fd = os.open(path, os.O_RDONLY | flags)
+		self.access = None
+		info = os.fstat(self.fd)
+		self._key = (info.st_dev, info.st_ino)
+		try:
+			kind = 'ex' if exclusive else 'sh'
+			if not self._take_access(kind, timeout):
+				raise StoreBusyError(
+					f'could not get exclusive access to {path!r} within {timeout}s: '
+					f'another handle still has it open')
+		except BaseException:
+			fd, self.fd = self.fd, None  # __del__ must not close a reused number
+			os.close(fd)
+			raise
+
+	def _peers(self):
+		return [h for h in _open_handles.get(self._key, ()) if h is not self]
+
+	def _take_access(self, kind, timeout):
+		"""Acquire (or convert) the access lock and register the handle.
+
+		A failed conversion leaves the lock already held unchanged.
+		"""
+		deadline = None if timeout is None else time.monotonic() + timeout
+		delay = 0.001
+		while True:
+			with _handles_lock:
+				# The lockf() fallback cannot see same-process handles, so
+				# conflicts among them are resolved here instead.
+				peers = [] if _ofd_supported else self._peers()
+				clash = any(p.access == 'ex' for p in peers) or (kind == 'ex' and peers)
+				if not clash and _try_lock(self.fd, kind, _ACCESS_LOCK_BYTE):
+					self.access = kind
+					registered = _open_handles.setdefault(self._key, [])
+					if self not in registered:
+						registered.append(self)
+					return True
+			remaining = None if deadline is None else deadline - time.monotonic()
+			if remaining is not None and remaining <= 0:
+				return False
+			time.sleep(delay if remaining is None else min(delay, remaining))
+			delay = min(delay * 2, _LOCK_POLL_MAX)
+
+	def upgrade(self, timeout):
+		"""Convert shared access to exclusive, waiting up to ``timeout``.
+
+		A failed conversion leaves the shared lock in place.
+
+		Returns:
+			bool: True if exclusive access is now held.
+
+		Raises:
+			PermissionError: If the part is open read-only; exclusive access
+				exists only to modify it.
+		"""
+		if self.access == 'ex':
+			return True
+		self._require_writable()
+		return self._take_access('ex', timeout)
+
+	def downgrade(self):
+		"""Convert exclusive access back to shared (never blocks)."""
+		if self.access == 'ex':
+			with _handles_lock:
+				_try_lock(self.fd, 'sh', _ACCESS_LOCK_BYTE)
+				self.access = 'sh'
+
+	@contextlib.contextmanager
+	def append_lock(self):
+		"""Hold the append lock for one batch."""
+		with _handles_lock:
+			mutex = _append_mutexes.setdefault(self._key, threading.Lock())
+		# lockf() does not exclude handles of the same process; the mutex does.
+		with contextlib.ExitStack() as held:
+			if not _ofd_supported:
+				held.enter_context(mutex)
+			_acquire(self.fd, 'ex', _APPEND_LOCK_BYTE, None)
+			try:
+				yield self
+			finally:
+				_try_lock(self.fd, 'un', _APPEND_LOCK_BYTE)
+
+	@contextlib.contextmanager
+	def stream(self):
+		"""Yield a decompressing binary reader over the whole part."""
+		raw = io.FileIO(self.fd, 'r', closefd=False)
+		raw.seek(0)
+		buffered = io.BufferedReader(raw)
+		reader = _decoding_reader(buffered, self.codec, self.path)
+		try:
+			yield reader
+		finally:
+			if reader is not buffered:
+				reader.close()
+			buffered.close()
+
+	def _require_writable(self):
+		if not self.writable:
+			raise PermissionError(errno.EACCES, 'part is not writable', self.path)
+
+	def append(self, payload, *, fsync=False):
+		"""Append encoded records at end of file; the caller holds the append lock."""
+		self._require_writable()
+		if not payload:
+			return
+		os.lseek(self.fd, 0, os.SEEK_END)
+		_write_all(self.fd, _compress(payload, self.codec, self.path))
+		if fsync:
+			os.fsync(self.fd)
+
+	def rewrite(self, payload):
+		"""Replace the part's contents in place; requires exclusive access.
+
+		The new contents are written over the old from offset 0, then the file
+		is truncated to their length and fsynced -- the same inode throughout.
+		Space for a larger result is reserved first where the filesystem
+		supports it, so running out of space fails before anything changes.
+		"""
+		self._require_writable()
+		if self.access != 'ex':
+			raise RuntimeError(f'rewriting {self.path!r} needs exclusive access')
+		data = _compress(payload, self.codec, self.path)
+		if len(data) > os.fstat(self.fd).st_size and hasattr(os, 'posix_fallocate'):
+			try:
+				os.posix_fallocate(self.fd, 0, len(data))
+			except OSError as exc:
+				if exc.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS):
+					raise
+		os.lseek(self.fd, 0, os.SEEK_SET)
+		_write_all(self.fd, data)
+		os.ftruncate(self.fd, len(data))
+		os.fsync(self.fd)
+
+	def close(self):
+		"""Close the descriptor, releasing both locks."""
+		if self.fd is None:
+			return
+		fd, self.fd = self.fd, None
+		with _handles_lock:
+			peers = _open_handles.get(self._key, [])
+			if self in peers:
+				peers.remove(self)
+			if not peers:
+				_open_handles.pop(self._key, None)
+				_append_mutexes.pop(self._key, None)
+			os.close(fd)
+			if not _ofd_supported:
+				# Closing any descriptor drops every lockf() lock this process
+				# holds on the file; restore the ones the other handles own.
+				for peer in peers:
+					if peer.fd is not None and peer.access:
+						_try_lock(peer.fd, peer.access, _ACCESS_LOCK_BYTE)
+		self.access = None
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		self.close()
+
+	def __del__(self):
+		with contextlib.suppress(Exception):
+			self.close()
+
+
+def _inherit_metadata(source, target):
+	"""Copy ``source``'s owner, group, mode, ACLs, and xattrs onto ``target``.
+
+	Used for parts TSVZ creates on a store's behalf, so a new part is exactly
+	as accessible as the part it continues. Best effort: changing the owner
+	needs privilege, and a filesystem may refuse some attributes. Timestamps
+	are left alone -- the new part really is new.
+	"""
+	try:
+		info = os.stat(source)
+	except OSError:
+		return
+	if hasattr(os, 'chown'):
+		try:
+			os.chown(target, info.st_uid, info.st_gid)
+		except OSError:
+			with contextlib.suppress(OSError):
+				os.chown(target, -1, info.st_gid)  # group alone needs membership only
+	with contextlib.suppress(OSError):
+		os.chmod(target, stat.S_IMODE(info.st_mode))
+	if hasattr(os, 'listxattr'):
+		try:
+			names = os.listxattr(source)
+		except OSError:
+			names = []
+		# Last, so a POSIX ACL (system.posix_acl_access) is not undone by chmod.
+		for name in names:
+			with contextlib.suppress(OSError):
+				os.setxattr(target, name, os.getxattr(source, name))
+
+
+def _create_part(path, payload, *, like=None):
+	"""Create a new part holding ``payload``, durably. Never replaces a file.
+
+	The part is created with ``O_EXCL`` and mode ``0o666``, so the umask and
+	any default ACL apply as for any new file; ``like`` then lends it its owner,
+	mode, ACLs, and xattrs (:func:`_inherit_metadata`).
+
+	Raises:
+		FileExistsError: If ``path`` already exists.
+	"""
+	flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_CLOEXEC', 0)
+			 | getattr(os, 'O_BINARY', 0))
+	fd = os.open(path, flags, 0o666)
+	try:
+		if like is not None:
+			_inherit_metadata(like, path)
+		_write_all(fd, _compress(payload, _codec_of(path), path))
+		os.fsync(fd)
+	except BaseException:
+		os.close(fd)
+		with contextlib.suppress(OSError):
+			os.unlink(path)
+		raise
+	os.close(fd)
+	_fsync_dir(path)
 
 
 def _parse_columns(header, delimiter):
@@ -2116,14 +2654,15 @@ def read_last_record(path, *, encoding='utf8', delimiter=None, store_offset=Fals
 	# row's absent columns (§14.3) are only known after replaying everything
 	# before it.
 	try:
-		with open_part(path, 'rb', encoding=encoding) as f:
-			for offset, line, _raw in _iter_records(f, encoding, source=path):
-				scratch.clear()
-				kind, entry = process_record(line, state, scratch, delimiter)
-				if kind == 'data' and entry is not None:
-					result = offset if store_offset else materialize_row(entry)
+		handle = _PartHandle(path)
 	except FileNotFoundError:
 		return empty
+	with handle, handle.stream() as f:
+		for offset, line, _raw in _iter_records(f, encoding, source=path):
+			scratch.clear()
+			kind, entry = process_record(line, state, scratch, delimiter)
+			if kind == 'data' and entry is not None:
+				result = offset if store_offset else materialize_row(entry)
 	return result
 
 
@@ -2222,6 +2761,11 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 	Raises:
 		FileNotFoundError: If the part is absent and ``create`` is False.
 
+	Note:
+		When ``path`` is the unnumbered file of a store promoted to multi-part
+		(§17.1), the whole store is read (:func:`read_multipart`), not just
+		part 0.
+
 	Examples:
 		>>> import os, tempfile
 		>>> fd, path = tempfile.mkstemp(suffix='.tsvz'); os.close(fd); os.unlink(path)
@@ -2231,6 +2775,9 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 		>>> os.unlink(path)
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
+	if not (last_record_only or store_offset) and _promoted_parts(path):
+		return read_multipart(path, encoding=encoding, delimiter=delimiter,
+							  store=store, policy=policy)
 	if last_record_only:
 		warnings.warn(
 			'read_store(last_record_only=True) is deprecated; call '
@@ -2302,6 +2849,7 @@ def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 		>>> os.unlink(path)
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
+	_reject_promoted(path, 'an offset index')
 	if store is None:
 		store = OrderedDict()
 	store, state, values_cache, digests = _replay_into(
@@ -2359,6 +2907,11 @@ def append_records(path, rows, *, create=False, encoding='utf8', delimiter=None,
 	Returns:
 		None: Rows are appended to ``path`` as a side effect.
 
+	Note:
+		When ``path`` is the unnumbered file of a store promoted to multi-part
+		(§17.1), the rows go to the store's newest part instead: appending to
+		part 0 would place them before every later part.
+
 	Examples:
 		>>> import os, tempfile
 		>>> fd, path = tempfile.mkstemp(suffix='.tsvz'); os.close(fd); os.unlink(path)
@@ -2371,6 +2924,9 @@ def append_records(path, rows, *, create=False, encoding='utf8', delimiter=None,
 		>>> os.unlink(path)
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
+	promoted = _promoted_parts(path)
+	if promoted:
+		path = promoted[-1].path
 	ensure_part_exists(
 		path, create=create, encoding=encoding, delimiter=delimiter, header=header,
 	)
@@ -2390,8 +2946,8 @@ def append_records(path, rows, *, create=False, encoding='utf8', delimiter=None,
 	if not lines:
 		return
 	_warn_loose_extension(path, lines, delimiter)
-	with open_part(path, 'ab', encoding=encoding) as f:
-		f.write(('\n'.join(lines) + '\n').encode(encoding, errors='replace'))
+	with _PartHandle(path, write=True) as handle, handle.append_lock():
+		handle.append(('\n'.join(lines) + '\n').encode(encoding, errors='replace'))
 
 
 def append_record(path, row, **kwargs):
@@ -2456,11 +3012,18 @@ def delete_record(path, key, **kwargs):
 	delete_records(path, [key], **kwargs)
 
 
-def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, defaults=None):
-	"""Replace part contents with an optional header comment and defaults marker.
+def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, defaults=None,
+				  lock_timeout=DEFAULT_LOCK_TIMEOUT):
+	"""Clear a part in place, keeping an optional header comment and defaults marker.
 
 	The file is created if it does not already exist. Existing data rows,
 	tombstones, and non-header comments are discarded.
+
+	The part is truncated **in place** under exclusive access (§18): the call
+	waits up to ``lock_timeout`` seconds for every other handle to close the
+	part, and the inode is kept -- so are its mode, owner, ACLs, extended
+	attributes, and links. To empty a part that is still in use, append
+	tombstones instead (:func:`delete_records`).
 
 	Args:
 		path: Filesystem path of the part.
@@ -2468,11 +3031,27 @@ def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, default
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
 		header: Optional column names written as a ``#`` comment.
 		defaults: Optional value-column defaults written as a marker.
+		lock_timeout: Seconds to wait for exclusive access; ``None`` waits
+			indefinitely.
 
 	Returns:
 		None: The part file is rewritten as a side effect.
+
+	Raises:
+		StoreBusyError: If another handle kept the part open past
+			``lock_timeout``.
+		ValueError: If ``path`` is part 0 of a promoted multi-part store, where
+			truncating one part would not clear the store.
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
+	_reject_promoted(path, 'truncate_part()')
+	ensure_part_exists(path, create=True, encoding=encoding, delimiter=delimiter)
+	with _PartHandle(path, write=True, exclusive=True, timeout=lock_timeout) as handle:
+		handle.rewrite(_cleared_payload(path, encoding, delimiter, header, defaults))
+
+
+def _cleared_payload(path, encoding, delimiter, header, defaults):
+	"""Bytes of a cleared part: an optional header comment, then defaults."""
 	header = _parse_columns(header, delimiter)
 	defaults = _normalize_defaults(defaults)
 	lines = []
@@ -2481,70 +3060,23 @@ def truncate_part(path, *, encoding='utf8', delimiter=None, header=None, default
 	if defaults:
 		lines.append(format_marker_line(MARKER_DEFAULTS, defaults, delimiter))
 	_warn_loose_extension(path, lines, delimiter)
-	payload = ''.join(line + '\n' for line in lines).encode(encoding, errors='replace')
-	_atomic_rewrite(path, payload, encoding=encoding)
+	return ''.join(line + '\n' for line in lines).encode(encoding, errors='replace')
 
 
-def _atomic_rewrite(path, payload, *, encoding='utf8'):
-	"""Replace ``path`` with ``payload`` atomically.
-
-	Writes a sibling temporary part, fsyncs it, then :func:`os.replace`\\ s it
-	over ``path``. Readers see either the whole old part or the whole new one,
-	never a truncated intermediate — which matters because §3.1 makes every
-	other write an append, so a half-written rewrite is the one way to lose a
-	whole store.
-
-	Args:
-		path: Destination part path.
-		payload: Complete new part contents, already encoded.
-		encoding: Text encoding forwarded to :func:`open_part`.
-
-	Returns:
-		None: ``path`` is replaced as a side effect.
-	"""
-	directory = os.path.dirname(os.path.abspath(path))
-	# mkstemp, not a PID-derived name: two threads snapshotting the same part
-	# share a PID and would otherwise clobber each other's temporary. The
-	# compression suffix is preserved so open_part picks the same codec as the
-	# destination.
-	fd, tmp = tempfile.mkstemp(dir=directory, prefix=f'.{os.path.basename(path)}.',
-							   suffix=f'.tmp{_compression_suffix(path)}')
-	os.close(fd)
-	try:
-		with open_part(tmp, 'wb', encoding=encoding) as f:
-			f.write(payload)
-			f.flush()
-		# Codec wrappers (gzip/lzma/zstd) write their footer in close(), which
-		# runs at the end of the `with`. fsync the finished file, then replace.
-		fd = os.open(tmp, os.O_RDONLY)
-		try:
-			os.fsync(fd)
-		finally:
-			os.close(fd)
-		os.replace(tmp, path)
-	except BaseException:
-		with contextlib.suppress(OSError):
-			os.unlink(tmp)
-		raise
-	with contextlib.suppress(OSError):  # durably link the new name into the dir
-		dir_fd = os.open(directory, os.O_RDONLY)
-		try:
-			os.fsync(dir_fd)
-		finally:
-			os.close(dir_fd)
-
-
-def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=None):
-	"""Materialize live state into a single part (simplified specification §19).
+def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=None,
+				  lock_timeout=DEFAULT_LOCK_TIMEOUT):
+	"""Compact one part in place (simplified specification §19).
 
 	Rewrites ``path``: superseded values, tombstones, and non-header comments
 	are dropped. The result begins with the §19.4 marker preamble followed by
 	live rows in first-appearance order (§3.4), each carrying fully resolved
 	value cells.
 
-	The rewrite is atomic — the new part is built in a sibling temporary file,
-	fsynced, and then :func:`os.replace`\\ d over ``path`` — so a crash mid-
-	snapshot leaves the original intact rather than a truncated store.
+	The rewrite happens **in place** under exclusive access (§18): the call
+	waits up to ``lock_timeout`` seconds for every other handle to close the
+	part, so nothing reads or appends while it changes. The inode is kept, and
+	with it the part's mode, owner, ACLs, extended attributes, and links. For
+	compaction beside a live writer, see :func:`snapshot_store`.
 
 	Unlike :class:`WalStore`, which treats the official ``#_defaults_#``
 	mapping key as a convenience for :meth:`~_StoreCommon.set_defaults`, this
@@ -2557,9 +3089,15 @@ def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=N
 		delimiter: Field delimiter; inferred from ``path`` when ``None``.
 		header: Optional header re-emitted above the preamble.
 		store: Optional mapping to populate during the pre-snapshot read.
+		lock_timeout: Seconds to wait for exclusive access; ``None`` waits
+			indefinitely.
 
 	Returns:
 		MutableMapping: Live key→row mapping that was written.
+
+	Raises:
+		StoreBusyError: If another handle kept the part open past
+			``lock_timeout``.
 
 	Examples:
 		>>> import os, tempfile
@@ -2577,9 +3115,44 @@ def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=N
 		>>> os.unlink(path)
 	"""
 	delimiter = delimiter or delimiter_for_path(path)
+	with _PartHandle(path, write=True, exclusive=True, timeout=lock_timeout) as handle:
+		return _compact_in_place(handle, encoding=encoding, delimiter=delimiter,
+								 header=header, store=store)
+
+
+def _replay_through(handles, delimiter, encoding):
+	"""Replay open part handles as one concatenation (§17.4).
+
+	Reads through handles the caller already holds, which matters under
+	exclusive access: opening the part again would wait on that very lock.
+	"""
+	store, state, digests = OrderedDict(), ReaderState(), DigestSet()
+	for handle in handles:
+		with handle.stream() as f:
+			_replay_stream(f, handle.path, delimiter, encoding=encoding, store=store,
+						   state=state, digests=digests)
+	return store, state, digests
+
+
+def _compact_in_place(handle, *, encoding, delimiter, header=None, store=None, keep=None):
+	"""Rewrite ``handle``'s part as a §19 snapshot of its own contents.
+
+	``handle`` must hold exclusive access. ``keep``, when given, is an
+	authoritative key→row mapping to write instead of the replayed state -- a
+	"clear and dump" of an in-memory store. Its keys and order win; a replayed
+	entry is reused wherever it still resolves to the same row, so §19.4
+	compensation keeps working for it.
+	"""
 	# Replay to entries, not materialized rows: §19.4 compensation needs each
 	# row's write-time defaults, which materialization has already folded away.
-	replayed, state = replay_part(path, delimiter, encoding=encoding)
+	replayed, state, _digests = _replay_through([handle], delimiter, encoding)
+	if keep is not None:
+		source, replayed = replayed, OrderedDict()
+		for key, row in keep.items():
+			entry = source.get(key)
+			reuse = isinstance(entry, StoreEntry) and list(row) in (
+				list(entry.row), materialize_row(entry))
+			replayed[key] = entry if reuse else list(row)
 	data = OrderedDict(
 		(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
 		for key, entry in replayed.items())
@@ -2588,12 +3161,11 @@ def snapshot_part(path, *, encoding='utf8', delimiter=None, header=None, store=N
 		clear(store)
 		for key, row in data.items():
 			setitem(store, key, row)
-		_attach_replay_meta(store, state)
 		data = store
+	_attach_replay_meta(data, state)
 	lines = _snapshot_body(replayed, state, delimiter, header=header)
-	_warn_loose_extension(path, lines, delimiter)
-	_atomic_rewrite(path, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
-					encoding=encoding)
+	_warn_loose_extension(handle.path, lines, delimiter)
+	handle.rewrite(('\n'.join(lines) + '\n').encode(encoding, errors='replace'))
 	return data
 
 
@@ -2603,6 +3175,9 @@ SnapshotResult = namedtuple(
 
 def rotate_parts(parts, action, *, allow_delete=False):
 	"""Apply a §19.5 rotate action to the parts a snapshot superseded.
+
+	``rename`` never replaces an existing file: a ``.rotated`` name that is
+	already taken raises ``FileExistsError``.
 
 	Args:
 		parts: :class:`PartName` records to act on.
@@ -2617,6 +3192,7 @@ def rotate_parts(parts, action, *, allow_delete=False):
 
 	Raises:
 		ValueError: If ``action`` is not a §19.5 action.
+		FileExistsError: If a ``.rotated`` target already exists.
 	"""
 	if action not in ROTATE_ACTIONS:
 		raise ValueError(f'rotate action must be one of {ROTATE_ACTIONS}, got {action!r}')
@@ -2635,14 +3211,16 @@ def rotate_parts(parts, action, *, allow_delete=False):
 			continue
 		store_base = f'{part.store_path}.{part.format_ext}'
 		target = part_path(store_base, part.ordinal, rotated=True, codec=part.codec)
-		os.replace(part.path, target)
+		if os.path.lexists(target):
+			raise FileExistsError(errno.EEXIST, 'rotated part already exists', target)
+		os.rename(part.path, target)
 		changes.append((part.path, target))
 	return action, changes
 
 
 def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 				   rotate=None, allow_delete=False, quiesce=False,
-				   policy='warn'):
+				   policy='warn', promote=True, lock_timeout=DEFAULT_LOCK_TIMEOUT):
 	"""Compact a multi-part store following the full §19.2 procedure.
 
 	Unlike :func:`snapshot_part`, which rewrites one file in place, this
@@ -2650,17 +3228,26 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 	emits the snapshot as a *new* part whose ordinal lies strictly between
 	that prefix and the still-live active part. The writer is never paused and
 	never notified; because the snapshot lands in an older slot than the
-	active part, no regression is possible (§19.2.5).
+	active part, no regression is possible (§19.2.5). No existing file is ever
+	rewritten or replaced.
 
 	  ``… prefix parts … | snapshot S | active part (writer still appending)``
 
 	The highest-ordinal part is assumed to be the active one. Pass
 	``quiesce=True`` when no writer is running to fold every part into the
-	snapshot instead (§19.3).
+	snapshot instead (§19.3); exclusive access to every part is then taken
+	first (§18), so a live writer makes the call fail rather than race.
+
+	A single unnumbered file is **promoted** to a multi-part store (§17.1):
+	the snapshot becomes its first numbered part, and the file itself -- now
+	part 0 -- is kept, renamed, or deleted by the rotate action. The file is
+	quiesced for the duration, so this waits for exclusive access like
+	:func:`snapshot_part`.
 
 	Rows carry fully resolved values under the §19.4 preamble, so the
 	compacted store reads back identically (see
-	:func:`build_snapshot_preamble`).
+	:func:`build_snapshot_preamble`). A new part gets the owner, mode, ACLs,
+	and extended attributes of the part it continues.
 
 	Args:
 		store_path: Store path including its format extension.
@@ -2673,8 +3260,12 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 		allow_delete: Permit the ``delete`` action; otherwise it is downgraded
 			to ``rename``, which §19.5 explicitly sanctions.
 		quiesce: Treat every part as immutable and place the snapshot above
-			them all. Only safe with no live writer (§19.3).
+			them all (§19.3), after taking exclusive access to each.
 		policy: Response to a §15 mismatch while replaying the prefix.
+		promote: Promote a single unnumbered file (the default). ``False``
+			refuses that case with ``ValueError`` instead.
+		lock_timeout: Seconds to wait for exclusive access when promoting or
+			quiescing; ``None`` waits indefinitely.
 
 	Returns:
 		SnapshotResult | None: ``None`` when there is nothing to compact (a
@@ -2682,9 +3273,11 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 
 	Raises:
 		FileNotFoundError: If the store has no parts.
-		ValueError: If the store is a single unnumbered file (use
-			:func:`snapshot_part`), or if no ordinal fits strictly between the
-			prefix and the active part (§19.3).
+		ValueError: If the store is a single unnumbered file and ``promote``
+			is False, or if no ordinal fits strictly between the prefix and
+			the active part (§19.3).
+		StoreBusyError: If promoting or quiescing and a part stayed open
+			elsewhere past ``lock_timeout``.
 	"""
 	delimiter = delimiter or delimiter_for_path(store_path)
 	parsed = parse_part_name(store_path)
@@ -2693,9 +3286,14 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 	parts = store_parts(store_path)
 	if not parts:
 		if os.path.isfile(store_path):
-			raise ValueError(
-				f'{store_path!r} is a single unnumbered file (§17.1); use '
-				f'snapshot_part() for that case.')
+			if not promote:
+				raise ValueError(
+					f'{store_path!r} is a single unnumbered file (§17.1); pass '
+					f'promote=True, or use snapshot_part() to compact it in place.')
+			return _promote_single_file(
+				store_path, encoding=encoding, delimiter=delimiter, header=header,
+				rotate=rotate, allow_delete=allow_delete, policy=policy,
+				lock_timeout=lock_timeout)
 		raise FileNotFoundError(store_path)
 
 	if quiesce:
@@ -2704,14 +3302,6 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 		prefix, active = parts[:-1], parts[-1]
 	if not prefix:
 		return None  # only the active part exists; nothing is immutable yet
-
-	# §19.2.2: replay the immutable prefix only -- never the active part.
-	replayed, state, digests = replay_parts(
-		[pn.path for pn in prefix], delimiter, encoding=encoding)
-	report_corruption(digests, store_path, policy)
-	data = OrderedDict(
-		(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
-		for key, entry in replayed.items())
 
 	# §19.3: slot S strictly between the prefix maximum and the active part.
 	low = prefix[-1].ordinal_value
@@ -2727,19 +3317,53 @@ def snapshot_store(store_path, *, encoding='utf8', delimiter=None, header=None,
 				f'new_ordinal(), or quiesce writes and pass quiesce=True.')
 		ordinal_value = low + (high - low) // 2
 	ordinal = format(ordinal_value, f'0{width}x')
-
-	lines = _snapshot_body(replayed, state, delimiter, header=header)
-
 	target = part_path(store_path, ordinal, codec=prefix[-1].codec)
-	_warn_loose_extension(target, lines, delimiter)
-	# §19.2.3: write it durably before anything else changes.
-	_atomic_rewrite(target, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
-					encoding=encoding)
+
+	with contextlib.ExitStack() as held:
+		handles = [held.enter_context(_PartHandle(
+			pn.path, write=quiesce, exclusive=quiesce,
+			timeout=lock_timeout if quiesce else None)) for pn in prefix]
+		# §19.2.2: replay the immutable prefix only -- never the active part.
+		replayed, state, digests = _replay_through(handles, delimiter, encoding)
+		report_corruption(digests, store_path, policy)
+		data = OrderedDict(
+			(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
+			for key, entry in replayed.items())
+		lines = _snapshot_body(replayed, state, delimiter, header=header)
+		_warn_loose_extension(target, lines, delimiter)
+		# §19.2.3: write it durably before anything else changes.
+		_create_part(target, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
+					 like=prefix[-1].path)
 
 	# §19.2.4: only once S is durable, dispose of the prefix it subsumes.
 	action = state.rotate if rotate is None else rotate
 	action, _changes = rotate_parts(prefix, action, allow_delete=allow_delete)
 	return SnapshotResult(path=target, ordinal=ordinal, subsumed=[pn.path for pn in prefix],
+						  rotate_action=action, data=data)
+
+
+def _promote_single_file(path, *, encoding, delimiter, header, rotate, allow_delete,
+						 policy, lock_timeout):
+	"""Snapshot the unnumbered file ``path`` into its store's first numbered part.
+
+	Afterwards ``path`` is part 0 (§17.1) and subject to the rotate action.
+	"""
+	suffix = _compression_suffix(path)
+	ordinal = new_ordinal()
+	target = part_path(path[:len(path) - len(suffix)], ordinal, codec=suffix.lstrip('.'))
+	with _PartHandle(path, write=True, exclusive=True, timeout=lock_timeout) as handle:
+		replayed, state, digests = _replay_through([handle], delimiter, encoding)
+		report_corruption(digests, path, policy)
+		data = OrderedDict(
+			(key, materialize_row(entry) if isinstance(entry, StoreEntry) else entry)
+			for key, entry in replayed.items())
+		lines = _snapshot_body(replayed, state, delimiter, header=header)
+		_warn_loose_extension(target, lines, delimiter)
+		_create_part(target, ('\n'.join(lines) + '\n').encode(encoding, errors='replace'),
+					 like=path)
+	action = state.rotate if rotate is None else rotate
+	action, _changes = rotate_parts([_part_zero(path)], action, allow_delete=allow_delete)
+	return SnapshotResult(path=target, ordinal=ordinal, subsumed=[path],
 						  rotate_action=action, data=data)
 
 
@@ -2974,7 +3598,13 @@ class WalStore(_StoreCommon, OrderedDict):
 			the part's ``#_write_ack_#`` marker.
 		multipart: If True, treat ``path`` as a §17 store: replay every part
 			in ordinal order, and append to a **new** part opened with a
-			fresh ordinal (§17.7).
+			fresh ordinal (§17.7). Implied when ``path`` is an unnumbered
+			file that already has numbered parts beside it (§17.1).
+		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
+			part before falling back to tombstones (§18).
+
+	The store holds a shared lock on its part for as long as it is open
+	(§18), so other handles cannot truncate or rewrite the part under it.
 
 	Examples:
 		>>> import os, tempfile, time
@@ -2993,27 +3623,48 @@ class WalStore(_StoreCommon, OrderedDict):
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
 				 delimiter=None, defaults=None, flush_interval=0.01,
-				 write_ack=None, multipart=False):
+				 write_ack=None, multipart=False, lock_timeout=DEFAULT_LOCK_TIMEOUT):
 		super().__init__()
 		self._pending = deque()
 		self._lock = threading.Lock()
 		self._wake = threading.Condition()
 		self._shutdown = threading.Event()
 		self._flush_error = None
-		self.multipart = multipart
+		self._handle = None
+		self.lock_timeout = lock_timeout
+		self.multipart = multipart or bool(_promoted_parts(path))
 		self.store_path = path
-		if multipart:
+		if self.multipart:
 			# §17.7: open a fresh part on startup and treat the existing ones
 			# as immutable. Appends go only to this part; replay spans them all.
 			path = part_path(path, new_ordinal())
 		self._init_common(path, header, create, encoding, delimiter, defaults)
 		self.flush_interval = flush_interval
+		if self.multipart and create:
+			existing = store_part_paths(self.store_path)
+			ensure_part_exists(path, create=True, encoding=encoding,
+							   delimiter=self.delimiter, header=self.header or None)
+			if existing:  # the new part continues the store: same access rights
+				_inherit_metadata(existing[-1], path)
+		self._open_handle(create=create)
 		self.reload()
 		self._adopt_constructor_defaults(defaults)
 		self.write_ack = self._resolve_write_ack(write_ack)
 		self._worker = threading.Thread(target=self._flush_worker, daemon=True)
 		self._worker.start()
 		atexit.register(self.close)
+
+	def _open_handle(self, *, create):
+		"""Open the part and take the shared access lock held until close."""
+		if self._handle is not None:
+			return self._handle
+		try:
+			ensure_part_exists(self.path, create=create, encoding=self.encoding,
+							   delimiter=self.delimiter, header=self.header or None)
+		except FileNotFoundError:
+			return None  # create=False: stay in memory until the first flush
+		self._handle = _PartHandle(self.path, write=True)
+		return self._handle
 
 	def reload(self):
 		"""Discard in-memory state and replay the part from disk.
@@ -3115,14 +3766,20 @@ class WalStore(_StoreCommon, OrderedDict):
 		self._persist_tombstone(key)
 
 	def clear(self):
-		"""Clear in-memory state and truncate the part on disk.
+		"""Clear the store: truncate the part if possible, else tombstone it.
 
-		The optional header comment and defaults marker are retained. The
-		rewrite happens under the same lock the flusher uses, so a concurrent
-		flush cannot interleave rows into the truncated part.
+		Waits up to :attr:`lock_timeout` seconds for exclusive access to the
+		part (§18). With it, the part is truncated in place -- same inode --
+		keeping the optional header comment and defaults marker. If another
+		handle still has the part open, truncating would pull the file out
+		from under it, so a tombstone is appended for every live key instead
+		(§9). The store reads back empty either way.
+
+		This runs under the same lock the flusher uses, so a concurrent flush
+		cannot interleave rows into the truncated part.
 
 		Returns:
-			WalStore: ``self``, after truncation.
+			WalStore: ``self``, after clearing.
 		"""
 		if self.multipart:
 			# Truncating one part would not empty the store, and rewriting the
@@ -3132,10 +3789,24 @@ class WalStore(_StoreCommon, OrderedDict):
 				del self[key]
 			return self
 		with self._lock:
-			self._pending.clear()
-			super().clear()
-			truncate_part(self.path, encoding=self.encoding, delimiter=self.delimiter,
-						  header=self.header, defaults=self._reader_state.defaults)
+			handle = self._open_handle(create=True)
+			if handle.upgrade(self.lock_timeout):
+				try:
+					self._pending.clear()
+					super().clear()
+					handle.rewrite(_cleared_payload(
+						self.path, self.encoding, self.delimiter, self.header,
+						self._reader_state.defaults))
+				finally:
+					handle.downgrade()
+				return self
+			# Busy: also tombstone what other handles wrote since our load.
+			on_disk, _state = replay_part(self.path, self.delimiter, encoding=self.encoding)
+		for key in list(OrderedDict.keys(self)):
+			del self[key]
+		for key in on_disk:
+			if key not in self:
+				self._persist_tombstone(key)
 		return self
 
 	def flush(self):
@@ -3221,6 +3892,9 @@ class WalStore(_StoreCommon, OrderedDict):
 		if self._worker.is_alive() and self._worker is not threading.current_thread():
 			self._worker.join()
 		atexit.unregister(self.close)
+		with self._lock:
+			if self._handle is not None:
+				self._handle.close()  # releases the shared access lock
 		return self
 
 	def __del__(self):
@@ -3256,10 +3930,10 @@ class WalStore(_StoreCommon, OrderedDict):
 	def _flush_quietly(self):
 		"""Flush from the background worker, recording rather than raising.
 
-		Catches ``Exception``, not just ``OSError``: subclasses hook extra work
-		into :meth:`flush` (``TSVZed`` runs a periodic snapshot there), and
-		anything escaping would kill the worker thread and silently strand
-		every queued record with nobody left to drain it.
+		Catches ``Exception``, not just ``OSError``: a subclass may hook extra
+		work into :meth:`flush`, and anything escaping would kill the worker
+		thread and silently strand every queued record with nobody left to
+		drain it.
 		"""
 		try:
 			self.flush()
@@ -3273,83 +3947,70 @@ class WalStore(_StoreCommon, OrderedDict):
 			self._flush_error = None
 
 	def _open_locked(self, mode, *, fsync=True):
-		"""Open the part under an exclusive file lock.
+		"""Take the part's append lock for one batch.
 
 		Caller must already hold ``self._lock``. The thread lock is *not*
 		acquired here, so :meth:`flush` can drain the queue and write as one
-		critical section (and :meth:`hardMapToFile` can flush then snapshot
+		critical section (and :meth:`hardMapToFile` can flush then compact
 		without a nested-lock deadlock).
 
 		Args:
-			mode: Open mode passed to :func:`open_part`.
-			fsync: If True, fsync the part when the context exits (§18.4
-				``disk``); if False, only flush to the OS (``memory``).
+			mode: Retained for compatibility; a batch is always an append.
+			fsync: If True, fsync the part once the batch is written (§18.4
+				``disk``); if False, only hand it to the OS (``memory``).
 
 		Returns:
-			_LockedPart: Context manager that releases the file lock on exit.
+			_LockedPart: Context manager that commits the batch and releases
+			the append lock on exit.
 
 		Raises:
-			OSError: If the part cannot be opened or locked.
+			OSError: If the part cannot be opened or written.
 		"""
-		f = None
-		try:
-			f = open_part(self.path, mode, encoding=self.encoding)
-			if os.name == 'posix':
-				fcntl.lockf(f, fcntl.LOCK_EX)
-			elif os.name == 'nt':
-				msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
-		except BaseException:
-			if f is not None:
-				with contextlib.suppress(OSError):
-					f.close()
-			raise
-		return _LockedPart(f, fsync=fsync)
+		_ = mode
+		return _LockedPart(self._open_handle(create=True), fsync=fsync)
 
 
 class _LockedPart:
-	"""File wrapper that unlocks and closes the part on exit.
+	"""One batch append to a part under its append lock (§18.2–§18.3).
 
-	The store's thread lock is held by the caller for the whole critical
-	section; this object only owns the file lock and the handle.
+	``write()`` collects the batch; a clean exit writes it as a single append
+	-- one codec stream for a compressed part -- followed by at most one fsync,
+	then releases the lock. The store's thread lock is held by the caller for
+	the whole critical section.
 
 	Args:
-		file_obj: Open part file handle.
-		fsync: If True, fsync before closing.
+		handle: The store's :class:`_PartHandle`.
+		fsync: If True, fsync after writing.
 	"""
 
-	def __init__(self, file_obj, *, fsync=True):
-		self._file = file_obj
+	def __init__(self, handle, *, fsync=True):
+		self._handle = handle
 		self._fsync = fsync
+		self._chunks = []
+		self._held = None
 
 	def __enter__(self):
-		return self._file
+		self._held = self._handle.append_lock()
+		self._held.__enter__()
+		return self
 
-	def __exit__(self, *exc):
+	def write(self, data):
+		self._chunks.append(bytes(data))
+		return len(data)
+
+	def flush(self):
+		"""No-op: the batch is committed on exit."""
+
+	def __exit__(self, exc_type, *exc):
 		# §18.3: at most one fsync per committed batch, and only when the
-		# store is running write_ack='disk' (§18.4). A failed fsync must
-		# propagate: swallowing it would acknowledge a 'disk' write that
-		# never reached durable storage.
-		fsync_error = None
+		# store is running write_ack='disk' (§18.4). A failed write or fsync
+		# propagates: swallowing it would acknowledge a record that never
+		# reached the file.
 		try:
-			self._file.flush()
-			if self._fsync:
-				os.fsync(self._file.fileno())
-		except (ValueError, AttributeError):
-			pass
-		except OSError as exc_fs:
-			if self._fsync:
-				fsync_error = exc_fs
-		if not self._file.closed:
-			if os.name == 'posix':
-				fcntl.lockf(self._file, fcntl.LOCK_UN)
-			elif os.name == 'nt':
-				try:
-					msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 2147483647)
-				except OSError:
-					pass
-			self._file.close()
-		if fsync_error is not None:
-			raise fsync_error
+			if exc_type is None:
+				self._handle.append(b''.join(self._chunks), fsync=self._fsync)
+		finally:
+			self._held.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -3385,22 +4046,33 @@ class OffsetStore(_StoreCommon, MutableMapping):
 			``None`` defers to the part's ``#_write_ack_#`` marker.
 		cache_size: Maximum rows retained in the LRU value cache; ``0``
 			disables caching so every read goes to disk.
+		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
+			part before falling back to tombstones (§18).
+
+	The store holds a shared lock on its part for as long as it is open
+	(§18): stored offsets stay valid because nothing else can truncate or
+	rewrite the part in the meantime.
 
 	Raises:
-		ValueError: If ``path`` carries a compression suffix (§16), or
-			``write_ack`` is not a recognized mode.
+		ValueError: If ``path`` carries a compression suffix (§16), is part 0
+			of a multi-part store (§17.1), or ``write_ack`` is not a
+			recognized mode.
 	"""
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
-				 delimiter=None, defaults=None, write_ack=None, cache_size=4096):
+				 delimiter=None, defaults=None, write_ack=None, cache_size=4096,
+				 lock_timeout=DEFAULT_LOCK_TIMEOUT):
 		if is_compressed_path(path):
 			raise ValueError(
 				f'OffsetStore cannot index a compressed part ({path!r}): byte '
 				f'offsets do not address a compressed stream. Use WalStore instead.')
+		_reject_promoted(path, 'OffsetStore')
 		self._cache_size = max(0, int(cache_size))
 		self._values = OrderedDict()   # bounded LRU: key -> row
 		self._offsets = {}
 		self._bindings = {}            # key -> interned (defaults, fill_empty, strip)
+		self._handle = None
+		self.lock_timeout = lock_timeout
 		self._init_common(path, header, create, encoding, delimiter, defaults)
 		try:
 			ensure_part_exists(self.path, create=self.create, encoding=self.encoding,
@@ -3413,12 +4085,19 @@ class OffsetStore(_StoreCommon, MutableMapping):
 			self.write_ack = self._resolve_write_ack(write_ack)
 			atexit.register(self.close)
 			return
-		# Long-lived handle; closed via close()/__exit__/atexit.
-		self._file = open(self.path, 'r+b')  # noqa: SIM115
+		self._attach_file()
 		self.reload()
 		self._adopt_constructor_defaults(defaults)
 		self.write_ack = self._resolve_write_ack(write_ack)
 		atexit.register(self.close)
+
+	def _attach_file(self):
+		"""Open the part under a shared access lock held until close (§18)."""
+		self._handle = _PartHandle(self.path, write=True)
+		# Long-lived buffered file on the handle's descriptor; closed via
+		# close()/__exit__/atexit, while the handle owns the descriptor.
+		self._file = open(self._handle.fd, 'r+b' if self._handle.writable else 'rb',  # noqa: SIM115
+						  closefd=False)
 
 	def reload(self):
 		"""Rebuild the offset index by replaying the part from disk.
@@ -3608,21 +4287,43 @@ class OffsetStore(_StoreCommon, MutableMapping):
 		return self._normalize_key(key) in self._offsets
 
 	def clear(self):
-		"""Truncate the part, retaining the header comment and defaults marker.
+		"""Clear the store: truncate the part if possible, else tombstone it.
+
+		Waits up to :attr:`lock_timeout` seconds for exclusive access to the
+		part (§18). With it, the part is truncated in place, keeping the header
+		comment and defaults marker. If another handle still has the part
+		open, a tombstone is appended for every live key instead (§9); the
+		store reads back empty either way.
 
 		Returns:
-			OffsetStore: ``self``, after truncation.
+			OffsetStore: ``self``, after clearing.
 		"""
-		self._offsets.clear()
-		self._values.clear()
-		self._bindings.clear()
-		self._file.seek(0)
-		self._file.truncate()
-		if self.header:
-			self._append_line(format_header_comment(self.header, self.delimiter))
-		if self._reader_state.defaults:
-			self._write_row(list(self._defaults_row))
-		self.flush(fsync=True)
+		handle = self._handle
+		if handle is not None and not handle.upgrade(self.lock_timeout):
+			self._file.flush()
+			on_disk, _state = replay_part(self.path, self.delimiter, encoding=self.encoding)
+			for key in list(self._offsets) + [k for k in on_disk if k not in self._offsets]:
+				self._offsets.pop(key, None)
+				self._values.pop(key, None)
+				self._bindings.pop(key, None)
+				self._persist_tombstone(key)
+			self.flush()
+			return self
+		try:
+			self._offsets.clear()
+			self._values.clear()
+			self._bindings.clear()
+			self._file.flush()
+			self._file.seek(0)
+			self._file.truncate()
+			if self.header:
+				self._append_line(format_header_comment(self.header, self.delimiter))
+			if self._reader_state.defaults:
+				self._write_row(list(self._defaults_row))
+			self.flush(fsync=True)
+		finally:
+			if handle is not None:
+				handle.downgrade()
 		return self
 
 	def close(self):
@@ -3637,6 +4338,8 @@ class OffsetStore(_StoreCommon, MutableMapping):
 		if not self._file.closed:
 			self.flush(fsync=True)  # closing is a durability point either way
 			self._file.close()
+		if self._handle is not None:
+			self._handle.close()  # releases the shared access lock
 		atexit.unregister(self.close)
 		return self
 
@@ -4061,10 +4764,9 @@ scrubTSV = scrubTabularFile
 class TSVZed(WalStore):
 	"""Legacy wrapper around :class:`WalStore`.
 
-	Provides an append-only WAL with optional periodic snapshots.
-	``rewrite_on_load``, ``rewrite_on_exit``, and ``rewrite_interval`` map to
-	:meth:`hardMapToFile` (which calls :func:`snapshot_part`). Prefer
-	invoking ``hardMapToFile()`` explicitly in new code.
+	Provides an append-only WAL with optional compaction on load and exit:
+	``rewrite_on_load`` and ``rewrite_on_exit`` call :meth:`hardMapToFile`.
+	Prefer invoking ``hardMapToFile()`` explicitly in new code.
 
 	Args:
 		fileName: Path of the backing part.
@@ -4074,7 +4776,8 @@ class TSVZed(WalStore):
 		verifyHeader: Unused; retained for compatibility.
 		rewrite_on_load: If True, compact once after loading.
 		rewrite_on_exit: If True, compact during :meth:`close`.
-		rewrite_interval: Seconds between automatic compact attempts.
+		rewrite_interval: Deprecated and ignored; periodic rewrites are gone.
+			A non-zero value emits a :class:`DeprecationWarning`.
 		append_check_delay: Background flush interval in seconds.
 		monitor_external_changes: Unused; retained for compatibility.
 		verbose: Unused; retained for compatibility.
@@ -4083,13 +4786,15 @@ class TSVZed(WalStore):
 		defaults: Optional value-column defaults.
 		strict: Unused; retained for compatibility.
 		correctColumnNum: Unused; retained for compatibility.
+		lock_timeout: Seconds :meth:`clear` and :meth:`hardMapToFile` wait for
+			exclusive access before appending instead (§18).
 	"""
 
 	def __init__(self, fileName, teeLogger=None, header='', createIfNotExist=True,
 				 verifyHeader=True, rewrite_on_load=False, rewrite_on_exit=False,
 				 rewrite_interval=0, append_check_delay=0.01, monitor_external_changes=True,
 				 verbose=False, encoding='utf8', delimiter=..., defaults=None,
-				 strict=False, correctColumnNum=-1):
+				 strict=False, correctColumnNum=-1, lock_timeout=DEFAULT_LOCK_TIMEOUT):
 		_ = (verifyHeader, monitor_external_changes, verbose, strict, correctColumnNum)
 		d = None if delimiter is ... else _legacy_delimiter(delimiter=delimiter, file_name=fileName)
 		self._fileName = fileName
@@ -4100,13 +4805,19 @@ class TSVZed(WalStore):
 		self.correctColumnNum = correctColumnNum
 		self.rewrite_on_load = rewrite_on_load
 		self.rewrite_on_exit = rewrite_on_exit
-		self.rewrite_interval = float(rewrite_interval or 0)
-		self._last_rewrite = time.monotonic()
+		if rewrite_interval:
+			# stacklevel 3: past the _deprecated() __init__ wrapper to the caller.
+			warnings.warn(
+				'TSVZed(rewrite_interval=...) is deprecated and ignored: parts are '
+				'no longer rewritten periodically. Use rewrite_on_load / '
+				'rewrite_on_exit, or call hardMapToFile() explicitly.',
+				DeprecationWarning, stacklevel=3)
+		self.rewrite_interval = float(rewrite_interval or 0)  # retained, unused
 		self._rewriting = False
 		super().__init__(
 			fileName, header=header or None, create=createIfNotExist,
 			encoding=encoding, delimiter=d, defaults=defaults,
-			flush_interval=append_check_delay,
+			flush_interval=append_check_delay, lock_timeout=lock_timeout,
 		)
 		self.appendQueue = self._pending
 		if self.rewrite_on_load and os.path.isfile(self.path):
@@ -4129,10 +4840,10 @@ class TSVZed(WalStore):
 		return self.close()
 
 	def clear_file(self):
-		"""Clear in-memory state and truncate the part on disk.
+		"""Legacy alias for :meth:`WalStore.clear`.
 
 		Returns:
-			TSVZed: ``self``, after truncation.
+			TSVZed: ``self``, after clearing.
 		"""
 		return self.clear()
 
@@ -4156,17 +4867,25 @@ class TSVZed(WalStore):
 		return self.hardMapToFile()
 
 	def hardMapToFile(self):
-		"""Compact the part via :func:`snapshot_part` and refresh memory state.
+		"""Make the part hold exactly the in-memory store: clear, then dump.
 
-		The drain and the rewrite both run under the store's write lock, so a
-		background flush cannot land rows in the part between the snapshot's
-		read and its atomic replace — which would otherwise leave data rows
-		ahead of the marker preamble, resolved under the wrong forward-only
-		marker state (§12.1, §19.2).
+		Waits up to :attr:`lock_timeout` seconds for exclusive access to the
+		part (§18). With it, the part is rewritten in place -- same inode -- as
+		a §19 snapshot of the in-memory store. Without it, because another
+		handle still has the part open, the clear and dump are appended
+		instead: a tombstone for each key that should no longer be there and a
+		row for each key whose on-disk value differs. The part reads back as
+		the in-memory store either way, and nothing is appended when the two
+		already agree. A multi-part store always takes the append path.
+
+		The in-memory store is authoritative: rows another handle appended that
+		this store never loaded are dropped. Queued writes are flushed first,
+		and everything runs under the store's write lock, so a background flush
+		cannot land between reading the part and rewriting it (§12.1, §19.2).
 
 		Returns:
-			bool: True on success, or False if a rewrite is already in
-			progress.
+			bool: True if the part was rewritten in place; False if the dump
+			was appended instead, or a rewrite is already in progress.
 		"""
 		if self._rewriting:
 			return False
@@ -4174,20 +4893,47 @@ class TSVZed(WalStore):
 		try:
 			with self._lock:
 				self._flush_locked()
-				data = snapshot_part(
-					self.path, encoding=self.encoding, delimiter=self.delimiter,
-					header=self.header or None,
-				)
-				self._last_rewrite = time.monotonic()
-				# Repopulate through OrderedDict so the refresh is not itself
-				# re-queued as a fresh batch of appends.
-				super(WalStore, self).clear()
-				for key, row in data.items():
-					OrderedDict.__setitem__(self, key, row)
-				self._reader_state = getattr(data, '_reader_state', self._reader_state)
-			return True
+				memory = OrderedDict(OrderedDict.items(self))
+				handle = None if self.multipart else self._open_handle(create=True)
+				if handle is not None and handle.upgrade(self.lock_timeout):
+					try:
+						data = _compact_in_place(
+							handle, encoding=self.encoding, delimiter=self.delimiter,
+							header=self.header or None, keep=memory)
+					finally:
+						handle.downgrade()
+					# Repopulate through OrderedDict so the refresh is not itself
+					# re-queued as a fresh batch of appends.
+					super(WalStore, self).clear()
+					for key, row in data.items():
+						OrderedDict.__setitem__(self, key, row)
+					self._reader_state = getattr(data, '_reader_state', self._reader_state)
+					return True
+				self._append_dump_locked(memory)
+			return False
 		finally:
 			self._rewriting = False
+
+	def _append_dump_locked(self, memory):
+		"""Append what makes the store on disk read back as ``memory``.
+
+		Caller holds ``self._lock``.
+		"""
+		if self.multipart:
+			on_disk = read_multipart(self.store_path, encoding=self.encoding,
+									 delimiter=self.delimiter)
+		else:
+			on_disk = read_store(self.path, encoding=self.encoding, delimiter=self.delimiter)
+		state = getattr(on_disk, '_reader_state', self._reader_state)
+		for key in on_disk:
+			if key not in memory:
+				self._pending.append((_TOMBSTONE, key))
+		for key, row in memory.items():
+			# Compare as a reader would see the row if it were appended now.
+			as_read = materialize_row(StoreEntry(list(row), list(state.defaults), False))
+			if on_disk.get(key) not in (list(row), as_read):
+				self._pending.append(list(row))
+		self._flush_locked()
 
 	mapToFile = hardMapToFile
 
@@ -4197,13 +4943,6 @@ class TSVZed(WalStore):
 		Returns:
 			TSVZed: ``self``.
 		"""
-		return self
-
-	def flush(self):
-		WalStore.flush(self)
-		if (not self._rewriting and self.rewrite_interval > 0
-				and time.monotonic() - self._last_rewrite >= self.rewrite_interval):
-			self.hardMapToFile()
 		return self
 
 	def close(self):
@@ -4231,17 +4970,21 @@ class TSVZedLite(OffsetStore):
 		strict: Unused; retained for compatibility.
 		correctColumnNum: Unused; retained for compatibility.
 		indexes: Optional pre-built offset mapping.
-		fileObj: Optional open file object to adopt.
+		fileObj: Optional open file object to adopt. The store still holds
+			its own locked handle on the part (§18).
+		lock_timeout: Seconds :meth:`clear` waits for exclusive access before
+			appending tombstones instead (§18).
 	"""
 
 	def __init__(self, fileName, header='', createIfNotExist=True, verifyHeader=True,
 				 verbose=False, encoding='utf8', delimiter=..., defaults=None,
-				 strict=True, correctColumnNum=-1, indexes=..., fileObj=...):
+				 strict=True, correctColumnNum=-1, indexes=..., fileObj=...,
+				 lock_timeout=DEFAULT_LOCK_TIMEOUT):
 		_ = (verifyHeader, verbose, strict, correctColumnNum)
 		d = None if delimiter is ... else _legacy_delimiter(delimiter=delimiter, file_name=fileName)
 		super().__init__(
 			fileName, header=header or None, create=createIfNotExist,
-			encoding=encoding, delimiter=d, defaults=defaults,
+			encoding=encoding, delimiter=d, defaults=defaults, lock_timeout=lock_timeout,
 		)
 		self._fileName = fileName
 		self.verifyHeader = verifyHeader
@@ -4279,8 +5022,12 @@ class TSVZedLite(OffsetStore):
 		if is_compressed_path(newFileName):
 			raise ValueError(
 				f'OffsetStore cannot index a compressed part ({newFileName!r}).')
+		_reject_promoted(newFileName, 'OffsetStore')
 		self.flush()
 		self._file.close()
+		if self._handle is not None:
+			self._handle.close()
+			self._handle = None
 		self.path = newFileName
 		self._fileName = newFileName
 		if createIfNotExist is not ...:
@@ -4289,7 +5036,7 @@ class TSVZedLite(OffsetStore):
 			self.verifyHeader = verifyHeader
 		ensure_part_exists(self.path, create=self.create, encoding=self.encoding,
 						   delimiter=self.delimiter, header=self.header)
-		self._file = open(self.path, 'r+b')  # noqa: SIM115
+		self._attach_file()
 		self.reload()
 		return self
 
@@ -4370,6 +5117,13 @@ def _cli_force_utf8():
 				line_buffering=stream.line_buffering))
 
 
+def _cli_busy(path, timeout):
+	"""Report a store that stayed in use past ``--lock-timeout``; exit status 1."""
+	print(f'tsvz: {path} is still open in another process after {timeout:g}s; '
+		  f'not modified (raise --lock-timeout to wait longer)', file=sys.stderr)
+	return 1
+
+
 def __main__():
 	"""Command-line entry point.
 
@@ -4377,9 +5131,14 @@ def __main__():
 	``scrub`` (snapshot/compact), ``verify`` (§15 integrity), and ``parts``
 	(list a §17 store's parts).
 
+	``clear`` and ``scrub`` truncate or rewrite a single-file store in place,
+	so they first wait up to ``--lock-timeout`` seconds for exclusive access:
+	no other handle may have the store open (§18).
+
 	Returns:
 		int: Process exit status — ``0`` on success, ``1`` when ``--strict``
-		and the part is missing, ``2`` for a usage error.
+		and the part is missing or when the store stayed in use past
+		``--lock-timeout``, ``2`` for a usage error.
 	"""
 	import argparse
 	_cli_force_utf8()
@@ -4431,6 +5190,10 @@ def __main__():
 	parser.add_argument(
 		'--checksum', metavar='ALGO',
 		help='With append: also close a §15 segment with this digest.')
+	parser.add_argument(
+		'--lock-timeout', type=float, default=DEFAULT_LOCK_TIMEOUT, metavar='SECONDS',
+		help='clear/scrub: how long to wait for other processes to close the '
+			 f'store before giving up (default: {DEFAULT_LOCK_TIMEOUT:g}).')
 	parser.add_argument('-V', '--version', action='version',
 						version=(f'%(prog)s {version} (tsvz-spec-v1; not 3.x compatible '
 								 f'— use TSVZ_old) @ {COMMIT_DATE} by {author}'))
@@ -4531,14 +5294,17 @@ def __main__():
 				append_records(active_path, [[key] for key in live],
 							   delimiter=args.delimiter)
 		else:
-			truncate_part(
-				args.filename, delimiter=args.delimiter, header=header or None,
-				defaults=defaults or None,
-			)
+			try:
+				truncate_part(
+					args.filename, delimiter=args.delimiter, header=header or None,
+					defaults=defaults or None, lock_timeout=args.lock_timeout,
+				)
+			except StoreBusyError:
+				return _cli_busy(args.filename, args.lock_timeout)
 	elif args.operation == 'scrub':
 		if multipart:
 			result = snapshot_store(store_path, delimiter=args.delimiter,
-									header=header or None)
+									header=header or None, lock_timeout=args.lock_timeout)
 			if result is None:
 				print('tsvz: nothing to compact (no immutable prefix)',
 					  file=sys.stderr)
@@ -4546,7 +5312,11 @@ def __main__():
 			print(f'{result.path} ({len(result.subsumed)} part(s) subsumed, '
 				  f'rotate={result.rotate_action})')
 		else:
-			snapshot_part(args.filename, delimiter=args.delimiter, header=header or None)
+			try:
+				snapshot_part(args.filename, delimiter=args.delimiter,
+							  header=header or None, lock_timeout=args.lock_timeout)
+			except StoreBusyError:
+				return _cli_busy(args.filename, args.lock_timeout)
 	else:
 		print('Invalid operation', file=sys.stderr)
 		return 2

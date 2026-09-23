@@ -82,12 +82,13 @@ work and warn.
 tsvz data.tsvz                         # read + pretty-print
 tsvz data.tsvz append alice Alice 10   # append/update
 tsvz data.tsvz delete alice            # tombstone
-tsvz data.tsvz clear                   # truncate
-tsvz data.tsvz scrub                   # compact (snapshot)
+tsvz data.tsvz clear                   # truncate in place
+tsvz data.tsvz scrub                   # compact in place (snapshot)
 tsvz data.tsvz verify                  # §15 checksums
 tsvz data.tsvz parts                   # list §17 parts
 
 tsvz data.csvz -d comma append k v1 v2
+tsvz data.tsvz clear --lock-timeout 30 # wait up to 30 s for other users to close it
 tsvz -h
 tsvz -V
 ```
@@ -132,8 +133,9 @@ These are summaries only — normative rules, edge cases, and the full reading
 pipeline are in [tsvz-spec-v1.md](tsvz-spec-v1.md).
 
 - **Append-only WAL.** Normal operation only appends; updates and deletes are new
-  lines at the end. **Snapshot / compaction** (spec §19) is the one sanctioned
-  rewrite.
+  lines at the end. **Snapshot / compaction** (spec §19) and clearing are the only
+  rewrites, and they happen in place under exclusive access (spec §18) — a part is
+  never replaced by another file.
 - **Key–value model.** Field 0 is the key; value columns follow. Column count is
   not fixed — absent trailing columns default per the active `#_defaults_#` marker
   (spec §14).
@@ -155,8 +157,9 @@ pipeline are in [tsvz-spec-v1.md](tsvz-spec-v1.md).
 - **Optional integrity.** `#_checksum_<algo>_#` markers enable segment digest
   verification (spec §15).
 - **Multi-part stores.** `store.tsvz.<ordinal>` parts are ordered by hexadecimal
-  ordinal, ascending; replay spans part boundaries (spec §17). Snapshots can slot
-  a new part between an immutable prefix and the active writer (spec §19).
+  ordinal, ascending; replay spans part boundaries (spec §17). An unnumbered
+  `store.tsvz` beside numbered parts is part 0. Snapshots can slot a new part
+  between an immutable prefix and the active writer (spec §19).
 - **Compression.** An orthogonal per-part stream filter (`.gz`, `.zst`, …; spec
   §16).
 
@@ -171,7 +174,8 @@ A worked replay example appears in Appendix C of
 
 An `OrderedDict` subclass that auto-syncs to `path` with a background append
 worker. Selected options: `header`, `create`, `delimiter`, `defaults`,
-`flush_interval`, `write_ack` (`'memory'` or `'disk'`), `multipart`.
+`flush_interval`, `write_ack` (`'memory'` or `'disk'`), `multipart`,
+`lock_timeout`.
 
 `#` keys are ordinary data, persisted as `<#>key`.
 
@@ -179,6 +183,46 @@ worker. Selected options: `header`, `create`, `delimiter`, `defaults`,
 
 A `MutableMapping` that stores only a key→offset index and seeks for each read.
 Uncompressed single-part only; rejects `.gz` / `.bz2` / `.xz` / `.zst`.
+
+### Locking, clearing, and compaction
+
+Every part carries two advisory locks (spec §18):
+
+- an **access lock**, held *shared* by anything that has the part open — stores
+  for their whole lifetime, one-shot reads and appends while they run — and
+  *exclusive* only while the part is truncated or rewritten in place. Exclusive
+  therefore means **no other process has the file open**;
+- an **append lock**, held for each batch append so writers never interleave.
+
+Clearing and compaction rewrite the part **in place** — same inode, so its mode,
+owner, ACLs, extended attributes, hard links, and symlinks all stay as they
+were. Nothing is ever renamed over a part. What happens when the part is still
+open elsewhere:
+
+| Operation | Waits for exclusive access | If it is still open elsewhere |
+|---|---|---|
+| `tsvz f clear` / `tsvz f scrub` | `--lock-timeout` (default 10 s) | exits `1`, file untouched |
+| `truncate_part()` / `snapshot_part()` | `lock_timeout=` (default 10 s) | raises `StoreBusyError` |
+| `WalStore.clear()` / `OffsetStore.clear()` | `lock_timeout=` | appends a tombstone per live key |
+| `TSVZed.hardMapToFile()` (clear + dump) | `lock_timeout=` | appends just the tombstones and rows needed to match memory; returns `False` |
+| `rewrite_on_load` / `rewrite_on_exit` | same as `hardMapToFile()` | same as `hardMapToFile()` |
+
+`TSVZed(rewrite_interval=…)` is deprecated and ignored: parts are no longer
+rewritten periodically.
+
+`snapshot_store()` never rewrites a file: it adds a new part (spec §19.2). Given a
+single unnumbered file, it **promotes** the store to multi-part — the snapshot
+becomes the first numbered part and the file becomes part 0 (kept, renamed to
+`.0.rotated`, or deleted per `#_rotate_#`). After that, `WalStore('f.tsvz')`,
+`read_store('f.tsvz')`, `append_records('f.tsvz', …)`, and the CLI all treat
+`f.tsvz` as the multi-part store. Any part TSVZ creates copies the owner, mode,
+ACLs, and xattrs of the part it continues.
+
+Locks are Linux open-file-description locks (kernel 3.15+). Elsewhere TSVZ falls
+back to POSIX `lockf()`, whose locks the kernel drops when the process closes
+*any* descriptor for the file — so code that opens a store with plain `open()`
+while a TSVZ store has it open weakens the guarantee in that process. On
+Windows the access lock is not enforced.
 
 ### Legacy wrappers
 
