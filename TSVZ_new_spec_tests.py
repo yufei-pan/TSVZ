@@ -3545,6 +3545,126 @@ class TestMarkerWatch(unittest.TestCase):
 			self.assertNotIn('#__meta__#', text)
 			self.assertIn('a\t1', text)
 
+	def test_walstore_open_and_reload_notify_again(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\na\t1\n') as path:
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			store = TSVZ.WalStore(path, watch=watch, flush_interval=1000)
+			try:
+				self.assertEqual(seen, ['#__meta__#\tx'])
+				self.assertEqual(store['a'], ['a', '1'])
+				store.reload()
+				self.assertEqual(seen, ['#__meta__#\tx', '#__meta__#\tx'])
+			finally:
+				store.close()
+
+	def test_walstore_reload_failure_keeps_rows_and_pending(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\na\t1\n') as path:
+			calls = {'n': 0}
+
+			def maybe(line):
+				calls['n'] += 1
+				if calls['n'] > 1:
+					raise RuntimeError('reload')
+
+			watch = TSVZ.MarkerWatch().add('#__meta__#', maybe)
+			store = TSVZ.WalStore(path, watch=watch, flush_interval=1000)
+			try:
+				store['b'] = ['b', 'queued']
+				with self.assertRaises(RuntimeError):
+					store.reload()
+				self.assertEqual(store['a'], ['a', '1'])
+				self.assertEqual(list(store._pending), [['b', 'queued']])
+				self.assertEqual(read_text(path), '#__meta__#\tx\na\t1\n')
+			finally:
+				store.close()
+
+	def test_walstore_construction_failure_starts_no_thread(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\n') as path:
+			def boom(line):
+				raise RuntimeError('open')
+			watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+			before = threading.active_count()
+			with self.assertRaises(RuntimeError):
+				TSVZ.WalStore(path, watch=watch, flush_interval=1000)
+			self.assertEqual(threading.active_count(), before)
+
+	def test_multipart_walstore_notifies_in_ordinal_order(self):
+		directory = tempfile.mkdtemp()
+		try:
+			base = os.path.join(directory, 'ev.tsvz')
+			with open(TSVZ.part_path(base, 1), 'w') as handle:
+				handle.write('#__meta__#\tone\n')
+			with open(TSVZ.part_path(base, 2), 'w') as handle:
+				handle.write('#__meta__#\ttwo\n')
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			store = TSVZ.WalStore(base, multipart=True, watch=watch, flush_interval=1000)
+			try:
+				self.assertEqual(seen, ['#__meta__#\tone', '#__meta__#\ttwo'])
+			finally:
+				store.close()
+		finally:
+			shutil.rmtree(directory)
+
+	def test_offset_reload_failure_keeps_the_previous_row(self):
+		with TempFile(suffix='.tsv', content=b'#__meta__#\tx\na\t1\n') as path:
+			calls = {'n': 0}
+
+			def maybe(line):
+				calls['n'] += 1
+				if calls['n'] > 1:
+					raise RuntimeError('reload')
+
+			watch = TSVZ.MarkerWatch().add('#__meta__#', maybe)
+			store = TSVZ.OffsetStore(path, watch=watch)
+			try:
+				self.assertEqual(store['a'], ['a', '1'])
+				with self.assertRaises(RuntimeError):
+					store.reload()
+				self.assertEqual(store['a'], ['a', '1'])
+			finally:
+				store.close()
+
+	def test_offset_reload_integrity_error_keeps_the_index(self):
+		with TempFile(suffix='.tsv', content=b'a\t1\n') as path:
+			store = TSVZ.OffsetStore(path)
+			real = TSVZ.report_corruption
+
+			def boom(*_args, **_kwargs):
+				raise TSVZ.IntegrityError('injected')
+
+			try:
+				TSVZ.report_corruption = boom
+				with self.assertRaises(TSVZ.IntegrityError):
+					store.reload()
+				self.assertEqual(store['a'], ['a', '1'])
+			finally:
+				TSVZ.report_corruption = real
+				store.close()
+
+	def test_clear_busy_path_does_not_notify(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\na\t1\n') as path:
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			store = TSVZ.WalStore(path, watch=watch, flush_interval=1000, lock_timeout=0)
+			other = TSVZ.WalStore(path, flush_interval=1000, lock_timeout=0)
+			try:
+				seen.clear()
+				store.clear()
+				self.assertEqual(seen, [])
+				self.assertIn('#__meta__#', read_text(path))
+			finally:
+				other.close()
+				store.close()
+
+	def test_bad_watch_is_rejected_by_constructors(self):
+		with TempFile(suffix='.tsvz', content=b'a\t1\n') as path:
+			with self.assertRaises(TypeError):
+				TSVZ.WalStore(path, watch=object())
+			with self.assertRaises(TypeError):
+				TSVZ.OffsetStore(path, watch=object())
+
 
 if __name__ == '__main__':
 	unittest.main()

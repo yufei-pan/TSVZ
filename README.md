@@ -150,7 +150,10 @@ pipeline are in [tsvz-spec-v1.md](tsvz-spec-v1.md).
 - **Markers.** Reserved lines matching `#_[A-Za-z0-9_-]+_#` set reader state
   (`#_version_#`, `#_defaults_#`, `#_strip_trailing_whites_#`, and others — spec
   §12). Official markers use `#_name_#`; custom extensions should use
-  `#__name__#` to avoid collision.
+  `#__name__#` to avoid collision. Pass a `MarkerWatch` to a read to invoke a
+  function with the logical line when a matching custom marker is seen. The
+  marker still does not affect reconstructed rows, and a snapshot still drops
+  the line.
 - **Escaping.** Reversible control tokens: `<sep>`, `<LF>`, `<lt>`, `<#>` (spec
   §13). Every literal `<` in field data is encoded; there are no lossy escape
   cases.

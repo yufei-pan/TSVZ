@@ -3697,6 +3697,8 @@ class WalStore(_StoreCommon, OrderedDict):
 			file that already has numbered parts beside it (§17.1).
 		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
 			part before falling back to tombstones (§18).
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during replay. ``None`` leaves those lines ignored.
 
 	The store holds a shared lock on its part for as long as it is open
 	(§18), so other handles cannot truncate or rewrite the part under it.
@@ -3718,7 +3720,10 @@ class WalStore(_StoreCommon, OrderedDict):
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
 				 delimiter=None, defaults=None, flush_interval=0.01,
-				 write_ack=None, multipart=False, lock_timeout=DEFAULT_LOCK_TIMEOUT):
+				 write_ack=None, multipart=False, lock_timeout=DEFAULT_LOCK_TIMEOUT,
+				 watch=None):
+		_require_watch(watch)
+		self._watch = watch
 		super().__init__()
 		self._pending = deque()
 		self._lock = threading.Lock()
@@ -3785,11 +3790,12 @@ class WalStore(_StoreCommon, OrderedDict):
 					delimiter=self.delimiter, header=self.header or None)
 				read_multipart(
 					self.store_path, encoding=self.encoding,
-					delimiter=self.delimiter, store=loaded)
+					delimiter=self.delimiter, store=loaded, watch=self._watch)
 			else:
 				read_store(
 					self.path, create=self.create, encoding=self.encoding,
-					delimiter=self.delimiter, store=loaded, header=self.header or None,
+					delimiter=self.delimiter, store=loaded,
+					header=self.header or None, watch=self._watch,
 				)
 		except FileNotFoundError:
 			if self.create:
@@ -4143,6 +4149,8 @@ class OffsetStore(_StoreCommon, MutableMapping):
 			disables caching so every read goes to disk.
 		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
 			part before falling back to tombstones (§18).
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during replay. ``None`` leaves those lines ignored.
 
 	The store holds a shared lock on its part for as long as it is open
 	(§18): stored offsets stay valid because nothing else can truncate or
@@ -4156,7 +4164,9 @@ class OffsetStore(_StoreCommon, MutableMapping):
 
 	def __init__(self, path, *, header=None, create=True, encoding='utf8',
 				 delimiter=None, defaults=None, write_ack=None, cache_size=4096,
-				 lock_timeout=DEFAULT_LOCK_TIMEOUT):
+				 lock_timeout=DEFAULT_LOCK_TIMEOUT, watch=None):
+		_require_watch(watch)
+		self._watch = watch
 		if is_compressed_path(path):
 			raise ValueError(
 				f'OffsetStore cannot index a compressed part ({path!r}): byte '
@@ -4197,23 +4207,27 @@ class OffsetStore(_StoreCommon, MutableMapping):
 	def reload(self):
 		"""Rebuild the offset index by replaying the part from disk.
 
+		The new index is installed only after replay returns, so a failure
+		leaves the previous offsets, value cache, bindings, and reader
+		state in place.
+
 		Returns:
-			OffsetStore: ``self``, after replay.
+			OffsetStore: ``self``, after a successful replay.
 		"""
-		self._offsets.clear()
-		self._values.clear()
-		self._bindings.clear()
+		bindings = {}
 		offsets, _values, state = read_offsets(
 			self.path, create=self.create, encoding=self.encoding,
 			delimiter=self.delimiter, cache_values=False,
-			bound_states=self._bindings)
-		self._offsets.update(offsets)
-		self._reader_state = state
-		# Share identical snapshots so memory stays proportional to distinct
-		# marker states, not to the key count.
+			bound_states=bindings, watch=self._watch)
 		intern = {}
-		for key, binding in self._bindings.items():
-			self._bindings[key] = intern.setdefault(binding, binding)
+		for key, binding in bindings.items():
+			bindings[key] = intern.setdefault(binding, binding)
+		self._offsets.clear()
+		self._values.clear()
+		self._bindings.clear()
+		self._offsets.update(offsets)
+		self._bindings.update(bindings)
+		self._reader_state = state
 		return self
 
 	def _cache_put(self, key, row):
