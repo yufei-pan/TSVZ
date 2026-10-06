@@ -3579,6 +3579,27 @@ class TestMarkerWatch(unittest.TestCase):
 			finally:
 				store.close()
 
+	def test_walstore_reload_callback_filenotfound_keeps_rows_and_pending(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\na\t1\n') as path:
+			calls = {'n': 0}
+
+			def maybe(line):
+				calls['n'] += 1
+				if calls['n'] > 1:
+					raise FileNotFoundError('reload')
+
+			watch = TSVZ.MarkerWatch().add('#__meta__#', maybe)
+			store = TSVZ.WalStore(path, watch=watch, create=False, flush_interval=1000)
+			try:
+				store['b'] = ['b', 'queued']
+				with self.assertRaises(FileNotFoundError):
+					store.reload()
+				self.assertEqual(store['a'], ['a', '1'])
+				self.assertEqual(list(store._pending), [['b', 'queued']])
+				self.assertEqual(read_text(path), '#__meta__#\tx\na\t1\n')
+			finally:
+				store.close()
+
 	def test_walstore_construction_failure_starts_no_thread(self):
 		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\n') as path:
 			def boom(line):

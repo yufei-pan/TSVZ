@@ -3774,7 +3774,10 @@ class WalStore(_StoreCommon, OrderedDict):
 		"""Discard in-memory state and replay the part from disk.
 
 		Pending writes that have not yet been flushed are preserved across
-		the reload.
+		the reload. A ``FileNotFoundError`` is an empty reload only when
+		``create`` is false and the part is actually absent. One raised while
+		the part is present, including from a watch callback, propagates and
+		leaves the in-memory rows and the pending queue in place.
 
 		Replay reads into a private mapping and repopulates ``self`` through
 		``OrderedDict.__setitem__``. Handing ``self`` to :func:`read_store`
@@ -3802,7 +3805,14 @@ class WalStore(_StoreCommon, OrderedDict):
 					header=self.header or None, watch=self._watch,
 				)
 		except FileNotFoundError:
-			if self.create:
+			# create=False on an absent part reloads as empty. If the part is
+			# still there, this came from the watch (or another reader) and
+			# must propagate before self or _pending is cleared.
+			if self.multipart:
+				present = bool(store_part_paths(self.store_path))
+			else:
+				present = os.path.exists(self.path)
+			if self.create or present:
 				raise
 		super().clear()
 		for key, row in loaded.items():
