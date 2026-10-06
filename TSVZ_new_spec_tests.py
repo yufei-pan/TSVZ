@@ -3589,6 +3589,26 @@ class TestMarkerWatch(unittest.TestCase):
 				TSVZ.WalStore(path, watch=watch, flush_interval=1000)
 			self.assertEqual(threading.active_count(), before)
 
+	def test_walstore_construction_failure_releases_the_part(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\n') as path:
+			def boom(line):
+				raise RuntimeError('open')
+			watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+			with self.assertRaises(RuntimeError):
+				TSVZ.WalStore(path, watch=watch, flush_interval=1000)
+			handle = TSVZ._PartHandle(path, write=True, exclusive=True, timeout=0)
+			handle.close()
+
+	def test_offset_construction_failure_releases_the_part(self):
+		with TempFile(suffix='.tsv', content=b'#__meta__#\tx\na\t1\n') as path:
+			def boom(line):
+				raise RuntimeError('open')
+			watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+			with self.assertRaises(RuntimeError):
+				TSVZ.OffsetStore(path, watch=watch)
+			handle = TSVZ._PartHandle(path, write=True, exclusive=True, timeout=0)
+			handle.close()
+
 	def test_multipart_walstore_notifies_in_ordinal_order(self):
 		directory = tempfile.mkdtemp()
 		try:

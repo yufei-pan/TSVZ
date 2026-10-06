@@ -3747,12 +3747,16 @@ class WalStore(_StoreCommon, OrderedDict):
 			if existing:  # the new part continues the store: same access rights
 				_inherit_metadata(existing[-1], path)
 		self._open_handle(create=create)
-		self.reload()
-		self._adopt_constructor_defaults(defaults)
-		self.write_ack = self._resolve_write_ack(write_ack)
-		self._worker = threading.Thread(target=self._flush_worker, daemon=True)
-		self._worker.start()
-		atexit.register(self.close)
+		try:
+			self.reload()
+			self._adopt_constructor_defaults(defaults)
+			self.write_ack = self._resolve_write_ack(write_ack)
+			self._worker = threading.Thread(target=self._flush_worker, daemon=True)
+			self._worker.start()
+			atexit.register(self.close)
+		except BaseException:
+			self.close()
+			raise
 
 	def _open_handle(self, *, create):
 		"""Open the part and take the shared access lock held until close."""
@@ -3990,8 +3994,11 @@ class WalStore(_StoreCommon, OrderedDict):
 		self._shutdown.set()
 		with self._wake:  # a worker parked on the Condition must be woken
 			self._wake.notify_all()
-		if self._worker.is_alive() and self._worker is not threading.current_thread():
-			self._worker.join()
+		# Construction can fail in reload(), before the worker exists. Still
+		# release the part; a missing worker has nothing to join.
+		worker = getattr(self, '_worker', None)
+		if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+			worker.join()
 		atexit.unregister(self.close)
 		with self._lock:
 			if self._handle is not None:
@@ -4191,10 +4198,14 @@ class OffsetStore(_StoreCommon, MutableMapping):
 			atexit.register(self.close)
 			return
 		self._attach_file()
-		self.reload()
-		self._adopt_constructor_defaults(defaults)
-		self.write_ack = self._resolve_write_ack(write_ack)
-		atexit.register(self.close)
+		try:
+			self.reload()
+			self._adopt_constructor_defaults(defaults)
+			self.write_ack = self._resolve_write_ack(write_ack)
+			atexit.register(self.close)
+		except BaseException:
+			self.close()
+			raise
 
 	def _attach_file(self):
 		"""Open the part under a shared access lock held until close (§18)."""
