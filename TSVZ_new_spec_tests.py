@@ -3418,6 +3418,133 @@ class TestMarkerWatch(unittest.TestCase):
 			('ignore', None))
 		self.assertEqual(list(store), [])
 
+	def test_replay_bytes_delivers_every_match_in_order(self):
+		seen = []
+		watch = (TSVZ.MarkerWatch()
+				 .add('#__meta__#', seen.append)
+				 .add('#__side__#', seen.append))
+		body = b'#__meta__#\told\n#__side__#\ts\nk\tv1\n#__META__#\tnew\nk\tv2\n'
+		store, state = TSVZ.replay_bytes(body, '\t', watch=watch)
+		self.assertEqual(seen, ['#__meta__#\told', '#__side__#\ts', '#__META__#\tnew'])
+		self.assertEqual(list(store['k'].row), ['k', 'v2'])
+		self.assertEqual(state.defaults, [])
+
+	def test_crlf_torn_tail_and_comma_delimiter(self):
+		seen = []
+		watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+		TSVZ.replay_bytes(b'#__meta__#\tpayload\r\n', '\t', watch=watch)
+		TSVZ.replay_bytes(b'#__meta__#\ttorn', '\t', watch=watch)
+		TSVZ.replay_bytes(b'#__meta__#,payload\n', ',', watch=watch)
+		self.assertEqual(seen, ['#__meta__#\tpayload', '#__meta__#,payload'])
+
+	def test_add_during_callback_sees_a_later_line(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+
+		def first(line):
+			seen.append(line)
+			watch.add('#__later__#', seen.append)
+
+		watch.add('#__meta__#', first)
+		TSVZ.replay_bytes(b'#__meta__#\ta\n#__later__#\tb\n', '\t', watch=watch)
+		self.assertEqual(seen, ['#__meta__#\ta', '#__later__#\tb'])
+
+	def test_watched_line_still_feeds_an_armed_checksum(self):
+		with TempFile(suffix='.tsvz') as path:
+			TSVZ.append_records(path, [['a', '1']], create=True)
+			TSVZ.append_checksum(path, 'crc32')
+			with open(path, 'a') as handle:
+				handle.write('#__meta__#\tx\n')
+			TSVZ.append_records(path, [['b', '2']])
+			TSVZ.append_checksum(path, 'crc32')
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			data = TSVZ.read_store(path, watch=watch)
+			self.assertEqual(seen, ['#__meta__#\tx'])
+			self.assertEqual((data._digests.verified, data._digests.mismatches), (1, []))
+			self.assertEqual(data['b'], ['b', '2'])
+
+	def test_callback_exception_leaves_the_caller_mapping_and_the_file(self):
+		with TempFile(suffix='.tsvz', content=b'k\tv\n#__meta__#\tx\n') as path:
+			before = read_text(path)
+			caller = OrderedDict([('old', ['old', 'row'])])
+
+			def boom(line):
+				raise RuntimeError('stop')
+
+			watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+			with self.assertRaises(RuntimeError):
+				TSVZ.read_store(path, watch=watch, store=caller)
+			self.assertEqual(list(caller.items()), [('old', ['old', 'row'])])
+			self.assertEqual(read_text(path), before)
+
+	def test_bad_watch_on_a_missing_or_empty_read_is_type_error(self):
+		with self.assertRaises(TypeError):
+			TSVZ.replay_bytes(b'', '\t', watch=object())
+		with self.assertRaises(TypeError):
+			TSVZ.replay_part('/no/such/tsvz-marker-watch.tsvz', '\t', watch=object())
+		with self.assertRaises(TypeError):
+			TSVZ.read_multipart('/no/such/tsvz-marker-watch.tsvz', watch=object())
+		with self.assertRaises(TypeError):
+			TSVZ.read_store('/no/such/tsvz-marker-watch.tsvz', watch=object())
+		with self.assertRaises(TypeError):
+			TSVZ.read_offsets('/no/such/tsvz-marker-watch.tsvz', watch=object())
+		empty = TSVZ.MarkerWatch()
+		store, state = TSVZ.replay_bytes(b'', '\t', watch=empty)
+		self.assertEqual(list(store), [])
+		self.assertIsInstance(state, TSVZ.ReaderState)
+
+	def test_read_offsets_and_read_multipart_notify_in_ordinal_order(self):
+		with TempFile(suffix='.tsv', content=b'#__meta__#\tx\na\t1\n') as path:
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			offsets, _values, _state = TSVZ.read_offsets(path, watch=watch)
+			self.assertEqual(seen, ['#__meta__#\tx'])
+			self.assertIn('a', offsets)
+		directory = tempfile.mkdtemp()
+		try:
+			base = os.path.join(directory, 'ev.tsvz')
+			with open(TSVZ.part_path(base, 1), 'w') as handle:
+				handle.write('#__meta__#\tone\n')
+			with open(TSVZ.part_path(base, 2), 'w') as handle:
+				handle.write('#__meta__#\ttwo\nk\tv\n')
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			rows = TSVZ.read_multipart(base, watch=watch)
+			self.assertEqual(seen, ['#__meta__#\tone', '#__meta__#\ttwo'])
+			self.assertEqual(rows['k'], ['k', 'v'])
+		finally:
+			shutil.rmtree(directory)
+
+	def test_last_record_snapshot_and_verify_do_not_notify(self):
+		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\na\t1\n') as path:
+			seen = []
+			watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+			with warnings.catch_warnings():
+				warnings.simplefilter('ignore', DeprecationWarning)
+				self.assertEqual(
+					TSVZ.read_store(path, watch=watch, last_record_only=True),
+					['a', '1'])
+			self.assertEqual(seen, [])
+			calls = []
+			real = TSVZ.process_record
+
+			def spy(raw_line, state, store, delimiter, **kwargs):
+				calls.append(kwargs.get('watch'))
+				return real(raw_line, state, store, delimiter, **kwargs)
+
+			TSVZ.process_record = spy
+			try:
+				TSVZ.snapshot_part(path)
+				TSVZ.verify_part(path)
+			finally:
+				TSVZ.process_record = real
+			self.assertTrue(calls)
+			self.assertTrue(all(item is None for item in calls))
+			text = read_text(path)
+			self.assertNotIn('#__meta__#', text)
+			self.assertIn('a\t1', text)
+
 
 if __name__ == '__main__':
 	unittest.main()

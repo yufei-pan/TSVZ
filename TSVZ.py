@@ -1248,7 +1248,7 @@ def _iter_records(stream, encoding, *, errors='replace', source=''):
 
 def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 				 store_offset=False, values_cache=None, bound_states=None,
-				 errors='replace', digests=None):
+				 errors='replace', digests=None, watch=None):
 	"""Replay committed bytes into a key->entry mapping (last write wins).
 
 	Only the committed payload is processed (§4.3).
@@ -1263,6 +1263,8 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 		values_cache: Optional key->row cache filled during replay.
 		errors: Decode error policy; see :func:`_iter_records`.
 		digests: Optional :class:`DigestSet` collecting §15 verification.
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		tuple: ``(store, state)`` where ``state`` is the final
@@ -1273,6 +1275,7 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 		>>> sorted((k, list(v.row)) for k, v in store.items())
 		[('a', ['a', '2'])]
 	"""
+	_require_watch(watch)
 	if store is None:
 		store = OrderedDict()
 	state = ReaderState()
@@ -1281,14 +1284,14 @@ def replay_bytes(data, delimiter, *, encoding='utf8', store=None,
 			line, state, store, delimiter,
 			offset=offset, store_offset=store_offset, values_cache=values_cache,
 			bound_states=bound_states,
-			digests=digests, raw_bytes=raw,
+			digests=digests, raw_bytes=raw, watch=watch,
 		)
 	return store, state
 
 
 def replay_part(path, delimiter, *, encoding='utf8', store=None,
 				store_offset=False, values_cache=None, bound_states=None,
-				errors='replace', digests=None, state=None):
+				errors='replace', digests=None, state=None, watch=None):
 	"""Replay a part file from disk into a key->entry mapping.
 
 	Streams the part rather than reading it whole, so peak memory scales with
@@ -1307,10 +1310,13 @@ def replay_part(path, delimiter, *, encoding='utf8', store=None,
 		state: Optional :class:`ReaderState` to continue from. Multi-part
 			replay passes the previous part's state so marker state carries
 			across the boundary (§17.4).
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		tuple: ``(store, state)`` after replaying the part.
 	"""
+	_require_watch(watch)
 	if store is None:
 		store = OrderedDict()
 	if state is None:
@@ -1322,24 +1328,28 @@ def replay_part(path, delimiter, *, encoding='utf8', store=None,
 	with handle, handle.stream() as f:
 		_replay_stream(f, path, delimiter, encoding=encoding, store=store, state=state,
 					   store_offset=store_offset, values_cache=values_cache,
-					   bound_states=bound_states, errors=errors, digests=digests)
+					   bound_states=bound_states, errors=errors, digests=digests,
+					   watch=watch)
 	return store, state
 
 
 def _replay_stream(f, path, delimiter, *, encoding, store, state, store_offset=False,
-				   values_cache=None, bound_states=None, errors='replace', digests=None):
+				   values_cache=None, bound_states=None, errors='replace', digests=None,
+				   watch=None):
 	"""Replay the committed records of an open, decompressed part stream."""
+	_require_watch(watch)
 	for offset, line, raw in _iter_records(f, encoding, errors=errors, source=path):
 		process_record(
 			line, state, store, delimiter, offset=offset,
 			store_offset=store_offset, values_cache=values_cache,
 			bound_states=bound_states, digests=digests, raw_bytes=raw,
+			watch=watch,
 		)
 	return store, state
 
 
 def replay_parts(paths, delimiter, *, encoding='utf8', store=None, state=None,
-				 digests=None, errors='replace'):
+				 digests=None, errors='replace', watch=None):
 	"""Replay several parts as ONE concatenation (§17.4).
 
 	Marker state (§12) and integrity accumulators (§15.4) both carry across
@@ -1354,10 +1364,13 @@ def replay_parts(paths, delimiter, *, encoding='utf8', store=None, state=None,
 		state: Optional starting :class:`ReaderState`.
 		digests: Optional :class:`DigestSet` spanning every part.
 		errors: Decode error policy; see :func:`_iter_records`.
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		tuple: ``(store, state, digests)`` after the last part.
 	"""
+	_require_watch(watch)
 	if store is None:
 		store = OrderedDict()
 	if state is None:
@@ -1367,13 +1380,14 @@ def replay_parts(paths, delimiter, *, encoding='utf8', store=None, state=None,
 	for path in paths:
 		store, state = replay_part(
 			path, delimiter, encoding=encoding, store=store, state=state,
-			digests=digests, errors=errors,
+			digests=digests, errors=errors, watch=watch,
 		)
 	return store, state, digests
 
 
 def read_multipart(store_path, *, encoding='utf8', delimiter=None, store=None,
-				   errors='replace', policy='warn', include_rotated=False):
+				   errors='replace', policy='warn', include_rotated=False,
+				   watch=None):
 	"""Replay a whole multi-part store into a key→row mapping (§17).
 
 	Parts are discovered by :func:`store_part_paths` and replayed in ordinal
@@ -1395,6 +1409,8 @@ def read_multipart(store_path, *, encoding='utf8', delimiter=None, store=None,
 			``'ignore'``.
 		include_rotated: If True, also replay ``.rotated`` parts. Off by
 			default because §17.2 excludes them from normal loading.
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		MutableMapping: Ordered key→row mapping, carrying ``_reader_state``,
@@ -1411,6 +1427,7 @@ def read_multipart(store_path, *, encoding='utf8', delimiter=None, store=None,
 		>>> dict(read_multipart(base))
 		{'b': ['b', '9']}
 	"""
+	_require_watch(watch)
 	delimiter = delimiter or delimiter_for_path(store_path)
 	paths = store_part_paths(store_path, include_rotated=include_rotated)
 	if not paths:
@@ -1418,7 +1435,7 @@ def read_multipart(store_path, *, encoding='utf8', delimiter=None, store=None,
 	if store is None:
 		store = OrderedDict()
 	replayed, state, digests = replay_parts(
-		paths, delimiter, encoding=encoding, errors=errors)
+		paths, delimiter, encoding=encoding, errors=errors, watch=watch)
 	report_corruption(digests, store_path, policy)
 	clear, setitem = _base_mutators(store)
 	clear(store)
@@ -2762,13 +2779,15 @@ def _fit_row(row, column_count):
 
 
 def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
-				 store_offset, cache_values=True, policy='warn', bound_states=None):
+				 store_offset, cache_values=True, policy='warn', bound_states=None,
+				 watch=None):
 	"""Shared body of :func:`read_store` and :func:`read_offsets`.
 
 	Returns:
 		tuple: ``(store, state, values_cache, digests)``; ``values_cache`` is
 		``None`` unless ``store_offset`` is True.
 	"""
+	_require_watch(watch)
 	header_cols = _parse_columns(header, delimiter) if header else []
 	ensure_part_exists(
 		path, create=create, encoding=encoding, delimiter=delimiter,
@@ -2780,7 +2799,7 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 	replayed, state = replay_part(
 		path, delimiter, encoding=encoding, store=OrderedDict(),
 		store_offset=store_offset, values_cache=values_cache,
-		bound_states=bound_states, digests=digests,
+		bound_states=bound_states, digests=digests, watch=watch,
 	)
 	report_corruption(digests, path, policy)
 	# Replay is a read: fill the target through its base mapping so a live
@@ -2796,7 +2815,7 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 
 def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 			   defaults=None, store=None, store_offset=False, last_record_only=False,
-			   header=None, policy='warn'):
+			   header=None, policy='warn', watch=None):
 	"""Replay a part into an ordered mapping of key to row list.
 
 	Rows are in first-appearance order (§3.4). Each row keeps the width it
@@ -2820,6 +2839,8 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 		policy: Response to a §15 integrity mismatch — ``'warn'`` (default),
 			``'raise'``, or ``'ignore'``. A part with no ``#_checksum_*_#``
 			markers is never checked (§15.1).
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		MutableMapping: Ordered key→row mapping. Carries a ``_digests``
@@ -2841,10 +2862,11 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 		{'a': ['a', '1'], 'b': ['b', '2']}
 		>>> os.unlink(path)
 	"""
+	_require_watch(watch)
 	delimiter = delimiter or delimiter_for_path(path)
 	if not (last_record_only or store_offset) and _promoted_parts(path):
 		return read_multipart(path, encoding=encoding, delimiter=delimiter,
-							  store=store, policy=policy)
+							  store=store, policy=policy, watch=watch)
 	if last_record_only:
 		warnings.warn(
 			'read_store(last_record_only=True) is deprecated; call '
@@ -2864,21 +2886,23 @@ def read_store(path, *, create=False, encoding='utf8', delimiter=None,
 			store = OrderedDict()
 		store, state, values_cache, digests = _replay_into(
 			path, store, create=create, encoding=encoding, delimiter=delimiter,
-			defaults=defaults, header=header, store_offset=True, policy=policy)
+			defaults=defaults, header=header, store_offset=True, policy=policy,
+			watch=watch)
 		_attach_replay_meta(store, state, values_cache, digests)
 		return store
 	if store is None:
 		store = OrderedDict()
 	store, state, _values, digests = _replay_into(
 		path, store, create=create, encoding=encoding, delimiter=delimiter,
-		defaults=defaults, header=header, store_offset=False, policy=policy)
+		defaults=defaults, header=header, store_offset=False, policy=policy,
+		watch=watch)
 	_attach_replay_meta(store, state, None, digests)
 	return store
 
 
 def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 				 defaults=None, header=None, store=None, cache_values=True,
-				 policy='warn', bound_states=None):
+				 policy='warn', bound_states=None, watch=None):
 	"""Replay a part into a key→byte-offset index instead of materialized rows.
 
 	Offsets address the start of each key's winning record in the *decoded*
@@ -2900,6 +2924,8 @@ def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 			(``defaults``, ``fill_empty``, ``strip_trailing``) that applied at
 			each winning row. :class:`OffsetStore` uses this to re-read a
 			line under the state in force at that offset.
+		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
+			during this scan. ``None`` leaves those lines ignored.
 
 	Returns:
 		tuple: ``(offsets, values, state)`` — key→offset mapping, the
@@ -2915,6 +2941,7 @@ def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 		(4, ['b', '2'])
 		>>> os.unlink(path)
 	"""
+	_require_watch(watch)
 	delimiter = delimiter or delimiter_for_path(path)
 	_reject_promoted(path, 'an offset index')
 	if store is None:
@@ -2922,7 +2949,8 @@ def read_offsets(path, *, create=False, encoding='utf8', delimiter=None,
 	store, state, values_cache, digests = _replay_into(
 		path, store, create=create, encoding=encoding, delimiter=delimiter,
 		defaults=defaults, header=header, store_offset=True,
-		cache_values=cache_values, policy=policy, bound_states=bound_states)
+		cache_values=cache_values, policy=policy, bound_states=bound_states,
+		watch=watch)
 	_attach_replay_meta(store, state, values_cache, digests)
 	return store, values_cache, state
 
