@@ -3600,6 +3600,32 @@ class TestMarkerWatch(unittest.TestCase):
 			finally:
 				store.close()
 
+	def test_multipart_create_false_on_existing_store_reloads_empty(self):
+		directory = tempfile.mkdtemp()
+		try:
+			base = os.path.join(directory, 'ev.tsvz')
+			with open(base, 'w') as handle:
+				handle.write('a\t1\n')
+			store = TSVZ.WalStore(base, multipart=True, create=False, flush_interval=1000)
+			try:
+				self.assertEqual(list(store), [])
+				self.assertIs(store.reload(), store)
+				self.assertEqual(list(store), [])
+			finally:
+				store.close()
+			os.unlink(base)
+			with open(TSVZ.part_path(base, 1), 'w') as handle:
+				handle.write('b\t2\n')
+			store = TSVZ.WalStore(base, multipart=True, create=False, flush_interval=1000)
+			try:
+				self.assertEqual(list(store), [])
+				self.assertIs(store.reload(), store)
+				self.assertEqual(list(store), [])
+			finally:
+				store.close()
+		finally:
+			shutil.rmtree(directory)
+
 	def test_walstore_construction_failure_starts_no_thread(self):
 		with TempFile(suffix='.tsvz', content=b'#__meta__#\tx\n') as path:
 			def boom(line):

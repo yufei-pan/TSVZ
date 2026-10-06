@@ -3775,9 +3775,12 @@ class WalStore(_StoreCommon, OrderedDict):
 
 		Pending writes that have not yet been flushed are preserved across
 		the reload. A ``FileNotFoundError`` is an empty reload only when
-		``create`` is false and the part is actually absent. One raised while
-		the part is present, including from a watch callback, propagates and
-		leaves the in-memory rows and the pending queue in place.
+		``create`` is false and the active part file (``self.path``) is
+		absent. For a multi-part store that file is the fresh ordinal, which
+		is not created when ``create`` is false, even if older parts exist.
+		One raised while that file is present, including from a watch
+		callback, propagates and leaves the in-memory rows and the pending
+		queue in place.
 
 		Replay reads into a private mapping and repopulates ``self`` through
 		``OrderedDict.__setitem__``. Handing ``self`` to :func:`read_store`
@@ -3805,14 +3808,13 @@ class WalStore(_StoreCommon, OrderedDict):
 					header=self.header or None, watch=self._watch,
 				)
 		except FileNotFoundError:
-			# create=False on an absent part reloads as empty. If the part is
-			# still there, this came from the watch (or another reader) and
-			# must propagate before self or _pending is cleared.
-			if self.multipart:
-				present = bool(store_part_paths(self.store_path))
-			else:
-				present = os.path.exists(self.path)
-			if self.create or present:
+			# create=False on an absent active part reloads as empty. The
+			# callback runs only after ensure_part_exists(self.path) has
+			# succeeded, so a FileNotFoundError while that file is present
+			# must propagate before self or _pending is cleared. isfile, not
+			# the store's other parts: a fresh multipart ordinal is missing
+			# when create is false even though older parts exist.
+			if self.create or os.path.isfile(self.path):
 				raise
 		super().clear()
 		for key, row in loaded.items():
