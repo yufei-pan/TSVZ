@@ -195,6 +195,11 @@ class MarkerWatch:
 	Register one function per marker key with :meth:`add`. A full replay
 	that is given this object calls ``fn(line)`` for each matching
 	committed line. The call does not change reconstructed rows.
+
+	The callback runs on the reader thread. It must not reload or mutate
+	the store being read. :meth:`add` during the callback applies to later
+	lines in that scan. Concurrent :meth:`add` from another thread during
+	a scan is unsupported.
 	"""
 
 	def __init__(self):
@@ -228,7 +233,10 @@ class MarkerWatch:
 			raise TypeError('marker_key must be a str')
 		if not callable(fn):
 			raise TypeError('fn must be callable')
-		if (not MARKER_RE.match(marker_key)
+		# ``$`` in MARKER_RE matches before one trailing newline, but a logical
+		# line's first field never includes that newline. Reject it here only.
+		if ('\n' in marker_key
+				or not MARKER_RE.match(marker_key)
 				or marker_key.lower() in OFFICIAL_MARKERS
 				or CHECKSUM_MARKER_RE.match(marker_key.lower())):
 			raise ValueError(
@@ -2796,10 +2804,14 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 	values_cache = {} if (store_offset and cache_values) else None
 	# A DigestSet costs nothing until a #_checksum_*_# line arms it (§15.1).
 	digests = DigestSet()
+	# Bindings stay private until the scan and the integrity check both
+	# return. process_record writes a winning row before a later marker
+	# callback, so a raise must not leave the caller's map half-filled.
+	scan_bindings = None if bound_states is None else dict(bound_states)
 	replayed, state = replay_part(
 		path, delimiter, encoding=encoding, store=OrderedDict(),
 		store_offset=store_offset, values_cache=values_cache,
-		bound_states=bound_states, digests=digests, watch=watch,
+		bound_states=scan_bindings, digests=digests, watch=watch,
 	)
 	report_corruption(digests, path, policy)
 	# Replay is a read: fill the target through its base mapping so a live
@@ -2810,6 +2822,9 @@ def _replay_into(path, store, *, create, encoding, delimiter, defaults, header,
 	for key, value in replayed.items():
 		setitem(store, key, value if store_offset or not isinstance(value, StoreEntry)
 				else materialize_row(value))
+	if scan_bindings is not None:
+		bound_states.clear()
+		bound_states.update(scan_bindings)
 	return store, state, values_cache, digests
 
 
@@ -3698,7 +3713,8 @@ class WalStore(_StoreCommon, OrderedDict):
 		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
 			part before falling back to tombstones (§18).
 		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
-			during replay. ``None`` leaves those lines ignored.
+			during replay. ``None`` leaves those lines ignored. Callback
+			constraints are on :class:`MarkerWatch`.
 
 	The store holds a shared lock on its part for as long as it is open
 	(§18), so other handles cannot truncate or rewrite the part under it.
@@ -4169,7 +4185,8 @@ class OffsetStore(_StoreCommon, MutableMapping):
 		lock_timeout: Seconds :meth:`clear` waits for exclusive access to the
 			part before falling back to tombstones (§18).
 		watch: Optional :class:`MarkerWatch` invoked for unrecognized markers
-			during replay. ``None`` leaves those lines ignored.
+			during replay. ``None`` leaves those lines ignored. Callback
+			constraints are on :class:`MarkerWatch`.
 
 	The store holds a shared lock on its part for as long as it is open
 	(§18): stored offsets stay valid because nothing else can truncate or

@@ -3367,6 +3367,19 @@ class TestMarkerWatch(unittest.TestCase):
 		watch.notify('#__meta__#', 'still-there')
 		self.assertEqual(seen, ['still-there'])
 
+	def test_add_rejects_a_trailing_newline_without_replacing(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+		watch.add('#__meta__#', seen.append)
+
+		def other(line):
+			seen.append(('other', line))
+
+		with self.assertRaises(ValueError):
+			watch.add('#__meta__#\n', other)
+		watch.notify('#__meta__#', 'still-there')
+		self.assertEqual(seen, ['still-there'])
+
 	def test_empty_watch_notifies_nothing(self):
 		watch = TSVZ.MarkerWatch()
 		watch.notify('#__meta__#', '#__meta__#')
@@ -3477,6 +3490,18 @@ class TestMarkerWatch(unittest.TestCase):
 				TSVZ.read_store(path, watch=watch, store=caller)
 			self.assertEqual(list(caller.items()), [('old', ['old', 'row'])])
 			self.assertEqual(read_text(path), before)
+
+	def test_read_offsets_keeps_bound_states_when_callback_raises(self):
+		with TempFile(suffix='.tsv', content=b'k\tv\n#__meta__#\tx\n') as path:
+			bound_states = OrderedDict([('sentinel', ('keep',))])
+
+			def boom(line):
+				raise RuntimeError('stop')
+
+			watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+			with self.assertRaises(RuntimeError):
+				TSVZ.read_offsets(path, bound_states=bound_states, watch=watch)
+			self.assertEqual(list(bound_states.items()), [('sentinel', ('keep',))])
 
 	def test_bad_watch_on_a_missing_or_empty_read_is_type_error(self):
 		with self.assertRaises(TypeError):
