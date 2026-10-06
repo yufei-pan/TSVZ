@@ -244,6 +244,12 @@ class MarkerWatch:
 			fn(line)
 
 
+def _require_watch(watch):
+	"""Raise TypeError unless ``watch`` is None or a MarkerWatch."""
+	if watch is not None and not isinstance(watch, MarkerWatch):
+		raise TypeError('watch must be None or a MarkerWatch')
+
+
 __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorted
 	# Reading
 	'read_store', 'read_offsets', 'read_last_record', 'read_multipart',
@@ -1079,7 +1085,7 @@ def materialize_row(entry):
 
 def process_record(raw_line, state, store, delimiter, *, offset=None,
 				   store_offset=False, values_cache=None, bound_states=None,
-				   digests=None, raw_bytes=None):
+				   digests=None, raw_bytes=None, watch=None):
 	"""Process one logical line and update ``store``.
 
 	A line consisting of a lone key (no delimiter) is a tombstone
@@ -1101,6 +1107,8 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 		digests: Optional :class:`DigestSet` to feed and checkpoint (§15).
 		raw_bytes: The record's raw on-disk bytes including its terminator,
 			required when ``digests`` is given (§15.4).
+		watch: Optional :class:`MarkerWatch`. An unrecognized marker whose
+			key is registered calls ``fn(line)`` and stays ignored.
 
 	Returns:
 		tuple: ``(kind, payload)`` where ``kind`` is one of ``'data'``,
@@ -1122,6 +1130,7 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 		>>> list(store['bob'].row)
 		['bob', '']
 	"""
+	_require_watch(watch)
 	fields = raw_line.split(delimiter)
 	f0 = fields[0]
 	kind = classify_record(f0)
@@ -1138,6 +1147,8 @@ def process_record(raw_line, state, store, delimiter, *, offset=None,
 			digests.checkpoint(algo, expected)
 		return kind, algo
 	if kind in ('comment', 'ignore'):
+		if kind == 'ignore' and watch is not None:
+			watch.notify(f0, raw_line)
 		return kind, None
 	if kind == 'marker':
 		apply_marker(state, f0, fields[1:], delimiter)

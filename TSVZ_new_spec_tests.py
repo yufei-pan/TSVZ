@@ -3371,6 +3371,53 @@ class TestMarkerWatch(unittest.TestCase):
 		watch = TSVZ.MarkerWatch()
 		watch.notify('#__meta__#', '#__meta__#')
 
+	def test_process_record_calls_with_the_raw_logical_line(self):
+		seen = []
+		watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+		state, store = TSVZ.ReaderState(), OrderedDict()
+		kind, payload = TSVZ.process_record(
+			'#__META__#\ta<sep>b', state, store, '\t', watch=watch)
+		self.assertEqual((kind, payload, seen, list(store), state.defaults),
+						 ('ignore', None, ['#__META__#\ta<sep>b'], [], []))
+
+	def test_process_record_skips_comments_empty_keys_and_other_markers(self):
+		seen = []
+		watch = TSVZ.MarkerWatch().add('#__meta__#', seen.append)
+		state, store = TSVZ.ReaderState(), OrderedDict()
+		TSVZ.process_record('# a comment', state, store, '\t', watch=watch)
+		TSVZ.process_record('\tval', state, store, '\t', watch=watch)
+		TSVZ.process_record('#__other__#\tz', state, store, '\t', watch=watch)
+		TSVZ.process_record('#_defaults_#\tD1', state, store, '\t', watch=watch)
+		self.assertEqual(seen, [])
+		self.assertEqual(state.defaults, ['D1'])
+		self.assertEqual(list(store), [])
+
+	def test_process_record_discards_the_return_value(self):
+		watch = TSVZ.MarkerWatch().add('#__meta__#', lambda line: 'nope')
+		kind, payload = TSVZ.process_record(
+			'#__meta__#\tx', TSVZ.ReaderState(), OrderedDict(), '\t', watch=watch)
+		self.assertEqual((kind, payload), ('ignore', None))
+
+	def test_process_record_propagates_callback_errors(self):
+		def boom(line):
+			raise RuntimeError('stop')
+		watch = TSVZ.MarkerWatch().add('#__meta__#', boom)
+		with self.assertRaises(RuntimeError):
+			TSVZ.process_record(
+				'#__meta__#\tx', TSVZ.ReaderState(), {}, '\t', watch=watch)
+
+	def test_process_record_rejects_a_foreign_watch(self):
+		with self.assertRaises(TypeError):
+			TSVZ.process_record(
+				'#__meta__#\tx', TSVZ.ReaderState(), {}, '\t', watch=object())
+
+	def test_process_record_without_a_watch_stays_inert(self):
+		state, store = TSVZ.ReaderState(), OrderedDict()
+		self.assertEqual(
+			TSVZ.process_record('#__meta__#\tx', state, store, '\t'),
+			('ignore', None))
+		self.assertEqual(list(store), [])
+
 
 if __name__ == '__main__':
 	unittest.main()
