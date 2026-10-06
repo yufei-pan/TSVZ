@@ -3326,5 +3326,51 @@ class TestPromotion(_ScratchDir):
 		self.assertEqual(TSVZ.store_parts(base), [])
 
 
+class TestMarkerWatch(unittest.TestCase):
+	def test_add_chains_and_notify_passes_the_line(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+		self.assertIs(watch.add('#__meta__#', seen.append), watch)
+		watch.notify('#__META__#', '#__META__#\tpayload')
+		self.assertEqual(seen, ['#__META__#\tpayload'])
+
+	def test_second_key_and_replace(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+		watch.add('#__meta__#', lambda line: seen.append(('first', line)))
+		watch.add('#__other__#', lambda line: seen.append(('other', line)))
+		watch.add('#__Meta__#', lambda line: seen.append(('second', line)))
+		watch.notify('#__meta__#', 'meta-line')
+		watch.notify('#__other__#', 'other-line')
+		watch.notify('#__nope__#', 'absent')
+		self.assertEqual(seen, [('second', 'meta-line'), ('other', 'other-line')])
+
+	def test_future_marker_key_is_allowed(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+		watch.add('#_future_marker_#', seen.append)
+		watch.notify('#_future_marker_#', '#_future_marker_#')
+		self.assertEqual(seen, ['#_future_marker_#'])
+
+	def test_failed_add_keeps_the_previous_registration(self):
+		seen = []
+		watch = TSVZ.MarkerWatch()
+		watch.add('#__meta__#', seen.append)
+		with self.assertRaises(TypeError):
+			watch.add('#__meta__#', None)
+		with self.assertRaises(TypeError):
+			watch.add(1, seen.append)
+		for bad in ('# comment', '#_defaults_#', '#_DEFAULTS_#',
+					'#_checksum_sha256_#', '#_checksum_SHA256_#', 'alice'):
+			with self.assertRaises(ValueError):
+				watch.add(bad, seen.append)
+		watch.notify('#__meta__#', 'still-there')
+		self.assertEqual(seen, ['still-there'])
+
+	def test_empty_watch_notifies_nothing(self):
+		watch = TSVZ.MarkerWatch()
+		watch.notify('#__meta__#', '#__meta__#')
+
+
 if __name__ == '__main__':
 	unittest.main()

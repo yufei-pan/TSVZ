@@ -188,6 +188,62 @@ OFFICIAL_MARKERS = frozenset({
 	'#_rotate_#', '#_write_ack_#',
 })
 
+
+class MarkerWatch:
+	"""Observational callbacks for unrecognized marker lines.
+
+	Register one function per marker key with :meth:`add`. A full replay
+	that is given this object calls ``fn(line)`` for each matching
+	committed line. The call does not change reconstructed rows.
+	"""
+
+	def __init__(self):
+		self._fns = {}
+
+	def add(self, marker_key, fn):
+		"""Register ``fn`` for one marker key.
+
+		Adding the same key again, ignoring ASCII case, replaces the
+		function. Official markers and checksum markers are rejected.
+
+		Args:
+			marker_key: Whole-field marker key, for example ``#__meta__#``.
+			fn: Called as ``fn(line)`` with the logical line.
+
+		Returns:
+			MarkerWatch: ``self``, so registrations can chain.
+
+		Raises:
+			TypeError: If ``marker_key`` is not a ``str`` or ``fn`` is not
+				callable.
+			ValueError: If ``marker_key`` is not a reserved marker key, or
+				is an official or checksum marker.
+
+		Examples:
+			>>> watch = MarkerWatch()
+			>>> watch.add('#__meta__#', lambda line: None) is watch
+			True
+		"""
+		if not isinstance(marker_key, str):
+			raise TypeError('marker_key must be a str')
+		if not callable(fn):
+			raise TypeError('fn must be callable')
+		if (not MARKER_RE.match(marker_key)
+				or marker_key.lower() in OFFICIAL_MARKERS
+				or CHECKSUM_MARKER_RE.match(marker_key.lower())):
+			raise ValueError(
+				'marker_key must be an unrecognized #_..._# marker, '
+				'not an official or checksum marker')
+		self._fns[marker_key.lower()] = fn
+		return self
+
+	def notify(self, field0, line):
+		"""Call the function registered for ``field0``, if any."""
+		fn = self._fns.get(field0.lower())
+		if fn is not None:
+			fn(line)
+
+
 __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorted
 	# Reading
 	'read_store', 'read_offsets', 'read_last_record', 'read_multipart',
@@ -211,7 +267,7 @@ __all__ = [  # noqa: RUF022  # grouped by concern, which reads better than sorte
 	# Paths and I/O
 	'open_part', 'delimiter_for_path', 'is_strict_store', 'is_compressed_path',
 	# Stores and state
-	'WalStore', 'OffsetStore', 'ReaderState', 'StoreEntry',
+	'WalStore', 'MarkerWatch', 'OffsetStore', 'ReaderState', 'StoreEntry',
 	# §18 locking
 	'StoreBusyError', 'DEFAULT_LOCK_TIMEOUT',
 	# Constants
