@@ -4168,7 +4168,7 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 
 def __main__():
 	import argparse
-	parser = argparse.ArgumentParser(description='TSVZed: A TSV / CSV / NSV file manager')
+	parser = argparse.ArgumentParser(description='TSVZ: a TSV / CSV / NSV / PSV key-value file manager (.tsvz / .csvz / .nsvz / .psvz follow tsvz-spec-v1)')
 	parser.add_argument('filename', type=str, help='The file to read')
 	parser.add_argument('operation', type=str,nargs='?', choices=['read','append','delete','clear','scrub'], help='The operation to perform. Note: scrub will also remove all comments. Default: read', default='read')
 	parser.add_argument('line', type=str, nargs='*', help='The line to append to the Tabular file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
@@ -4203,8 +4203,8 @@ def __main__():
 			defaults = []
 
 	if args.operation == 'read':
-		# check if the file exist
-		if not os.path.isfile(args.filename):
+		# check if the file exist (a .tsvz store may consist of numbered parts only)
+		if not (_storeParts(args.filename)[0] if _isSpecPath(args.filename) else os.path.isfile(args.filename)):
 			print(f"File not found: {args.filename}")
 			return
 		# read the file

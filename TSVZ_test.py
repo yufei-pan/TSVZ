@@ -1809,6 +1809,54 @@ def test_lite_switch_file_between_dialects(tmp_path):
 	assert lite['k'] == ['k', 'w'] and lite.dialect == 'tsvz'
 	lite.close()
 
+# ==========================================================================
+# CLI
+# ==========================================================================
+def _cli(*args, script='TSVZ.py'):
+	return subprocess.run([sys.executable, os.path.join(HERE, script)] + list(args),
+						  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+
+def test_cli_spec_operations(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	assert _cli(p, 'append', 'alice', 'Alice', '30').returncode == 0
+	assert _cli(p, 'append', 'bob', 'Bob', '7').returncode == 0
+	assert _cli(p, 'delete', 'bob').returncode == 0
+	out = _cli(p, 'read')
+	assert out.returncode == 0 and 'Alice' in out.stdout and 'Bob' not in out.stdout
+	assert open(p, 'rb').read() == b'alice\tAlice\t30\nbob\tBob\t7\nbob\n'
+	assert _cli(p, 'scrub').returncode == 0
+	assert open(p, 'rb').read() == b'#_version_#\t1\nalice\tAlice\t30\n'
+	assert _cli(p, 'clear').returncode == 0
+	assert open(p, 'rb').read() == b''
+
+
+def test_cli_reads_a_store_made_of_numbered_parts_only(tmp_path):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1', b'key1\tvalue1\n')
+	out = _cli(base, 'read')
+	assert out.returncode == 0 and 'File not found' not in out.stdout and 'value1' in out.stdout
+
+
+def test_cli_legacy_matches_339(tmp_path):
+	results = []
+	for script in ('TSVZ.py', 'TSVZ_old.py'):
+		d = tmp_path / script.split('.')[0]
+		d.mkdir()
+		p = str(d / 'c.tsv')
+		outputs = []
+		for args in (['-c', 'id\\tval', 'append', 'k', 'v'], ['append', 'j', 'w'], ['delete', 'k'], ['read'],
+					 ['scrub'], ['read'], ['clear', '-c', 'id\\tval']):
+			r = _cli(p, *args, script=script)
+			outputs.append((r.returncode, r.stdout.replace(str(d), 'D')))
+		results.append((outputs, open(p, 'rb').read()))
+	assert results[0] == results[1]
+
+
+def test_cli_version():
+	out = _cli('-V')
+	assert out.returncode == 0 and '4.1' in out.stdout
+
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
