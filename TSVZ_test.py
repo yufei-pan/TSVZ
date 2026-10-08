@@ -1509,5 +1509,171 @@ def test_tsvzed_spec_header_and_defaults_arguments(tmp_path):
 	t.close()
 
 
+# ==========================================================================
+# TSVZed on spec stores: writing (design §5.2–§5.5, §5.8)
+# ==========================================================================
+def test_tsvzed_spec_writes_rows_tombstones_and_hash_keys(tmp_path):
+	p = str(tmp_path / 'w.tsvz')
+	t = TSVZ.TSVZed(p, header='id\ta\tb')
+	t['k1'] = ['k1', 'x']
+	t['k2'] = ['k2', '', '']
+	t['#hash'] = 'v<1>'
+	t['k3'] = 'k3\ty\tz'
+	del t['k3']
+	t['k1'] = 'k1'
+	assert dict(t) == {'k2': ['k2', '', ''], '#hash': ['#hash', 'v<1>', '']}
+	t.close()
+	assert open(p, 'rb').read() == b'#id\ta\tb\nk1\tx\nk2\t\t\n<#>hash\tv<lt>1>\nk3\ty\tz\nk3\nk1\n'
+	t = TSVZ.TSVZed(p, header='id\ta\tb')
+	assert dict(t) == {'k2': ['k2', '', ''], '#hash': ['#hash', 'v<1>', '']}
+	t.close()
+
+
+def test_tsvzed_spec_markers_through_the_api(tmp_path):
+	p = str(tmp_path / 'm.tsvz')
+	t = TSVZ.TSVZed(p)
+	t['#_defaults_#'] = ['G', '0']
+	t['a'] = ['a', '', '']
+	t['#_return_defaults_when_missing_#'] = 'false'
+	t['#__tool__#'] = 'meta'
+	t['#_fill_empty_with_default_#'] = 'maybe'  # rejected: not written
+	assert t['a'] == ['a', 'G', '0'] and '#__tool__#' not in t
+	with pytest.raises(KeyError):
+		t['missing']
+	del t['#_defaults_#']
+	assert t.defaults == ['#_defaults_#']
+	t.close()
+	assert open(p, 'rb').read() == (b'#_defaults_#\tG\t0\na\tG\t0\n#_return_defaults_when_missing_#\tfalse\n'
+									b'#__tool__#\tmeta\n#_defaults_#\n')
+
+
+def test_tsvzed_spec_wide_values_are_kept(tmp_path):
+	p = str(tmp_path / 'w.tsvz')
+	t = TSVZ.TSVZed(p, header='id\tv')
+	t['k'] = ['k', '1', 'extra']
+	assert t['k'] == ['k', '1', 'extra']
+	t.close()
+	assert TSVZ.readTabularFile(p, header='id\tv') == {'k': ['k', '1', 'extra']}
+	s = TSVZ.TSVZed(p, header='id\tv', strict=True)
+	s['j'] = ['j', '1', 'extra']  # strict keeps 3.39's refusal
+	assert 'j' not in s
+	s.close()
+
+
+def test_tsvzed_spec_constructor_defaults_are_persisted_once(tmp_path):
+	p = str(tmp_path / 'd.tsvz')
+	_touch(p, b'a\t1\n')
+	for _ in range(2):
+		t = TSVZ.TSVZed(p, defaults=['X', 'Y'])
+		t.close()
+	assert open(p, 'rb').read() == b'a\t1\n#_defaults_#\tX\tY\n'
+	n = str(tmp_path / 'n.tsvz')
+	t = TSVZ.TSVZed(n, header='id\tv', defaults=['X'])
+	t.close()
+	assert open(n, 'rb').read() == b'#id\tv\n#_defaults_#\tX\n'
+
+
+def test_tsvzed_spec_append_truncates_torn_tail(tmp_path, capsys):
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'a\t1\nhalf')
+	t = TSVZ.TSVZed(p)
+	t['b'] = ['b', '2']
+	t.close()
+	assert open(p, 'rb').read() == b'a\t1\nb\t2\n'
+	warnings = _tsvz_warnings(capsys)
+	assert any('ignored uncommitted bytes' in w for w in warnings)
+	assert any("removed uncommitted tail b'half'" in w for w in warnings)
+
+
+def test_tsvzed_spec_repairs_damaged_gzip_before_appending(tmp_path):
+	g = str(tmp_path / 'g.tsvz.gz')
+	_touch(g, gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\nbr')[:-6])
+	t = TSVZ.TSVZed(g)
+	t['c'] = ['c', '3']
+	t.close()
+	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}
+	assert any('.damaged-' in name for name in os.listdir(str(tmp_path)))
+
+
+def test_tsvzed_spec_appends_go_to_the_active_part(tmp_path):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	_touch(base + '.2', b'b\t2\n')
+	t = TSVZ.TSVZed(base)
+	t['c'] = ['c', '3']
+	del t['a']
+	t.close()
+	assert open(base, 'rb').read() == b'a\t1\n'
+	assert open(base + '.2', 'rb').read() == b'b\t2\nc\t3\na\n'
+
+
+def test_tsvzed_spec_clear_keeps_markers_queued_before_it(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	t = TSVZ.TSVZed(p, header='id\tv')
+	t['a'] = ['a', '1']
+	t['#_defaults_#'] = ['D']
+	t.clear()
+	t['b'] = ['b', '']
+	t.close()
+	assert open(p, 'rb').read() == b'#id\tv\n#_defaults_#\tD\nb\tD\n'
+
+
+def test_tsvzed_spec_keeps_queue_when_writes_fail(tmp_path, capsys):
+	d = tmp_path / 'sub'
+	d.mkdir()
+	p = str(d / 'f.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	t._activePath = str(d / 'missing-dir' / 'f.tsvz')  # every write now fails
+	t['a'] = ['a', '1']
+	time.sleep(0.1)
+	assert _wait_for(lambda: len(t.appendQueue) == 1)
+	assert open(p, 'rb').read() == b''
+	t._activePath = p
+	assert _wait_for(lambda: not t.appendQueue)
+	t.close()
+	assert open(p, 'rb').read() == b'a\t1\n'
+	out = capsys.readouterr()
+	assert out.out.count('will retry') == 1 and 'writes recovered' in out.err
+
+
+def test_two_tsvzed_handles_on_one_tsvz_file(tmp_path):
+	p = str(tmp_path / 'shared.tsvz')
+	a = TSVZ.TSVZed(p, append_check_delay=0.002)
+	b = TSVZ.TSVZed(p, append_check_delay=0.002)
+	for i in range(50):
+		a['a%d' % i] = ['a%d' % i, str(i)]
+		b['b%d' % i] = ['b%d' % i, str(i)]
+	a.close()
+	b.close()
+	data = TSVZ.readTabularFile(p)
+	assert len(data) == 100 and data['a7'] == ['a7', '7'] and data['b49'] == ['b49', '49']
+	assert open(p, 'rb').read().count(b'\n') == 100
+
+
+def test_tsvzed_spec_recreates_a_deleted_file_on_append(tmp_path):
+	p = str(tmp_path / 'gone.tsvz')
+	t = TSVZ.TSVZed(p, monitor_external_changes=False)
+	os.remove(p)
+	t['a'] = ['a', '1']
+	t.close()
+	assert open(p, 'rb').read() == b'a\t1\n'
+
+
+def test_tsvzed_spec_survives_a_failed_external_reload(tmp_path, capsys):
+	p = str(tmp_path / 'x.tsvz')
+	_touch(p, b'#id\tv\n')
+	t = TSVZ.TSVZed(p, header='id\tv', strict=True, append_check_delay=0.01)
+	time.sleep(0.05)
+	_touch(p, b'#other\tcols\n')
+	st = os.stat(p)
+	os.utime(p, (st.st_atime + 1, st.st_mtime + 1))
+	assert _wait_for(lambda: not t.deSynced and t._specLoaded)
+	time.sleep(0.1)
+	t['k'] = ['k', 'v']
+	t.close()
+	assert b'k\tv\n' in open(p, 'rb').read()
+	assert 'Failed to reload' in capsys.readouterr().out
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

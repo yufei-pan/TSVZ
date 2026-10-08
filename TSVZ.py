@@ -2583,6 +2583,11 @@ class TSVZed(OrderedDict):
 		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
+		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
+				and not self.memoryOnly):
+			# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
+			self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
+			self._specState.sawDefaults = True
 		self._specLoaded = True
 		return self
 
@@ -2609,8 +2614,11 @@ class TSVZed(OrderedDict):
 		if reloadInternalFromFile is None:
 			reloadInternalFromFile = self.monitor_external_changes
 		if reloadInternalFromFile:
-			self.commitAppendToFile()
-			self.reload()
+			try:
+				self.commitAppendToFile()
+				self.reload()
+			except Exception as e:
+				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
 		self.deSynced = False
 		return True
 
@@ -2626,6 +2634,8 @@ class TSVZed(OrderedDict):
 		return False
 
 	def __setitem__(self,key,value):
+		if self._spec:
+			return self._specSetItem(key, value)
 		key = str(key).rstrip()
 		if not key:
 			self.__teePrintOrNot('Key cannot be empty','error')
@@ -2713,6 +2723,8 @@ class TSVZed(OrderedDict):
 		
 
 	def __delitem__(self,key):
+		if self._spec:
+			return self._specDelItem(key)
 		key = str(key).rstrip()
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = [DEFAULTS_INDICATOR_KEY]
@@ -2746,6 +2758,10 @@ class TSVZed(OrderedDict):
 		# resurrecting the deleted key. The key has already been removed from
 		# the mapping by the caller, so self[key] must not be accessed.
 		self.dirty = True
+		if self._spec:
+			# Spec §9.2: a tombstone is the lone key, never padded.
+			self.appendQueue.append(_specFormatRecord([key], self.delimiter))
+			return self
 		if self.correctColumnNum > 1:
 			emptyLine = [key]+['']*(self.correctColumnNum-1)
 		else:
@@ -2753,6 +2769,132 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Appending {emptyLine} to the appendQueue")
 		self.appendQueue.append(emptyLine)
+		return self
+
+	def _specSetItem(self, key, value):
+		"""__setitem__ for .tsvz (design §5.2): write the given cells, keep the padded row in memory."""
+		key = str(key).rstrip()
+		if not key:
+			self.__teePrintOrNot('Key cannot be empty','error')
+			return
+		if isinstance(value,str):
+			value = value.split(self.delimiter)
+		value = [str(s).rstrip() if s else '' for s in value]
+		if not value or value[0] != key:
+			value = [key]+value
+		if _MARKER_RE.match(key):
+			self._specSetMarker(key, value)
+			return
+		if len(value) == 1:
+			del self[key]
+			return
+		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+			self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
+			return
+		defaults = self.defaults
+		for i in range(1, min(len(value), len(defaults))):
+			if not value[i] and defaults[i]:
+				value[i] = defaults[i]
+		written = list(value)
+		if self.correctColumnNum <= 0:
+			self.correctColumnNum = len(value)
+		target = max(self.correctColumnNum, len(defaults))
+		if len(value) < target:
+			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
+		if key in self:
+			if OrderedDict.__getitem__(self, key) == value:
+				return
+			self.dirty = True
+		OrderedDict.__setitem__(self, key, value)
+		if self.memoryOnly:
+			return
+		self.appendQueue.append(_specFormatRecord(written, self.delimiter))
+		self.lastUpdateTime = get_time_ns()
+
+	def _specSetMarker(self, key, value):
+		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
+		keyLower = key.lower()
+		if keyLower in _SPEC_MARKER_KEYS:
+			reporter = _Reporter(self._fileName, self.teeLogger)
+			applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+			reporter.flush()
+			if not applied:
+				return
+			self.defaults = list(self._specState.defaults)
+		if self.verbose:
+			self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
+		if self.memoryOnly:
+			return
+		self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+		self.lastUpdateTime = get_time_ns()
+
+	def _specDelItem(self, key):
+		key = str(key).rstrip()
+		if _MARKER_RE.match(key):
+			# A lone marker key resets that marker (spec §12.1).
+			self._specSetMarker(key, [key])
+			return
+		if key not in self:
+			if self.verbose:
+				self.__teePrintOrNot(f"Key {key} not found")
+			return
+		OrderedDict.__delitem__(self, key)
+		if self.memoryOnly:
+			return
+		self.__appendEmptyLine(key)
+		self.lastUpdateTime = get_time_ns()
+
+	def _specCommit(self):
+		"""Append the queued records to the active part (design §5.4).
+
+		Records stay queued until the write succeeds; a failure is reported once
+		and retried on the next tick.
+		"""
+		if not self.appendQueue:
+			return self
+		if self.memoryOnly:
+			self.appendQueue.clear()
+			return self
+		items = []
+		while self.appendQueue:
+			items.append(self.appendQueue.popleft())
+		payload = ''.join(item + '\n' for item in items).encode('utf-8')
+		reporter = _Reporter(self._fileName, self.teeLogger)
+		with self.writeLock:
+			try:
+				info = self._activeInfo
+				repair = bool(info is not None and info.codec and (info.damaged or info.tail))
+				_specAppendPayload(self._activePath, payload, reporter, repair=repair, fsync=True)
+				self._activeInfo = None
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+				if self._writeFailing:
+					self._writeFailing = False
+					_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
+			except Exception as e:
+				self.appendQueue.extendleft(reversed(items))
+				if not self._writeFailing:
+					self._writeFailing = True
+					self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._activePath}: {e}; will retry",'error')
+					import traceback
+					self.__teePrintOrNot(traceback.format_exc(),'error')
+		reporter.flush()
+		return self
+
+	def _specClearFile(self):
+		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place."""
+		try:
+			self.commitAppendToFile()
+			self.appendQueue.clear()
+			with self.writeLock:
+				_specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
+									  verbose=self.verbose, delimiter=self.delimiter)
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+			self.dirty = False
+			self.deSynced = False
+		except Exception as e:
+			self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
+			import traceback
+			self.__teePrintOrNot(traceback.format_exc(),'error')
 		return self
 
 	def getListView(self):
@@ -2770,6 +2912,8 @@ class TSVZed(OrderedDict):
 		return self
 
 	def clear_file(self):
+		if self._spec:
+			return self._specClearFile()
 		file = None
 		try:
 			if self.header:
@@ -3107,6 +3251,8 @@ memoryOnly:{self.memoryOnly}
 		self.commitAppendToFile()
 
 	def commitAppendToFile(self):
+		if self._spec:
+			return self._specCommit()
 		if self.appendQueue:
 			if self.memoryOnly:
 				self.appendQueue.clear()
