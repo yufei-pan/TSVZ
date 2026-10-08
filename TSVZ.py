@@ -13,14 +13,18 @@ extension) keep the exact TSVZ 3.39 format. ``.tsvz`` / ``.csvz`` / ``.nsvz``
 API: ``TSVZed``, ``TSVZedLite``, ``readTabularFile`` and friends.
 """
 import atexit
+import bisect
+import codecs
 import functools
+import hashlib
 import io
 import os
 import re
+import shutil
 import threading
 import time
 import sys
-from collections import OrderedDict, deque
+from collections import OrderedDict, deque, namedtuple
 from collections.abc import MutableMapping
 RESOURCE_LIB_AVAILABLE = True
 try:
@@ -72,6 +76,9 @@ def get_delimiter(delimiter = ...,file_name = ''):
 		if not file_name:
 			# Nothing to infer from; fall back to the module default.
 			return DEFAULT_DELIMITER
+		name = _parsePartName(file_name)
+		if name.ext in STRICT_EXTENSIONS:
+			return _EXTENSION_DELIMITERS[name.ext]
 		# Ignore a trailing compression extension so 'data.csv.gz' still
 		# infers ',' rather than the tab fallback.
 		lowerName = file_name.lower()
@@ -446,6 +453,215 @@ def __teePrintOrNot(message,level = 'info',teeLogger = None):
 			print(message,flush=True)
 	except Exception:
 		print(message,flush=True)
+
+# ---------------------------------------------------------------------------
+# 4.1 infrastructure: file names, dialect selection, warnings, locked appends
+# ---------------------------------------------------------------------------
+STRICT_EXTENSIONS = ('tsvz', 'csvz', 'nsvz', 'psvz')
+_EXTENSION_DELIMITERS = {'tsv': '\t', 'csv': ',', 'nsv': '\0', 'psv': '|',
+						 'tsvz': '\t', 'csvz': ',', 'nsvz': '\0', 'psvz': '|'}
+_HEX_RE = re.compile(r'^[0-9A-Fa-f]+$')
+_PartName = namedtuple('_PartName', 'store ext ordinal rotated codec')
+#: Read size for spec-dialect parts (tests shrink it to force chunk splits).
+_CHUNK = 1 << 20
+
+
+def _parsePartName(path):
+	"""Split a file name per tsvz-spec-v1 Appendix A.
+
+	Returns ``_PartName(store, ext, ordinal, rotated, codec)``: ``store`` is the
+	path up to and including the format extension, ``ext`` the lowercase format
+	extension ('' when the name has none), ``ordinal`` an int or None,
+	``rotated`` a bool and ``codec`` the lowercase compression suffix or ''.
+	"""
+	rest, codec = path, ''
+	head, dot, tail = rest.rpartition('.')
+	if dot and tail.lower() in COMPRESSED_FILE_EXTENSIONS:
+		rest, codec = head, tail.lower()
+	plain = rest
+	rotated = False
+	head, dot, tail = rest.rpartition('.')
+	if dot and tail.lower() == 'rotated':
+		rest, rotated = head, True
+	ordinal = None
+	head, dot, tail = rest.rpartition('.')
+	if dot and _HEX_RE.match(tail) and head.rpartition('.')[2].lower() in _EXTENSION_DELIMITERS:
+		rest, ordinal = head, int(tail, 16)
+	head, dot, tail = rest.rpartition('.')
+	ext = tail.lower() if dot else ''
+	if ext not in _EXTENSION_DELIMITERS:
+		return _PartName(plain, '', None, False, codec)
+	return _PartName(rest, ext, ordinal, rotated, codec)
+
+
+def _isSpecPath(path):
+	"""True when ``path`` names a tsvz-spec-v1 file (``.tsvz``/``.csvz``/``.nsvz``/``.psvz``)."""
+	return _parsePartName(path).ext in STRICT_EXTENSIONS
+
+
+def _warn(message, teeLogger=None):
+	"""Report a tolerance warning through ``teeLogger``, else stderr (never stdout)."""
+	if teeLogger:
+		try:
+			teeLogger.teelog(message, 'warning')
+			return
+		except Exception:
+			pass
+	eprint(message)
+
+
+class _Reporter(object):
+	"""Collect tolerance events for one operation and report each kind once.
+
+	``note(kind, where, detail)`` records an event; ``where`` is a location such
+	as ``'line 17'`` or None. ``flush()`` prints one line per kind, in first-seen
+	order, with the number of occurrences and the first location.
+	"""
+
+	def __init__(self, path, teeLogger=None):
+		self.path = path
+		self.teeLogger = teeLogger
+		self._events = OrderedDict()
+
+	def note(self, kind, where, detail):
+		event = self._events.get(kind)
+		if event is None:
+			self._events[kind] = [1, where, detail]
+		else:
+			event[0] += 1
+
+	def flush(self):
+		for count, where, detail in self._events.values():
+			message = 'TSVZ warning: {}: {}'.format(self.path, detail)
+			if count > 1:
+				message += ' ({} occurrences{})'.format(count, ', first at ' + where if where else '')
+			elif where:
+				message += ' ({})'.format(where)
+			_warn(message, self.teeLogger)
+		self._events.clear()
+
+
+def _warnOnce(owner, kind, path, detail, teeLogger=None):
+	"""Warn about ``detail`` once per ``owner`` object and ``kind``."""
+	warned = owner.__dict__.setdefault('_tsvzWarned', set())
+	if kind in warned:
+		return
+	warned.add(kind)
+	_warn('TSVZ warning: {}: {}'.format(path, detail), teeLogger)
+
+
+_PATH_LOCKS = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _pathLock(path):
+	"""Return the process-wide lock for ``path``.
+
+	POSIX ``lockf`` does not exclude two handles of the same process, so 4.1
+	writers also hold this lock while they append to or rewrite a file.
+	"""
+	key = os.path.realpath(path)
+	with _PATH_LOCKS_GUARD:
+		lock = _PATH_LOCKS.get(key)
+		if lock is None:
+			lock = _PATH_LOCKS[key] = threading.RLock()
+		return lock
+
+
+def _lockFile(f):
+	"""Take the exclusive whole-file lock that 3.39 writers take."""
+	if os.name == 'posix':
+		fcntl.lockf(f, fcntl.LOCK_EX)
+	elif os.name == 'nt':
+		msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
+
+
+def _unlockFile(f):
+	try:
+		if os.name == 'posix':
+			fcntl.lockf(f, fcntl.LOCK_UN)
+		elif os.name == 'nt':
+			msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 2147483647)
+	except Exception:
+		pass
+
+
+def _lastNewlineEnd(f, size):
+	"""Return the offset just after the last b'\\n' within the first ``size`` bytes of ``f``, or 0."""
+	position = size
+	while position > 0:
+		step = min(65536, position)
+		position -= step
+		f.seek(position)
+		index = f.read(step).rfind(b'\n')
+		if index >= 0:
+			return position + index + 1
+	return 0
+
+
+def _endsWithoutNewline(f):
+	"""True when the readable binary file ``f`` is non-empty and does not end in b'\\n'."""
+	size = f.seek(0, os.SEEK_END)
+	if not size:
+		return False
+	f.seek(size - 1)
+	return f.read(1) != b'\n'
+
+
+def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
+	"""Append ``payload`` (whole records ending in b'\\n') to an uncompressed file.
+
+	The file is opened ``O_APPEND`` and locked (``_pathLock`` + ``lockf``). An
+	unterminated last line is handled per ``tailPolicy``: ``'newline'`` writes
+	b'\\n' first (legacy dialect: that line is a record), ``'truncate'`` cuts it
+	off (spec dialect: those bytes were never committed, spec §4.3). Either
+	repair is noted on ``reporter``. A missing file is created.
+	"""
+	with _pathLock(path):
+		with open(path, 'a+b') as f:
+			_lockFile(f)
+			try:
+				if _endsWithoutNewline(f):
+					size = f.seek(0, os.SEEK_END)
+					if tailPolicy == 'newline':
+						payload = b'\n' + payload
+						reporter.note('missing-newline', None, 'last line had no trailing newline; added one before appending')
+					else:
+						keep = _lastNewlineEnd(f, size)
+						f.seek(keep)
+						tail = f.read(size - keep)
+						f.truncate(keep)
+						reporter.note('truncated-tail', None, 'removed uncommitted tail {!r} before appending'.format(tail[:80]))
+				f.write(payload)
+				f.flush()
+				if fsync:
+					os.fsync(f.fileno())
+			finally:
+				_unlockFile(f)
+
+
+def _compressBytes(codec, data, level=1):
+	"""Compress ``data`` as one complete member / stream for ``codec``."""
+	if codec in ('gz', 'gzip'):
+		import gzip
+		return gzip.compress(data, compresslevel=level)
+	if codec in ('bz2', 'bzip2'):
+		import bz2
+		return bz2.compress(data, compresslevel=level)
+	if codec in ('xz', 'lzma'):
+		import lzma
+		return lzma.compress(data, preset=level)
+	from compression import zstd  # Python 3.14+
+	return zstd.compress(data, level=level)
+
+
+def _dirMtimeNs(path):
+	"""Modification time (ns) of the directory holding ``path``, or 0."""
+	try:
+		return os.stat(os.path.dirname(os.path.abspath(path))).st_mtime_ns
+	except OSError:
+		return 0
+
 
 def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,defaults = ...,
 				 storeOffset = False, offset = -1):

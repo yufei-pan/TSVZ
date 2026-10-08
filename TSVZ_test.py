@@ -544,5 +544,124 @@ def test_legacy_read_corpus_matches_339(tmp_path):
 	assert _content(new_path) == _content(old_path)
 
 
+# ==========================================================================
+# Infrastructure
+# ==========================================================================
+def test_parse_part_name():
+	P = TSVZ._parsePartName
+	assert P('/a/b.c/data.tsvz.1a2b.rotated.gz') == ('/a/b.c/data.tsvz', 'tsvz', 0x1a2b, True, 'gz')
+	assert P('data.tsvz') == ('data.tsvz', 'tsvz', None, False, '')
+	assert P('data.TSVZ.GZ') == ('data.TSVZ', 'tsvz', None, False, 'gz')
+	assert P('data.txt.gz') == ('data.txt', '', None, False, 'gz')
+	assert P('data.add') == ('data.add', '', None, False, '')
+	assert P('/x.tsv/data') == ('/x.tsv/data', '', None, False, '')
+	assert P('tsv') == ('tsv', '', None, False, '')
+	assert P('data.tsv.1') == ('data.tsv', 'tsv', 1, False, '')
+	assert P('data.tsvz.f.xz').ordinal == 15
+
+
+def test_is_spec_path():
+	assert TSVZ._isSpecPath('a.tsvz') and TSVZ._isSpecPath('a.csvz.10.zst') and TSVZ._isSpecPath('A.NSVZ')
+	assert not TSVZ._isSpecPath('a.tsv') and not TSVZ._isSpecPath('a.csv.gz') and not TSVZ._isSpecPath('a.txt')
+
+
+def test_get_delimiter_strict_extensions():
+	assert TSVZ.get_delimiter(..., 'a.tsvz') == '\t'
+	assert TSVZ.get_delimiter(..., 'a.csvz') == ','
+	assert TSVZ.get_delimiter(..., 'a.nsvz.gz') == '\0'
+	assert TSVZ.get_delimiter(..., 'a.psvz.1f') == '|'
+	assert TSVZ.get_delimiter(..., 'a.csv') == ','
+
+
+def test_reporter_summarises_once_per_kind(capsys):
+	reporter = TSVZ._Reporter('f.tsvz')
+	reporter.note('utf8', 'line 3', 'invalid UTF-8 replaced with U+FFFD')
+	reporter.note('utf8', 'line 9', 'invalid UTF-8 replaced with U+FFFD')
+	reporter.note('tail', None, "ignored uncommitted bytes after the last newline: b'x'")
+	reporter.flush()
+	reporter.flush()
+	assert _tsvz_warnings(capsys) == [
+		'TSVZ warning: f.tsvz: invalid UTF-8 replaced with U+FFFD (2 occurrences, first at line 3)',
+		"TSVZ warning: f.tsvz: ignored uncommitted bytes after the last newline: b'x'",
+	]
+
+
+def test_reporter_uses_tee_logger(capsys):
+	class Logger(object):
+		def __init__(self):
+			self.calls = []
+
+		def teelog(self, message, level):
+			self.calls.append((message, level))
+	log = Logger()
+	reporter = TSVZ._Reporter('f.tsvz', log)
+	reporter.note('x', 'line 1', 'detail')
+	reporter.flush()
+	assert log.calls == [('TSVZ warning: f.tsvz: detail (line 1)', 'warning')]
+	assert capsys.readouterr().err == ''
+
+
+def test_warn_once_per_owner(capsys):
+	class Owner(object):
+		pass
+	owner = Owner()
+	TSVZ._warnOnce(owner, 'k', 'p.tsv', 'said once')
+	TSVZ._warnOnce(owner, 'k', 'p.tsv', 'said once')
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: p.tsv: said once']
+
+
+def test_locked_append_newline_policy(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'a\t1')
+	reporter = TSVZ._Reporter(p)
+	TSVZ._lockedAppend(p, b'b\t2\n', 'newline', reporter)
+	reporter.flush()
+	assert open(p, 'rb').read() == b'a\t1\nb\t2\n'
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: last line had no trailing newline; added one before appending' % p]
+
+
+def test_locked_append_truncate_policy(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'a\t1\nbo')
+	reporter = TSVZ._Reporter(p)
+	TSVZ._lockedAppend(p, b'c\t3\n', 'truncate', reporter)
+	reporter.flush()
+	assert open(p, 'rb').read() == b'a\t1\nc\t3\n'
+	assert _tsvz_warnings(capsys) == ["TSVZ warning: %s: removed uncommitted tail b'bo' before appending" % p]
+
+
+def test_locked_append_whole_file_uncommitted_and_missing_file(tmp_path):
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'no newline at all')
+	TSVZ._lockedAppend(p, b'c\t3\n', 'truncate', TSVZ._Reporter(p))
+	assert open(p, 'rb').read() == b'c\t3\n'
+	q = str(tmp_path / 'new.tsvz')
+	TSVZ._lockedAppend(q, b'd\t4\n', 'truncate', TSVZ._Reporter(q))
+	assert open(q, 'rb').read() == b'd\t4\n'
+
+
+def test_last_newline_end_spans_blocks(tmp_path):
+	p = str(tmp_path / 'big')
+	_touch(p, b'x\n' + b'y' * 200000)
+	with open(p, 'rb') as f:
+		assert TSVZ._lastNewlineEnd(f, os.path.getsize(p)) == 2
+	_touch(p, b'y' * 70000)
+	with open(p, 'rb') as f:
+		assert TSVZ._lastNewlineEnd(f, os.path.getsize(p)) == 0
+
+
+def test_compress_bytes_roundtrip():
+	import bz2
+	import lzma
+	assert gzip.decompress(TSVZ._compressBytes('gz', b'abc\n')) == b'abc\n'
+	assert bz2.decompress(TSVZ._compressBytes('bz2', b'abc\n')) == b'abc\n'
+	assert lzma.decompress(TSVZ._compressBytes('xz', b'abc\n')) == b'abc\n'
+
+
+def test_path_lock_is_shared_per_real_path(tmp_path):
+	p = str(tmp_path / 'a.tsvz')
+	assert TSVZ._pathLock(p) is TSVZ._pathLock(os.path.join(str(tmp_path), '.', 'a.tsvz'))
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
