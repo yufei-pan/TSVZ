@@ -758,5 +758,69 @@ def test_l4_invalid_utf8_in_header_is_reported_and_matches_339(tmp_path, capsys)
 	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: invalid utf8 replaced with U+FFFD (line 1)' % p]
 
 
+# ==========================================================================
+# Legacy fixes L2 and L3
+# ==========================================================================
+def test_l2_tsvzed_all_empty_row_is_a_delete(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	t = TSVZ.TSVZed(p, header='id\ta\tb', rewrite_on_load=False)
+	t['k'] = ['k', 'x', 'y']
+	t['k'] = ['k', '', '']
+	assert 'k' not in t
+	t['j'] = ['j', '', '']
+	assert 'j' not in t
+	t['#scratch'] = ['#scratch', '', '']  # '#' keys stay memory-only, untouched by L2
+	assert '#scratch' in t
+	t.close()
+	assert 'k' not in TSVZ.readTabularFile(p, header='id\ta\tb')
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'values are all empty is a delete' in warnings[0]
+
+
+def test_l2_tsvzedlite_all_empty_row_is_a_delete(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	lite = TSVZ.TSVZedLite(p, header='id\ta\tb', strict=False)
+	lite['k'] = ['k', 'x', 'y']
+	lite['k'] = ['k', '', '']
+	assert 'k' not in lite.indexes
+	lite.close()
+	assert 'k' not in TSVZ.readTabularFile(p, header='id\ta\tb')
+	assert len(_tsvz_warnings(capsys)) == 1
+
+
+def test_l3_tsvzedlite_on_gzip_keeps_rows_in_memory(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv.gz')
+	TSVZ.appendLinesTabularFile(p, [['k1', 'x']], header='id\tv', createIfNotExist=True)
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	assert lite['k1'] == ['k1', 'x']
+	lite['k2'] = ['k2', 'y']
+	assert lite['k2'] == ['k2', 'y']
+	del lite['k1']
+	repr(lite)
+	lite.close()
+	assert dict(TSVZ.readTabularFile(p, header='id\tv')) == {'k2': ['k2', 'y']}
+	assert any('keeps rows in memory' in w for w in _tsvz_warnings(capsys))
+
+
+def test_l3_tsvzedlite_gzip_clear(tmp_path):
+	p = str(tmp_path / 'a.tsv.gz')
+	TSVZ.appendLinesTabularFile(p, [['k1', 'x']], header='id\tv', createIfNotExist=True)
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	lite.clear()
+	lite.close()
+	assert gzip.decompress(open(p, 'rb').read()) == b'id\tv\n'
+
+
+def test_l3_tsvzedlite_hash_keys_are_readable(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	lite['#memo'] = ['#memo', 'ram only']
+	assert lite['#memo'] == ['#memo', 'ram only']
+	assert lite.pop('#memo') == ['#memo', 'ram only']
+	lite['#memo'] = ['#memo', 'again']
+	assert lite.popitem() == ('#memo', ['#memo', 'again'])
+	lite.close()
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

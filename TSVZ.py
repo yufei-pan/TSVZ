@@ -1660,6 +1660,14 @@ class TSVZed(OrderedDict):
 					value[i] = self.defaults[i]
 					if self.verbose:
 						self.__teePrintOrNot(f"    Replacing empty value at {i} with default: {self.defaults[i]}")
+		if (len(value) > 1 and not any(value[1:]) and key != DEFAULTS_INDICATOR_KEY
+				and not key.startswith('#') and not self.memoryOnly):
+			# L2: on disk this row is a delete; make memory agree with the file.
+			_warnOnce(self, 'empty-row', self._fileName,
+					  f'in .tsv files a row whose values are all empty is a delete; deleted {key!r} (use .tsvz to store empty rows)',
+					  self.teeLogger)
+			del self[key]
+			return
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = value
 			if self.verbose:
@@ -2296,6 +2304,10 @@ class TSVZedLite(MutableMapping):
 		self.verifyHeader = verifyHeader
 		self.verbose = verbose
 		self.encoding = encoding
+		# L3: offsets cannot address a compressed file; keep its rows in memory.
+		self._inMemoryRows = _isCompressedFile(fileName)
+		if self._inMemoryRows:
+			_warnOnce(self, 'compressed', fileName, 'compressed file: TSVZedLite keeps rows in memory and appends new compressed members')
 		if indexes is ...:
 			self.indexes = dict()
 			self.load()
@@ -2309,7 +2321,7 @@ class TSVZedLite(MutableMapping):
 			_verifyFileExistence(self._fileName, createIfNotExist = self.createIfNotExist,
 								  header = self.header, encoding = self.encoding,
 								  strict = self.strict, delimiter = self.delimiter)
-			self.fileObj = open(self._fileName,'r+b')
+			self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
 		else:
 			self.fileObj = fileObj
 		atexit.register(self.close)
@@ -2343,7 +2355,7 @@ class TSVZedLite(MutableMapping):
 		readTabularFile(self._fileName, header = self.header, createIfNotExist = self.createIfNotExist,
 				   verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self.indexes,
 				   encoding = self.encoding if self.encoding else None, strict = self.strict, 
-				   delimiter = self.delimiter, defaults=self.defaults,storeOffset=True)
+				   delimiter = self.delimiter, defaults=self.defaults,storeOffset=not self._inMemoryRows)
 		return self
 
 	def positions(self):
@@ -2357,6 +2369,10 @@ class TSVZedLite(MutableMapping):
 		return getListView(self,header=self.header,delimiter=self.delimiter)
 
 	def clear_file(self):
+		if self.fileObj is None:
+			clearTabularFile(self._fileName, header=self.header, verbose=self.verbose,
+							 encoding=self.encoding, delimiter=self.delimiter)
+			return self
 		if self.verbose:
 			eprint(f"Clearing {self._fileName}")
 		self.fileObj.seek(0)
@@ -2375,10 +2391,12 @@ class TSVZedLite(MutableMapping):
 			createIfNotExist = self.createIfNotExist
 		if verifyHeader is ...:
 			verifyHeader = self.verifyHeader
-		self.fileObj.close()
+		if self.fileObj is not None:
+			self.fileObj.close()
 		self._fileName = newFileName
+		self._inMemoryRows = _isCompressedFile(newFileName)
 		self.reload()
-		self.fileObj = open(self._fileName,'r+b')
+		self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		return self
@@ -2386,6 +2404,11 @@ class TSVZedLite(MutableMapping):
 	# Private methods for reading and writing values for TSVZedLite
 
 	def __writeValues(self,data):
+		if self.fileObj is None:
+			line = self.delimiter.join(_sanitize(data,delimiter=self.delimiter))
+			with openFileAsCompressed(self._fileName, mode='ab', encoding=self.encoding) as f:
+				f.write(line.encode(encoding=self.encoding,errors='replace') + b'\n')
+			return list(data)
 		write_at = self.fileObj.seek(0, os.SEEK_END)
 		if write_at:
 			self.fileObj.seek(write_at - 1)
@@ -2462,6 +2485,9 @@ class TSVZedLite(MutableMapping):
 				return self.defaults
 			raise KeyError(key)
 		pos = self.indexes[key]
+		if isinstance(pos, list):
+			# L3: rows held in memory ('#' keys, compressed files).
+			return pos
 		return self.__readValuesAtPos(pos,key)
 
 	def __setitem__(self,key,value):
@@ -2502,6 +2528,13 @@ class TSVZedLite(MutableMapping):
 					value[i] = self.defaults[i]
 					if self.verbose:
 						eprint(f"    Replacing empty value at {i} with default: {self.defaults[i]}")
+		if (len(value) > 1 and not any(value[1:]) and key != DEFAULTS_INDICATOR_KEY
+				and not key.startswith('#')):
+			# L2: on disk this row is a delete; make memory agree with the file.
+			_warnOnce(self, 'empty-row', self._fileName,
+					  f'in .tsv files a row whose values are all empty is a delete; deleted {key!r} (use .tsvz to store empty rows)')
+			del self[key]
+			return
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = value
 			if self.verbose:
@@ -2554,7 +2587,7 @@ class TSVZedLite(MutableMapping):
 				pos = self.indexes.pop(key)
 			except StopIteration:
 				raise KeyError("popitem(): dictionary is empty")
-		if return_pos:
+		if return_pos or isinstance(pos, list):
 			value = pos
 		else:
 			value = self.__readValuesAtPos(pos,key)
@@ -2572,7 +2605,7 @@ class TSVZedLite(MutableMapping):
 			elif default is ...:
 				return self.defaults
 			return default
-		if return_pos:
+		if return_pos or isinstance(pos, list):
 			value = pos
 		else:
 			value = self.__readValuesAtPos(pos,key)
@@ -2604,7 +2637,7 @@ delimiter:{self.delimiter}
 defaults:{self.defaults}
 verbose:{self.verbose}
 encoding:{self.encoding}
-file_descriptor:{self.fileObj.fileno()}
+file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 )"""
 
 	def __str__(self):
@@ -2670,7 +2703,8 @@ file_descriptor:{self.fileObj.fileno()}
 		return self
 	
 	def close(self):
-		self.fileObj.close()
+		if self.fileObj is not None:
+			self.fileObj.close()
 		return self
 
 	def __exit__(self,exc_type,exc_value,traceback):
