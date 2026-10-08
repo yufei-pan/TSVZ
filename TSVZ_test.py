@@ -1384,5 +1384,130 @@ def test_spec_scrub_empty_stores(tmp_path):
 		assert TSVZ.readTabularFile(p) == {}
 
 
+# ==========================================================================
+# TSVZed on spec stores: loading and reading (design §5.6, §6)
+# ==========================================================================
+def _wait_for(predicate, timeout=3.0):
+	deadline = time.time() + timeout
+	while not predicate() and time.time() < deadline:
+		time.sleep(0.01)
+	return predicate()
+
+
+def test_tsvzed_spec_loads_without_rewriting(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, APPENDIX_C)
+	mtime = os.stat(p).st_mtime_ns
+	t = TSVZ.TSVZed(p)
+	assert t.dialect == 'tsvz'
+	assert list(t) == ['alice', 'carol'] and t['alice'] == ['alice', 'Alice', '31']
+	assert t.defaults == ['#_defaults_#', 'guest', '0']
+	t.close()
+	assert open(p, 'rb').read() == APPENDIX_C and os.stat(p).st_mtime_ns == mtime
+
+
+def test_tsvzed_dialect_attribute_for_tsv(tmp_path):
+	t = TSVZ.TSVZed(str(tmp_path / 'a.tsv'))
+	assert t.dialect == 'tsv'
+	t.close()
+
+
+def test_tsvzed_spec_missing_key_returns_defaults(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, APPENDIX_C)
+	t = TSVZ.TSVZed(p)
+	assert t['bob'] == ['bob', 'guest', '0']
+	assert 'bob' not in t and t.get('bob') is None and t.get('bob', 7) == 7
+	assert t.pop('bob', 'x') == 'x'
+	t.close()
+	_touch(p, APPENDIX_C + b'#_return_defaults_when_missing_#\tfalse\n')
+	t = TSVZ.TSVZed(p)
+	with pytest.raises(KeyError):
+		t['bob']
+	t.close()
+
+
+def test_tsvzed_spec_empty_stores(tmp_path):
+	t = TSVZ.TSVZed(str(tmp_path / 'e.tsvz'), header='id\ta\tb')
+	assert dict(t) == {} and t['nobody'] == ['nobody', '', '']
+	t.close()
+	for content in (b'', b'#id\tv\n', b'#_defaults_#\tD\n'):
+		p = str(tmp_path / 'm.tsvz')
+		_touch(p, content)
+		t = TSVZ.TSVZed(p)
+		assert dict(t) == {}
+		t.close()
+
+
+def test_tsvzed_legacy_missing_key_still_raises(tmp_path):
+	t = TSVZ.TSVZed(str(tmp_path / 'a.tsv'))
+	with pytest.raises(KeyError):
+		t['nobody']
+	t.close()
+
+
+def test_tsvzed_spec_rewrite_features_warn_and_do_nothing(tmp_path, capsys):
+	p = str(tmp_path / 'r.tsvz')
+	_touch(p, b'a\t1\na\t2\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=True, rewrite_on_exit=True, rewrite_interval=5)
+	assert t.rewrite(force=True) is False
+	t.mapToFile()
+	t.hardMapToFile()
+	t.close()
+	assert open(p, 'rb').read() == b'a\t1\na\t2\n'
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 6 and all('ignored for .tsvz' in w for w in warnings)
+
+
+def test_tsvzed_spec_default_constructor_is_silent(tmp_path, capsys):
+	t = TSVZ.TSVZed(str(tmp_path / 'q.tsvz'))
+	t.close()
+	assert _tsvz_warnings(capsys) == []
+
+
+def test_tsvzed_spec_move_to_end_is_memory_only(tmp_path, capsys):
+	p = str(tmp_path / 'o.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p)
+	t.move_to_end('a')
+	assert list(t) == ['b', 'a'] and t.rewrite_on_exit is False
+	t.close()
+	assert open(p, 'rb').read() == b'a\t1\nb\t2\n'
+	assert any('move_to_end only reorders memory' in w for w in _tsvz_warnings(capsys))
+
+
+def test_tsvzed_spec_reloads_on_external_append(tmp_path):
+	p = str(tmp_path / 'x.tsvz')
+	_touch(p, b'a\t1\n')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	time.sleep(0.05)
+	with open(p, 'ab') as f:
+		f.write(b'b\t2\n')
+	st = os.stat(p)
+	os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+	assert _wait_for(lambda: 'b' in t)
+	assert t['b'] == ['b', '2']
+	t.close()
+
+
+def test_tsvzed_spec_reloads_when_a_new_part_appears(tmp_path):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	t = TSVZ.TSVZed(base, append_check_delay=0.01)
+	time.sleep(0.05)
+	_touch(base + '.5', b'b\t2\n')
+	assert _wait_for(lambda: 'b' in t)
+	assert t._activePath == base + '.5'
+	t.close()
+
+
+def test_tsvzed_spec_header_and_defaults_arguments(tmp_path):
+	p = str(tmp_path / 'h.tsvz')
+	_touch(p, b'#id\tname\tage\nk\tv\n')
+	t = TSVZ.TSVZed(p, header='id\tname\tage', defaults=['x', 'y'])
+	assert t.correctColumnNum == 3 and t['k'] == ['k', 'v', 'y']
+	t.close()
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

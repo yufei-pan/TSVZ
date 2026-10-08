@@ -2429,22 +2429,32 @@ class TSVZed(OrderedDict):
 	def getResourceUsage(self,return_dict = False):
 		return get_resource_usage(return_dict = return_dict)
 
-	def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,
+	def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,
 				  rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,
 				  verbose = False,encoding = 'utf8',delimiter = ...,defaults = None,strict = False,correctColumnNum = -1):
 		super().__init__()
+		self._spec = _isSpecPath(fileName)
 		self.version = version
 		self.strict = strict
 		self.externalFileUpdateTime = getFileUpdateTimeNs(fileName)
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self._fileName = fileName
 		self.teeLogger = teeLogger
-		self.delimiter = get_delimiter(delimiter,file_name=fileName)
+		if self._spec:
+			reporter = _Reporter(fileName, teeLogger)
+			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+			reporter.flush()
+		else:
+			self.delimiter = get_delimiter(delimiter,file_name=fileName)
 		self.setDefaults(defaults)
+		self._constructorDefaults = list(self.defaults)
 		self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
 		self.correctColumnNum = correctColumnNum
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
+		if rewrite_on_load is ...:
+			# 3.39 rewrote on load by default; spec stores are never rewritten implicitly.
+			rewrite_on_load = not self._spec
 		self.rewrite_on_load = rewrite_on_load
 		self.rewrite_on_exit = rewrite_on_exit
 		self.rewrite_interval = rewrite_interval
@@ -2463,6 +2473,20 @@ class TSVZed(OrderedDict):
 		self.encoding = encoding
 		self.writeLock = threading.Lock()
 		self.shutdownEvent = threading.Event()
+		if self._spec:
+			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
+								('rewrite_interval', rewrite_interval)):
+				if given:
+					_warnOnce(self, flag, fileName,
+							  f'{flag}={given!r} is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
+							  teeLogger)
+			self._specState = _SpecState(self.defaults)
+			self._parts = []
+			self._activePath = fileName
+			self._activeInfo = None
+			self._dirMtimeNs = _dirMtimeNs(fileName)
+			self._writeFailing = False
+			self._specLoaded = False
 		#self.appendEvent = threading.Event()
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
 		self.appendThread.start()
@@ -2490,11 +2514,13 @@ class TSVZed(OrderedDict):
 
 	def load(self):
 		self.reload()
-		if self.rewrite_on_load:
+		if self.rewrite_on_load and not self._spec:
 			self.rewrite(force = True,reloadInternalFromFile = False)
 		return self
 
 	def reload(self):
+		if self._spec:
+			return self._specReload()
 		# Load or refresh data from the TSV file
 		mo = self.memoryOnly
 		self.memoryOnly = True
@@ -2522,6 +2548,82 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self.memoryOnly = mo
 		return self
+
+	def _specReload(self):
+		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised."""
+		if self.verbose:
+			self.__teePrintOrNot(f"Loading {self._fileName}")
+		reporter = _Reporter(self._fileName, self.teeLogger)
+		load = None
+		try:
+			if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
+								self.strict, self.teeLogger, self.delimiter):
+				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
+								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
+								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
+		finally:
+			reporter.flush()
+		OrderedDict.clear(self)
+		width = -1
+		if load is not None:
+			for key, row in load.data.items():
+				OrderedDict.__setitem__(self, key, row)
+			self._specState = load.state
+			self.defaults = list(load.state.defaults)
+			self._parts, self._activePath = load.parts, load.active
+			info = load.infos[-1] if load.infos else None
+			self._activeInfo = info if info is not None and info.path == load.active else None
+			width = load.correctColumnNum
+		if self.header and any(self.header) and self.verifyHeader:
+			self.correctColumnNum = len(self.header)
+		else:
+			self.correctColumnNum = width
+		if self.verbose:
+			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
+		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+		self.lastUpdateTime = self.externalFileUpdateTime
+		self._dirMtimeNs = _dirMtimeNs(self._fileName)
+		self._specLoaded = True
+		return self
+
+	def __missing__(self, key):
+		# Spec §14.5: while #_return_defaults_when_missing_# is true a missing key
+		# reads as the active defaults. Only t[key] reaches this; get / in /
+		# setdefault / pop keep dict semantics.
+		if self._spec and self._specState.returnDefaults:
+			row = [key] + list(self.defaults[1:])
+			if self.correctColumnNum > len(row):
+				row += [''] * (self.correctColumnNum - len(row))
+			return row
+		raise KeyError(key)
+
+	@property
+	def dialect(self):
+		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
+		return 'tsvz' if self._spec else 'tsv'
+
+	def _specSync(self, reloadInternalFromFile=None):
+		"""The part of 3.39's rewrite() that .tsvz keeps: reload after an external change."""
+		if not self.deSynced:
+			return False
+		if reloadInternalFromFile is None:
+			reloadInternalFromFile = self.monitor_external_changes
+		if reloadInternalFromFile:
+			self.commitAppendToFile()
+			self.reload()
+		self.deSynced = False
+		return True
+
+	def _specExternalChanged(self):
+		"""True when another writer changed the active part or the set of parts."""
+		if getFileUpdateTimeNs(self._activePath) > self.externalFileUpdateTime:
+			return True
+		dirMtime = _dirMtimeNs(self._fileName)
+		if dirMtime != self._dirMtimeNs:
+			self._dirMtimeNs = dirMtime
+			if _storeParts(self._fileName)[0] != self._parts:
+				return True
+		return False
 
 	def __setitem__(self,key,value):
 		key = str(key).rstrip()
@@ -2761,6 +2863,11 @@ memoryOnly:{self.memoryOnly}
 		'''
 		key = str(key).rstrip()
 		super().move_to_end(key, last)
+		if self._spec:
+			_warnOnce(self, 'move_to_end', self._fileName,
+					  'move_to_end only reorders memory for .tsvz; the file keeps first-appearance order',
+					  self.teeLogger)
+			return self
 		self.dirty = True
 		if not self.rewrite_on_exit:
 			self.rewrite_on_exit = True
@@ -2790,7 +2897,7 @@ memoryOnly:{self.memoryOnly}
 		return size
 
 	@classmethod
-	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = True,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False):
+	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False):
 		'''Create a new ordered dictionary with keys from iterable and values set to value.
 		'''
 		self = cls(fileName,teeLogger,header,createIfNotExist,verifyHeader,rewrite_on_load,rewrite_on_exit,rewrite_interval,append_check_delay,verbose)
@@ -2800,6 +2907,12 @@ memoryOnly:{self.memoryOnly}
 
 
 	def rewrite(self,force = False,reloadInternalFromFile = None):
+		if self._spec:
+			_warnOnce(self, 'rewrite()', self._fileName,
+					  'rewrite() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
+					  self.teeLogger)
+			self._specSync(reloadInternalFromFile)
+			return False
 		if not self.deSynced and not force:
 			if not self.dirty:
 				return False
@@ -2836,6 +2949,11 @@ memoryOnly:{self.memoryOnly}
 			return False
 		
 	def hardMapToFile(self):
+		if self._spec:
+			_warnOnce(self, 'hardMapToFile()', self._fileName,
+					  'hardMapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
+					  self.teeLogger)
+			return self
 		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
@@ -2872,6 +2990,11 @@ memoryOnly:{self.memoryOnly}
 		return self
 	
 	def mapToFile(self):
+		if self._spec:
+			_warnOnce(self, 'mapToFile()', self._fileName,
+					  'mapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
+					  self.teeLogger)
+			return self
 		mec = self.monitor_external_changes
 		self.monitor_external_changes = False
 		file = None
@@ -2953,6 +3076,11 @@ memoryOnly:{self.memoryOnly}
 			return self
 		if not self.monitor_external_changes:
 			return self
+		if self._spec:
+			if self._specLoaded and self._specExternalChanged():
+				self.deSynced = True
+				self.__teePrintOrNot(f"External changes detected in {self._fileName}")
+			return self
 		realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 		if self.externalFileUpdateTime < realExternalFileUpdateTime:
 			self.deSynced = True
@@ -2966,7 +3094,10 @@ memoryOnly:{self.memoryOnly}
 		while not self.shutdownEvent.is_set():
 			if not self.memoryOnly:
 				self.checkExternalChanges()
-				self.rewrite()
+				if self._spec:
+					self._specSync()
+				else:
+					self.rewrite()
 				self.commitAppendToFile()
 			time.sleep(self.append_check_delay)
 			# self.appendEvent.wait()
@@ -3017,7 +3148,10 @@ memoryOnly:{self.memoryOnly}
 				# if self.verbose:
 				#     self.__teePrintOrNot(f"Append thread for {self._fileName} already stopped")
 				return
-			self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
+			if self._spec:
+				self._specSync()
+			else:
+				self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
 			# self.appendEvent.set()
 			self.shutdownEvent.set()  # Signal the append thread to shut down
 			self.appendThread.join()  # Wait for the append thread to complete 
