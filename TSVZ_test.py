@@ -270,6 +270,165 @@ def test_version_is_4_1():
 	assert not hasattr(TSVZ, 'WalStore')
 
 
+# ==========================================================================
+# Shared helpers for the 4.1 tests
+# ==========================================================================
+import gzip
+import random
+import subprocess
+from collections import OrderedDict
+
+import pytest
+
+import TSVZ_old
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LEGACY_HEADER = ['id', 'c1', 'c2']
+LEGACY_VALUES = ['a', 'b c', 'x<y', '#hash', '<sep>', '</sep/>', '<LF>', 'multi\nline',
+				 'trail  ', ' lead', 'é ü 中', 'tab\there', 'comma,here', 'pipe|here', '']
+
+
+def _touch(path, content=b''):
+	with open(path, 'wb') as f:
+		f.write(content)
+
+
+def _tsvz_warnings(capsys):
+	return [line for line in capsys.readouterr().err.splitlines() if line.startswith('TSVZ warning:')]
+
+
+def _content(path):
+	with open(path, 'rb') as f:
+		data = f.read()
+	return gzip.decompress(data) if path.endswith('.gz') else data
+
+
+def _twin_paths(base, suffix):
+	old_dir, new_dir = base / 'old', base / 'new'
+	old_dir.mkdir(parents=True, exist_ok=True)
+	new_dir.mkdir(parents=True, exist_ok=True)
+	return str(old_dir / ('data' + suffix)), str(new_dir / ('data' + suffix))
+
+
+def _legacy_ops(seed, count=40, hash_keys=True):
+	rng = random.Random(seed)
+	keys = ['k%d' % i for i in range(6)] + (['#memo'] if hash_keys else [])
+	ops = []
+	for _ in range(count):
+		roll = rng.random()
+		key = rng.choice(keys)
+		if roll < 0.55:
+			cells = [rng.choice(LEGACY_VALUES) for _ in range(rng.randint(1, 3))]
+			cells[0] = cells[0] or 'v'  # never all-empty: that case is fix L2
+			ops.append(('set', key, [key] + cells))
+		elif roll < 0.75:
+			ops.append(('del', key))
+		elif roll < 0.85:
+			ops.append(('lone', key))
+		elif roll < 0.92:
+			ops.append(('defaults', ['#_defaults_#', '', rng.choice(['NA', 'x y'])]))
+		else:
+			ops.append(('reopen',))
+	return ops
+
+
+def _apply_op(store, op):
+	if op[0] == 'set':
+		store[op[1]] = list(op[2])
+	elif op[0] == 'del':
+		del store[op[1]]
+	elif op[0] == 'lone':
+		store[op[1]] = op[1]
+	elif op[0] == 'defaults':
+		store['#_defaults_#'] = list(op[1])
+
+
+# ==========================================================================
+# Legacy dialect: differential tests against the frozen 3.39 module
+# ==========================================================================
+LEGACY_SUFFIXES = ['.tsv', '.csv', '.nsv', '.psv', '.tsv.gz']
+
+
+def _drive_tsvzed(mod, path, ops):
+	seen = []
+	kwargs = dict(header=LEGACY_HEADER, append_check_delay=0.001)
+	t = mod.TSVZed(path, **kwargs)
+	for op in ops:
+		if op[0] == 'reopen':
+			t.close()
+			seen.append(dict(t))
+			t = mod.TSVZed(path, **kwargs)
+			seen.append(dict(t))
+		else:
+			_apply_op(t, op)
+	t.close()
+	seen.append(dict(t))
+	t = mod.TSVZed(path, **kwargs)
+	seen.append(dict(t))
+	t.close()
+	return seen
+
+
+def _drive_lite(mod, path, ops):
+	seen = []
+	kwargs = dict(header=LEGACY_HEADER, strict=False)
+	lite = mod.TSVZedLite(path, **kwargs)
+	for op in ops:
+		if op[0] == 'reopen':
+			lite.close()
+			lite = mod.TSVZedLite(path, **kwargs)
+			seen.append({key: lite[key] for key in list(lite.indexes)})
+		else:
+			_apply_op(lite, op)
+	seen.append({key: lite[key] for key in list(lite.indexes)})
+	lite.close()
+	return seen
+
+
+def _drive_stateless(mod, path, seed):
+	rng = random.Random(seed)
+	out = []
+	delimiter = mod.get_delimiter(..., path)
+	for _ in range(6):
+		rows = []
+		for _ in range(rng.randint(1, 4)):
+			key = 'k%d' % rng.randint(0, 5)
+			rows.append([key] + [rng.choice(LEGACY_VALUES) or 'v' for _ in range(rng.randint(0, 3))])
+		mod.appendLinesTabularFile(path, rows, header=LEGACY_HEADER, createIfNotExist=True)
+		out.append(dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=False)))
+		out.append(dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True)))
+		out.append(mod.read_last_valid_line(path, {}, -1, delimiter=delimiter))
+	out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
+	out.append(_content(path))
+	mod.clearTabularFile(path, header=LEGACY_HEADER)
+	out.append(_content(path))
+	return out
+
+
+def test_legacy_tsvzed_matches_339(tmp_path):
+	for suffix in LEGACY_SUFFIXES:
+		for seed in range(4):
+			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
+			ops = _legacy_ops(seed)
+			assert _drive_tsvzed(TSVZ, new_path, ops) == _drive_tsvzed(TSVZ_old, old_path, ops), (suffix, seed)
+			assert _content(new_path) == _content(old_path), (suffix, seed)
+
+
+def test_legacy_tsvzedlite_matches_339(tmp_path):
+	for suffix in ['.tsv', '.csv', '.nsv', '.psv']:
+		for seed in range(4):
+			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
+			ops = _legacy_ops(seed, hash_keys=False)
+			assert _drive_lite(TSVZ, new_path, ops) == _drive_lite(TSVZ_old, old_path, ops), (suffix, seed)
+			assert _content(new_path) == _content(old_path), (suffix, seed)
+
+
+def test_legacy_stateless_helpers_match_339(tmp_path):
+	for suffix in LEGACY_SUFFIXES:
+		for seed in range(3):
+			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
+			assert _drive_stateless(TSVZ, new_path, seed) == _drive_stateless(TSVZ_old, old_path, seed), (suffix, seed)
+
 if __name__ == '__main__':
 	funcs = [(n, f) for n, f in sorted(globals().items())
 			 if n.startswith('test_') and callable(f)]
