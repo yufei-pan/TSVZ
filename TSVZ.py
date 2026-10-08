@@ -3497,42 +3497,240 @@ class TSVZedLite(MutableMapping):
 					delimiter = ...,defaults = None,strict = True,correctColumnNum = -1,
 					indexes = ..., fileObj = ...
 					):
+		self._spec = _isSpecPath(fileName)
 		self.version = version
 		self.strict = strict
 		self._fileName = fileName
-		self.delimiter = get_delimiter(delimiter,file_name=fileName)
+		if self._spec:
+			reporter = _Reporter(fileName)
+			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+			reporter.flush()
+		else:
+			self.delimiter = get_delimiter(delimiter,file_name=fileName)
 		self.setDefaults(defaults)
+		self._constructorDefaults = list(self.defaults)
 		self.header = _formatHeader(header,verbose = verbose,delimiter=self.delimiter)
 		self.correctColumnNum = correctColumnNum
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		self.verbose = verbose
 		self.encoding = encoding
-		# L3: offsets cannot address a compressed file; keep its rows in memory.
-		self._inMemoryRows = _isCompressedFile(fileName)
-		if self._inMemoryRows:
-			_warnOnce(self, 'compressed', fileName, 'compressed file: TSVZedLite keeps rows in memory and appends new compressed members')
+		if self._spec:
+			self._specInit(indexes, fileObj)
+		else:
+			# L3: offsets cannot address a compressed file; keep its rows in memory.
+			self._inMemoryRows = _isCompressedFile(fileName)
+			if self._inMemoryRows:
+				_warnOnce(self, 'compressed', fileName, 'compressed file: TSVZedLite keeps rows in memory and appends new compressed members')
+			if indexes is ...:
+				self.indexes = dict()
+				self.load()
+			else:
+				self.indexes = indexes
+			if fileObj is ...:
+				# 'r+b' requires the file to exist. When indexes were supplied
+				# externally, load() (which would have created it) is skipped, so
+				# ensure the file exists first -- creating it when allowed, or
+				# raising a clear FileNotFoundError instead of a cryptic open error.
+				_verifyFileExistence(self._fileName, createIfNotExist = self.createIfNotExist,
+									  header = self.header, encoding = self.encoding,
+									  strict = self.strict, delimiter = self.delimiter)
+				self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
+			else:
+				self.fileObj = fileObj
+		atexit.register(self.close)
+
+	def getResourceUsage(self,return_dict = False):
+		return get_resource_usage(return_dict = return_dict)
+
+	@property
+	def dialect(self):
+		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
+		return 'tsvz' if self._spec else 'tsv'
+
+	def __contains__(self, key):
+		if self._spec:
+			return str(key).rstrip() in self.indexes
+		return MutableMapping.__contains__(self, key)
+
+	def get(self, key, default=None):
+		if self._spec:
+			return self[key] if key in self else default
+		return MutableMapping.get(self, key, default)
+
+	def setdefault(self, key, default=None):
+		if self._spec:
+			if key not in self:
+				self[key] = default
+			return self[key]
+		return MutableMapping.setdefault(self, key, default)
+
+	def _specInit(self, indexes, fileObj):
+		self._inMemoryRows = False
+		self._specState = _SpecState(self.defaults)
+		self._transOffsets = []
+		self._transStates = []
+		self._activePath = self._fileName
+		self._pendingDefaults = False
+		self._pendingRepair = False
 		if indexes is ...:
 			self.indexes = dict()
 			self.load()
 		else:
 			self.indexes = indexes
+			# One scan for the marker state, the transitions and the active part.
+			self._specLiteLoad({})
 		if fileObj is ...:
-			# 'r+b' requires the file to exist. When indexes were supplied
-			# externally, load() (which would have created it) is skipped, so
-			# ensure the file exists first -- creating it when allowed, or
-			# raising a clear FileNotFoundError instead of a cryptic open error.
-			_verifyFileExistence(self._fileName, createIfNotExist = self.createIfNotExist,
-								  header = self.header, encoding = self.encoding,
-								  strict = self.strict, delimiter = self.delimiter)
-			self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
+			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
 		else:
 			self.fileObj = fileObj
-		atexit.register(self.close)
+		self._specFlushPendingDefaults()
 
-	# Implement custom methods just for TSVZedLite
-	def getResourceUsage(self,return_dict = False):
-		return get_resource_usage(return_dict = return_dict)
+	def _specLiteLoad(self, target):
+		"""Load key -> offset (active, uncompressed part) or key -> row (elsewhere) into ``target``."""
+		reporter = _Reporter(self._fileName)
+		try:
+			if not _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
+									self.strict, None, self.delimiter):
+				return self
+			load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
+							 strict=self.strict, defaults=self._constructorDefaults,
+							 correctColumnNum=self.correctColumnNum, storeOffset=True, taskDic=target,
+							 reporter=reporter, verbose=self.verbose)
+		finally:
+			reporter.flush()
+		self._specState = load.state
+		self.defaults = list(load.state.defaults)
+		self._activePath = load.active
+		self._inMemoryRows = bool(_parsePartName(load.active).codec)
+		info = load.infos[-1] if load.infos else None
+		self._pendingRepair = bool(info is not None and info.path == load.active and info.codec
+								   and (info.damaged or info.tail))
+		self._transOffsets = [offset for offset, _ in load.transitions]
+		self._transStates = [rowState for _, rowState in load.transitions]
+		if self.correctColumnNum == -1:
+			self.correctColumnNum = load.correctColumnNum
+		held = sum(1 for value in target.values() if isinstance(value, list))
+		if held:
+			_warnOnce(self, 'held', self._fileName, f'{held} keys from older or compressed parts are held in memory (offsets cannot address them)')
+		if not load.state.sawDefaults and any(self._constructorDefaults[1:]):
+			self._pendingDefaults = True
+		return self
+
+	def _specFlushPendingDefaults(self):
+		"""Persist constructor defaults the store never declared (design §5.3)."""
+		if self._pendingDefaults:
+			self._pendingDefaults = False
+			self._specWriteMarker(DEFAULTS_INDICATOR_KEY, list(self._constructorDefaults))
+
+	def _specReadAt(self, pos, key=...):
+		"""Read the row at ``pos`` under the marker state in force there (found by bisection)."""
+		self.fileObj.seek(pos)
+		raw = self.fileObj.readline()
+		index = bisect.bisect_right(self._transOffsets, pos) - 1
+		rowState = self._transStates[index] if index >= 0 else self._specState.rowState
+		state = _SpecState.fromRowState(rowState)
+		reporter = _Reporter(self._fileName)
+		record = None
+		if raw.endswith(b'\n'):
+			record = _specProcessRecord(_decodeLine(raw, reporter, f'offset {pos}'), state, self.delimiter, reporter, None)
+		reporter.flush()
+		segments = []
+		if record and record[1] is not None:
+			segments = record[1]
+			target = max(self.correctColumnNum, len(state.defaults))
+			if len(segments) < target:
+				segments.extend(state.defaults[j] if j < len(state.defaults) else '' for j in range(len(segments), target))
+		if self.verbose:
+			eprint(f"Read at position {pos}: {segments}")
+		if key is not ...:
+			if not segments:
+				eprint(f"Error: No segments found at position {pos}")
+			elif segments[0] != key:
+				eprint(f"Warning: Key mismatch at position {pos}: expected {key}, got {segments[0]}")
+			else:
+				return segments
+			if self.strict:
+				eprint("Error: Key mismatch and strict mode enabled. Raising KeyError.")
+				raise KeyError(key)
+			else:
+				eprint("Continuing despite key mismatch due to non-strict mode. Expect errors!")
+		return segments
+
+	def _specSetItem(self, key, value):
+		"""__setitem__ for .tsvz: same normalisation as TSVZed, written immediately."""
+		key = str(key).rstrip()
+		if not key:
+			eprint('Error: Key cannot be empty')
+			return
+		if isinstance(value,str):
+			value = value.split(self.delimiter)
+		value = [str(s).rstrip() if s else '' for s in value]
+		if not value or value[0] != key:
+			value = [key]+value
+		if _MARKER_RE.match(key):
+			self._specWriteMarker(key, value)
+			return
+		if len(value) == 1:
+			del self[key]
+			return
+		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+			eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
+			return
+		defaults = self.defaults
+		for i in range(1, min(len(value), len(defaults))):
+			if not value[i] and defaults[i]:
+				value[i] = defaults[i]
+		if self.correctColumnNum <= 0:
+			# Mirror _specLoad's width rule so memory and reads equal a reload.
+			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
+		offset = self._specWrite(_specFormatRecord(value, self.delimiter))
+		if offset is None:
+			target = max(self.correctColumnNum, len(defaults))
+			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
+			self.indexes[key] = value
+		else:
+			self.indexes[key] = offset
+
+	def _specWriteMarker(self, key, value):
+		keyLower = key.lower()
+		if keyLower in _SPEC_MARKER_KEYS:
+			reporter = _Reporter(self._fileName)
+			applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+			reporter.flush()
+			if not applied:
+				return
+			self.defaults = list(self._specState.defaults)
+		self._specWrite(_specFormatRecord(value, self.delimiter, marker=True))
+
+	def _specWrite(self, line):
+		"""Append one record to the active part; return its offset, or None for a compressed part."""
+		data = (line + '\n').encode('utf-8', errors='replace')
+		if self.fileObj is None:
+			reporter = _Reporter(self._activePath)
+			_specAppendPayload(self._activePath, data, reporter, repair=self._pendingRepair)
+			self._pendingRepair = False
+			reporter.flush()
+			return None
+		f = self.fileObj
+		with _pathLock(self._activePath):
+			size = f.seek(0, os.SEEK_END)
+			if size:
+				f.seek(size - 1)
+				if f.read(1) != b'\n':
+					keep = _lastNewlineEnd(f, size)
+					f.seek(keep)
+					tail = f.read(size - keep)
+					f.truncate(keep)
+					size = keep
+					_warn(f'TSVZ warning: {self._activePath}: removed uncommitted tail {tail[:80]!r} before appending')
+			f.seek(size)
+			f.write(data)
+			f.flush()
+		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
+			self._transOffsets.append(size)
+			self._transStates.append(self._specState.rowState)
+		return size
 
 	def setDefaults(self,defaults):
 		if not defaults:
@@ -3554,6 +3752,10 @@ class TSVZedLite(MutableMapping):
 		self.defaults = defaults
 
 	def load(self):
+		if self._spec:
+			if self.verbose:
+				eprint(f"Loading {self._fileName}")
+			return self._specLiteLoad(self.indexes)
 		if self.verbose:
 			eprint(f"Loading {self._fileName}")
 		readTabularFile(self._fileName, header = self.header, createIfNotExist = self.createIfNotExist,
@@ -3573,6 +3775,15 @@ class TSVZedLite(MutableMapping):
 		return getListView(self,header=self.header,delimiter=self.delimiter)
 
 	def clear_file(self):
+		if self._spec:
+			_specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter)
+			if self.fileObj is not None:
+				self.fileObj.close()
+			self.indexes.clear()
+			self._specLiteLoad(self.indexes)
+			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
+			self._specFlushPendingDefaults()
+			return self
 		if self.fileObj is None:
 			clearTabularFile(self._fileName, header=self.header, verbose=self.verbose,
 							 encoding=self.encoding, delimiter=self.delimiter)
@@ -3598,14 +3809,24 @@ class TSVZedLite(MutableMapping):
 		if self.fileObj is not None:
 			self.fileObj.close()
 		self._fileName = newFileName
-		self._inMemoryRows = _isCompressedFile(newFileName)
-		self.reload()
-		self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
+		self._spec = _isSpecPath(newFileName)
+		if self._spec:
+			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(newFileName).ext]
+			self._specState = _SpecState(self._constructorDefaults)
+			self._transOffsets, self._transStates = [], []
+			self._activePath = newFileName
+			self._pendingDefaults = False
+			self._pendingRepair = False
+			self.reload()
+			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
+			self._specFlushPendingDefaults()
+		else:
+			self._inMemoryRows = _isCompressedFile(newFileName)
+			self.reload()
+			self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		return self
-
-	# Private methods for reading and writing values for TSVZedLite
 
 	def __writeValues(self,data):
 		if self.fileObj is None:
@@ -3633,6 +3854,9 @@ class TSVZedLite(MutableMapping):
 		return write_at
 
 	def __mapDeleteToFile(self,key):
+		if self._spec:
+			self._specWrite(_specFormatRecord([key], self.delimiter))
+			return
 		# Persist a deletion by appending a tombstone (a lone key with no
 		# values); on read such a row deletes the key (see _processLine). The
 		# key must already have been removed from self.indexes by the caller --
@@ -3654,6 +3878,8 @@ class TSVZedLite(MutableMapping):
 		self.__writeValues([key])
 
 	def __readValuesAtPos(self,pos,key = ...):
+		if self._spec:
+			return self._specReadAt(pos, key)
 		self.fileObj.seek(pos)
 		line = self.fileObj.readline().decode(self.encoding,errors='replace')
 		self.correctColumnNum, segments = _processLine(
@@ -3687,14 +3913,22 @@ class TSVZedLite(MutableMapping):
 		if key not in self.indexes:
 			if key == DEFAULTS_INDICATOR_KEY:
 				return self.defaults
+			if self._spec and self._specState.returnDefaults:
+				# Spec §14.5: a missing key reads as the active defaults.
+				row = [key] + list(self.defaults[1:])
+				if self.correctColumnNum > len(row):
+					row += [''] * (self.correctColumnNum - len(row))
+				return row
 			raise KeyError(key)
 		pos = self.indexes[key]
 		if isinstance(pos, list):
-			# L3: rows held in memory ('#' keys, compressed files).
+			# L3: rows held in memory ('#' keys, compressed files, older parts).
 			return pos
 		return self.__readValuesAtPos(pos,key)
 
 	def __setitem__(self,key,value):
+		if self._spec:
+			return self._specSetItem(key, value)
 		key = str(key).rstrip()
 		if not key:
 			eprint('Error: Key cannot be empty')
@@ -3755,6 +3989,18 @@ class TSVZedLite(MutableMapping):
 		
 	def __delitem__(self,key):
 		key = str(key).rstrip()
+		if self._spec:
+			if _MARKER_RE.match(key):
+				# A lone marker key resets that marker (spec §12.1).
+				self._specWriteMarker(key, [key])
+				return
+			if key not in self.indexes:
+				if self.verbose:
+					eprint(f"Key {key} not found")
+				return
+			self.indexes.pop(key, None)
+			self._specWrite(_specFormatRecord([key], self.delimiter))
+			return
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.__mapDeleteToFile(key)
 			return

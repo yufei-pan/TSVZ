@@ -1721,5 +1721,94 @@ def test_tsvzed_spec_sync_keeps_memory_while_writes_fail(tmp_path):
 	t.close()
 
 
+# ==========================================================================
+# TSVZedLite on spec stores
+# ==========================================================================
+def test_lite_spec_reads_and_writes(tmp_path):
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, APPENDIX_C)
+	lite = TSVZ.TSVZedLite(p, strict=False)
+	assert lite.dialect == 'tsvz'
+	assert list(lite) == ['alice', 'carol']
+	assert lite['carol'] == ['carol', '', '25'] and lite['alice'] == ['alice', 'Alice', '31']
+	assert lite['bob'] == ['bob', 'guest', '0']
+	assert 'bob' not in lite and lite.get('bob') is None and lite.get('alice') == ['alice', 'Alice', '31']
+	assert lite.setdefault('carol', ['x']) == ['carol', '', '25']
+	lite['dave'] = ['dave', 'Dave']
+	assert lite['dave'] == ['dave', 'Dave', '0']
+	lite['#_defaults_#'] = ['G', '9']
+	lite['erin'] = ['erin', 'Erin']
+	assert lite['erin'] == ['erin', 'Erin', '9'] and lite['dave'] == ['dave', 'Dave', '0']
+	del lite['alice']
+	lite.close()
+	assert TSVZ.readTabularFile(p) == {'carol': ['carol', '', '25'], 'dave': ['dave', 'Dave', '0'],
+									   'erin': ['erin', 'Erin', '9']}
+
+
+def test_lite_spec_multipart_older_parts_in_memory(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\nb\t2\n')
+	_touch(base + '.3', b'c\t3\n')
+	lite = TSVZ.TSVZedLite(base, strict=False)
+	assert lite.indexes['a'] == ['a', '1'] and isinstance(lite.indexes['c'], int)
+	lite['d'] = ['d', '4']
+	del lite['a']
+	lite.close()
+	assert open(base + '.3', 'rb').read() == b'c\t3\nd\t4\na\n'
+	assert any('held in memory' in w for w in _tsvz_warnings(capsys))
+
+
+def test_lite_spec_gzip(tmp_path):
+	g = str(tmp_path / 'g.tsvz.gz')
+	TSVZ.appendLinesTabularFile(g, [['a', '1']], createIfNotExist=True)
+	lite = TSVZ.TSVZedLite(g, strict=False)
+	lite['b'] = ['b', '2']
+	assert lite['a'] == ['a', '1'] and lite['b'] == ['b', '2']
+	lite.close()
+	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'b': ['b', '2']}
+
+
+def test_lite_spec_external_indexes(tmp_path):
+	p = str(tmp_path / 'x.tsvz')
+	_touch(p, b'a\t1\n#_defaults_#\tQ\tR\nb\t2\n')
+	offsets = TSVZ.readTabularFile(p, storeOffset=True)
+	lite = TSVZ.TSVZedLite(p, indexes=offsets, strict=False)
+	assert lite['b'] == ['b', '2', 'R'] and lite['a'] == ['a', '1']
+	lite.close()
+
+
+def test_lite_spec_torn_tail_and_clear(tmp_path):
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'#id\tv\na\t1\nzz')
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	lite['b'] = ['b', '2']
+	assert open(p, 'rb').read() == b'#id\tv\na\t1\nb\t2\n'
+	lite.clear()
+	assert open(p, 'rb').read() == b'#id\tv\n'
+	lite['c'] = ['c', '3']
+	assert lite['c'] == ['c', '3'] and list(lite) == ['c']
+	lite.close()
+
+
+def test_lite_spec_constructor_defaults_persisted(tmp_path):
+	p = str(tmp_path / 'd.tsvz')
+	_touch(p, b'a\t1\n')
+	lite = TSVZ.TSVZedLite(p, defaults=['X', 'Y'], strict=False)
+	lite.close()
+	assert open(p, 'rb').read() == b'a\t1\n#_defaults_#\tX\tY\n'
+
+
+def test_lite_switch_file_between_dialects(tmp_path):
+	tsv = str(tmp_path / 'a.tsv')
+	tsvz = str(tmp_path / 'b.tsvz')
+	_touch(tsv, b'k\tv\n')
+	_touch(tsvz, b'k\tw\n')
+	lite = TSVZ.TSVZedLite(tsv, strict=False)
+	assert lite['k'] == ['k', 'v'] and lite.dialect == 'tsv'
+	lite.switchFile(tsvz)
+	assert lite['k'] == ['k', 'w'] and lite.dialect == 'tsvz'
+	lite.close()
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
