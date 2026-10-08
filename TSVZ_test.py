@@ -1858,5 +1858,78 @@ def test_cli_version():
 	assert out.returncode == 0 and '4.1' in out.stdout
 
 
+# ==========================================================================
+# Round-trip fuzz: memory == reload == scrub + reload (design §8.6)
+# ==========================================================================
+SPEC_ALPHABET = ['a', 'b', ' ', '\t', ',', '|', '\0', '\n', '<', '>', '#', '_', 'é', '中', '\U0001F600',
+				 'sep', 'LF', 'lt', '\r']
+LEGACY_ALPHABET = ['a', 'b', ' ', '\t', ',', '|', '\n', '<', '>', 'é', '中', 'sep', 'LF', '\r']
+
+
+def _fuzz_text(rng, alphabet):
+	return ''.join(rng.choice(alphabet) for _ in range(rng.randint(0, 6))).rstrip()
+
+
+def _trim_empty_tail(row):
+	row = list(row)
+	while len(row) > 2 and row[-1] == '':
+		row.pop()
+	return row
+
+
+def _normalised(items):
+	return [(key, _trim_empty_tail(row)) for key, row in items]
+
+
+def _fuzz_session(path, seed, alphabet, legacy):
+	rng = random.Random(seed)
+	t = TSVZ.TSVZed(path, append_check_delay=0.001)
+	for _ in range(40):
+		key = _fuzz_text(rng, alphabet) or 'k'
+		if legacy:
+			key = key.lstrip('#') or 'k'  # '#' keys are memory-only in 3.39 files
+		elif key.startswith('#_') and key.endswith('_#'):
+			key = 'x' + key  # the reserved marker namespace is not data
+		roll = rng.random()
+		if roll < 0.6:
+			t[key] = [key] + [_fuzz_text(rng, alphabet) for _ in range(rng.randint(1, 3))]
+		elif roll < 0.85:
+			del t[key]
+		else:
+			t[key] = key
+	t.close()
+	return list(t.items())
+
+
+def _reload_items(path):
+	t = TSVZ.TSVZed(path)
+	items = list(t.items())
+	t.close()
+	return items
+
+
+def test_spec_roundtrip_fuzz(tmp_path):
+	for suffix in ('.tsvz', '.csvz', '.nsvz', '.psvz', '.tsvz.gz'):
+		for seed in range(6):
+			p = str(tmp_path / ('f%d%s' % (seed, suffix)))
+			memory = _normalised(_fuzz_session(p, seed, SPEC_ALPHABET, legacy=False))
+			assert _normalised(_reload_items(p)) == memory, (suffix, seed)
+			lite = TSVZ.TSVZedLite(p, strict=False)
+			assert _normalised((key, lite[key]) for key in list(lite.indexes)) == memory, (suffix, seed)
+			lite.close()
+			TSVZ.scrubTabularFile(p)
+			assert _normalised(_reload_items(p)) == memory, (suffix, seed)
+
+
+def test_legacy_roundtrip_fuzz(tmp_path):
+	for suffix in ('.tsv', '.csv', '.nsv', '.psv', '.tsv.gz'):
+		for seed in range(6):
+			p = str(tmp_path / ('f%d%s' % (seed, suffix)))
+			memory = _fuzz_session(p, seed, LEGACY_ALPHABET, legacy=True)
+			assert _reload_items(p) == memory, (suffix, seed)
+			TSVZ.scrubTabularFile(p)
+			assert _reload_items(p) == memory, (suffix, seed)
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
