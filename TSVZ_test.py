@@ -925,5 +925,14 @@ def test_normalize_defaults():
 	assert N('NA,0', ',') == ['#_defaults_#', 'NA', '0']
 
 
+def test_spec_version_marker_with_unicode_digits_is_rejected(capsys):
+	_, state, reporter = _process(['#_version_#\t²', '#_version_#\t٣'])
+	assert state.version == 1
+	reporter.flush()
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1
+	assert 'invalid value' in warnings[0] and '2 occurrences' in warnings[0]
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

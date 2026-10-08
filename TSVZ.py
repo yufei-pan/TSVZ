@@ -1391,6 +1391,7 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 MAX_SPEC_VERSION = 1
 _MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
 _CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
+_ASCII_DIGITS_RE = re.compile(r'^[0-9]+$')
 _SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|lt|#)>')
 _SPEC_TOKENS = {'<LF>': '\n', '<lt>': '<', '<#>': '#'}
 _RowState = namedtuple('_RowState', 'defaults strip fillEmpty')
@@ -1472,7 +1473,7 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 	elif keyLower == '#_version_#':
 		if not value:
 			state.version = 1
-		elif not value.isdigit() or int(value) < 1:
+		elif not _ASCII_DIGITS_RE.match(value) or int(value) < 1:
 			reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
 			return False
 		else:
