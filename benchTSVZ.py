@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput benchmark for the spec TSVZ engine."""
+"""Throughput benchmark for TSVZ (TSVZed / TSVZedLite)."""
 import argparse
 import os
 import random
@@ -15,7 +15,7 @@ try:
 except ImportError:
 	RESOURCE_LIB_AVAILABLE = False
 
-version = '3.0'
+version = '4.1'
 
 
 def almost_urandom(n):
@@ -235,8 +235,8 @@ def pretty_format_table(data, delimiter='\t', header=None, full=False):
 
 def _open_store(path, *, lite=False, flush_interval=0.01, verbose=False):
 	if lite:
-		return TSVZ.OffsetStore(path, create=True)
-	return TSVZ.WalStore(path, create=True, flush_interval=flush_interval)
+		return TSVZ.TSVZedLite(path, strict=False, verbose=verbose)
+	return TSVZ.TSVZed(path, append_check_delay=flush_interval, verbose=verbose)
 
 
 def _print_usage(verbose):
@@ -245,36 +245,33 @@ def _print_usage(verbose):
 
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='Benchmark for TSVZ (spec engine)')
-	parser.add_argument('file_name', type=str, help='Part file to benchmark')
+	parser = argparse.ArgumentParser(description='Benchmark for TSVZ')
+	parser.add_argument('file_name', type=str, help='File to benchmark (.tsv for the 3.39 format, .tsvz for spec v1)')
 	parser.add_argument('-n', '--number', type=int, default=1_000_000,
 						help='Number of entries to write (default: 1M)')
 	parser.add_argument('--lite', action='store_true',
-						help='Use OffsetStore instead of WalStore')
-	parser.add_argument('--snapshot', action='store_true',
-						help='Run snapshot_part after writes (§19 compaction)')
+						help='Use TSVZedLite instead of TSVZed')
+	parser.add_argument('--scrub', action='store_true',
+						help='Run scrubTabularFile after the writes')
+	parser.add_argument('--compare-old', action='store_true',
+						help='Also time a full readTabularFile load with TSVZ 3.39 (TSVZ_old) and this TSVZ')
 	parser.add_argument('--flush-interval', type=float, default=0.01,
-						help='WalStore background flush interval in seconds')
+						help='TSVZed append_check_delay in seconds')
 	parser.add_argument('-v', '--verbose', action='store_true',
 						help='Print resource usage and extra detail')
 	parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version}')
 	args = parser.parse_args()
 
-	store_label = 'OffsetStore' if args.lite else 'WalStore'
+	store_label = 'TSVZedLite' if args.lite else 'TSVZed'
 	start = time.perf_counter()
-	store = _open_store(
-		args.file_name, lite=args.lite, flush_interval=args.flush_interval, verbose=args.verbose,
-	)
+	store = _open_store(args.file_name, lite=args.lite, flush_interval=args.flush_interval)
 	print(f'Time to create / load {store_label}: {time.perf_counter() - start:.3f} seconds')
 	_print_usage(args.verbose)
 
 	start = time.perf_counter()
 	for i in range(args.number):
 		store[str(i)] = [str(i)] + [str(id(i))] * 19
-	if hasattr(store, 'close'):
-		store.close()
-	else:
-		store.flush()
+	store.close()
 	del store
 	elapsed = time.perf_counter() - start
 	print(f'Time to write {args.number} entries: {elapsed:.3f} seconds')
@@ -282,8 +279,15 @@ if __name__ == '__main__':
 		print(f'Rate: {args.number / elapsed:,.0f} entries/s')
 	_print_usage(args.verbose)
 
-	if args.snapshot:
+	if args.scrub:
 		start = time.perf_counter()
-		TSVZ.snapshot_part(args.file_name)
-		print(f'Time to snapshot {args.number} entries: {time.perf_counter() - start:.3f} seconds')
+		TSVZ.scrubTabularFile(args.file_name)
+		print(f'Time to scrub {args.number} entries: {time.perf_counter() - start:.3f} seconds')
 		_print_usage(args.verbose)
+
+	if args.compare_old:
+		import TSVZ_old
+		for label, module in (('TSVZ 3.39', TSVZ_old), ('TSVZ ' + TSVZ.version, TSVZ)):
+			start = time.perf_counter()
+			module.readTabularFile(args.file_name, verifyHeader=False, strict=False)
+			print(f'Time to load with {label}: {time.perf_counter() - start:.3f} seconds')
