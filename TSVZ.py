@@ -1208,6 +1208,10 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	- Exception: If the file does not exist and createIfNotExist is False.
 	- Exception: If the existing header does not match the provided header.
 	"""
+	if _isSpecPath(fileName):
+		return _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=teeLogger, header=header,
+										   createIfNotExist=createIfNotExist, verifyHeader=verifyHeader,
+										   verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
@@ -1293,6 +1297,9 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	"""
+	if _isSpecPath(fileName):
+		return _specClearTabularFile(fileName, teeLogger=teeLogger, header=header, verifyHeader=verifyHeader,
+									 verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
@@ -1995,6 +2002,203 @@ def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=F
 			return -1 if storeOffset else []
 		return load.lastLine[0] if storeOffset else load.lastLine[1]
 	return taskDic
+
+
+def _specRepairCompressed(path, reporter):
+	"""Re-encode a damaged compressed part in place, keeping every committed record.
+
+	The original raw bytes are first copied to ``<path>.damaged-<timestamp>``.
+	Returns False when the part turned out to be intact.
+	"""
+	info = _PartInfo(path)
+	with _pathLock(path):
+		with open(path, 'r+b') as f:
+			_lockFile(f)
+			try:
+				content = b''.join(_decompressChunks(f, info))
+				keep = content[:content.rfind(b'\n') + 1]
+				if not info.damaged and len(keep) == len(content):
+					return False
+				backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+				f.seek(0)
+				with open(backup, 'wb') as copy:
+					shutil.copyfileobj(f, copy)
+				raw = _compressBytes(info.codec, keep) if keep else b''
+				f.seek(0)
+				f.write(raw)
+				f.truncate()
+				f.flush()
+				os.fsync(f.fileno())
+			finally:
+				_unlockFile(f)
+	reporter.note('repaired', None, 'repaired a damaged compressed part in place; the original bytes are in {}'.format(backup))
+	return True
+
+
+def _specAppendPayload(path, payload, reporter, repair=False, fsync=False):
+	"""Append whole records to a spec part (design §5.4).
+
+	Uncompressed: an uncommitted tail is truncated first. Compressed: the
+	payload becomes a new member, after ``_specRepairCompressed`` when
+	``repair`` is set. A missing part is created.
+	"""
+	codec = _parsePartName(path).codec
+	if not codec:
+		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
+		return
+	if repair and os.path.exists(path):
+		_specRepairCompressed(path, reporter)
+	with _pathLock(path):
+		with open(path, 'ab') as f:
+			_lockFile(f)
+			try:
+				f.write(_compressBytes(codec, payload))
+				f.flush()
+				if fsync:
+					os.fsync(f.fileno())
+			finally:
+				_unlockFile(f)
+
+
+def _specRewriteInPlace(path, content):
+	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
+
+	``content`` is uncompressed; it is compressed for a compressed part. The
+	file is left alone when its bytes already match. Returns True if written.
+	"""
+	codec = _parsePartName(path).codec
+	raw = _compressBytes(codec, content) if codec and content else content
+	with _pathLock(path):
+		with open(path, 'r+b') as f:
+			_lockFile(f)
+			try:
+				if os.fstat(f.fileno()).st_size == len(raw) and f.read() == raw:
+					return False
+				f.seek(0)
+				f.write(raw)
+				f.truncate()
+				f.flush()
+				os.fsync(f.fileno())
+				return True
+			finally:
+				_unlockFile(f)
+
+
+def _specPreamble(state, delimiter, compensate=False, version=True):
+	"""Marker lines that re-create ``state`` (spec §19.2.3a): version, non-default markers, defaults last.
+
+	``compensate`` forces stripping and fill-empty off for the rows that follow
+	(the §19.4 compensating layout; ``_specPostamble`` restores them).
+	"""
+	d = delimiter
+	lines = ['#_version_#' + d + '1'] if version else []
+	if compensate:
+		lines.append('#_strip_trailing_whites_#' + d + 'false')
+		lines.append('#_fill_empty_with_default_#' + d + 'false')
+	else:
+		if not state.strip:
+			lines.append('#_strip_trailing_whites_#' + d + 'false')
+		if state.fillEmpty:
+			lines.append('#_fill_empty_with_default_#' + d + 'true')
+	if not state.returnDefaults:
+		lines.append('#_return_defaults_when_missing_#' + d + 'false')
+	if state.rotate != 'keep':
+		lines.append('#_rotate_#' + d + state.rotate)
+	if state.writeAck != 'memory':
+		lines.append('#_write_ack_#' + d + state.writeAck)
+	if any(state.defaults[1:]):
+		lines.append(_specFormatRecord(state.defaults, d, marker=True))
+	return lines
+
+
+def _specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger):
+	"""3.39 header verification against the first non-marker, non-blank line of part 0."""
+	parts, _ = _storeParts(fileName)
+	line = ''
+	if parts:
+		reporter = _Reporter(fileName)  # not flushed: the full read reports these
+		lines = _iterPartLines(_PartInfo(parts[0]), reporter)
+		try:
+			for raw, _ in lines:
+				text = _decodeLine(raw, reporter, None)
+				if text.strip() and not _MARKER_RE.match(text.split(delimiter, 1)[0]):
+					line = text
+					break
+		finally:
+			lines.close()
+	candidate = line[1:] if line.startswith('#') else line
+	return _lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
+
+
+def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header='', createIfNotExist=False,
+								verifyHeader=True, verbose=False, encoding='utf8', strict=True, delimiter=...):
+	"""``appendLinesTabularFile`` for spec paths: rows are written exactly as given (design §5.2)."""
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		if not _specEnsureStore(fileName, createIfNotExist, header, [DEFAULTS_INDICATOR_KEY], strict, teeLogger, delimiter):
+			return
+		records = []
+		for line in linesToAppend:
+			if isinstance(linesToAppend, dict):
+				key = line
+				line = linesToAppend[key]
+			if isinstance(line, str):
+				line = line.split(delimiter)
+			elif line:
+				line = [item if isinstance(item, str) else _cellText(item) for item in line]
+			else:
+				line = []
+			if isinstance(linesToAppend, dict) and (not line or line[0] != key):
+				line = [key] + line
+			if not line:
+				continue
+			records.append(_specFormatRecord(line, delimiter, marker=bool(_MARKER_RE.match(line[0]))))
+		if not records:
+			if verbose:
+				__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
+			return
+		if any(header) and verifyHeader:
+			_specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger)
+		_, active = _storeParts(fileName, reporter)
+		_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter)
+		if verbose:
+			__teePrintOrNot(f"Appended {len(records)} lines to {fileName}",teeLogger=teeLogger)
+	finally:
+		reporter.flush()
+
+
+def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
+						  encoding='utf8', strict=False, delimiter=...):
+	"""``clearTabularFile`` for spec paths (design §5.5, §5.8)."""
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter):
+			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
+		load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
+						 reporter=reporter, teeLogger=teeLogger, verbose=verbose)
+		if len(load.parts) > 1:
+			tombstones = ''.join(_specFormatRecord([key], delimiter) + '\n' for key in load.data)
+			if tombstones:
+				_specAppendPayload(load.active, tombstones.encode('utf-8'), reporter)
+			reporter.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
+		else:
+			if any(header) and verifyHeader and load.headerLine is not None:
+				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
+					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
+			lines = []
+			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
+			if headerLine:
+				lines.append(headerLine)
+			lines += _specPreamble(load.state, delimiter, version=False)
+			_specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'))
+	finally:
+		reporter.flush()
+	if verbose:
+		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
 
 
 def getListView(tsvzDic,header = [],delimiter = ...):

@@ -1214,6 +1214,107 @@ def test_spec_empty_and_marker_only_stores(tmp_path):
 		assert TSVZ.readTabularFile(p, lastLineOnly=True) == []
 
 
+# ==========================================================================
+# Spec dialect: appends, compressed repair, clear
+# ==========================================================================
+def test_spec_append_writes_rows_as_given(tmp_path):
+	p = str(tmp_path / 'a.tsvz')
+	TSVZ.appendLinesTabularFile(p, [['k1', 'x'], ['k2', '', ''], ['#hash', 'a<b'], ['k3'], 'k4\tv4'],
+								header='id\tv\tw', createIfNotExist=True)
+	assert open(p, 'rb').read() == b'#id\tv\tw\nk1\tx\nk2\t\t\n<#>hash\ta<lt>b\nk3\nk4\tv4\n'
+	assert TSVZ.readTabularFile(p, header='id\tv\tw') == {
+		'k1': ['k1', 'x', ''], 'k2': ['k2', '', ''], '#hash': ['#hash', 'a<b', ''], 'k4': ['k4', 'v4', '']}
+
+
+def test_spec_append_dict_and_markers(tmp_path):
+	p = str(tmp_path / 'a.tsvz')
+	TSVZ.appendLinesTabularFile(p, OrderedDict([('k1', ['x']), ('#_defaults_#', ['D'])]), createIfNotExist=True)
+	assert open(p, 'rb').read() == b'k1\tx\n#_defaults_#\tD\n'
+
+
+def test_spec_append_truncates_torn_tail(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'a\t1\nb\t')
+	TSVZ.appendTabularFile(p, ['c', '3'])
+	assert open(p, 'rb').read() == b'a\t1\nc\t3\n'
+	assert _tsvz_warnings(capsys)[-1].endswith("removed uncommitted tail b'b\\t' before appending")
+
+
+def test_spec_append_goes_to_active_part(tmp_path):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	_touch(base + '.2', b'b\t2\n')
+	TSVZ.appendTabularFile(base, ['c', '3'])
+	assert open(base + '.2', 'rb').read() == b'b\t2\nc\t3\n'
+	assert open(base, 'rb').read() == b'a\t1\n'
+
+
+def test_spec_append_compressed_adds_member(tmp_path):
+	p = str(tmp_path / 'a.tsvz.gz')
+	TSVZ.appendLinesTabularFile(p, [['a', '1']], createIfNotExist=True)
+	TSVZ.appendLinesTabularFile(p, [['b', '2']])
+	assert gzip.decompress(open(p, 'rb').read()) == b'a\t1\nb\t2\n'
+
+
+def test_spec_append_header_mismatch_strict(tmp_path):
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'#id\tv\n')
+	with pytest.raises(ValueError):
+		TSVZ.appendTabularFile(p, ['k', 'v'], header='x\ty', strict=True)
+	TSVZ.appendTabularFile(p, ['k', 'v'], header='id\tv', strict=True)
+	assert open(p, 'rb').read() == b'#id\tv\nk\tv\n'
+
+
+def test_spec_compressed_repair_keeps_records_and_backs_up(tmp_path, capsys):
+	g = str(tmp_path / 'g.tsvz.gz')
+	_touch(g, gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\nbr')[:-6])
+	reporter = TSVZ._Reporter(g)
+	TSVZ._specAppendPayload(g, b'c\t3\n', reporter, repair=True)
+	reporter.flush()
+	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}
+	assert len([n for n in os.listdir(str(tmp_path)) if '.damaged-' in n]) == 1
+	assert any('repaired a damaged compressed part' in w for w in _tsvz_warnings(capsys))
+
+
+def test_spec_rewrite_in_place_keeps_inode_and_skips_identical(tmp_path):
+	p = str(tmp_path / 'r.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	ino = os.stat(p).st_ino
+	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') is True
+	assert open(p, 'rb').read() == b'a\t1\n' and os.stat(p).st_ino == ino
+	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') is False
+
+
+def test_spec_clear_keeps_header_and_markers(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, b'#id\tv\n#_defaults_#\tD\n#_fill_empty_with_default_#\ttrue\na\t1\n# note\nb\t2\n')
+	ino = os.stat(p).st_ino
+	TSVZ.clearTabularFile(p)
+	assert open(p, 'rb').read() == b'#id\tv\n#_fill_empty_with_default_#\ttrue\n#_defaults_#\tD\n'
+	assert os.stat(p).st_ino == ino
+
+
+def test_spec_clear_multipart_appends_tombstones(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	_touch(base + '.2', b'b\t2\n')
+	TSVZ.clearTabularFile(base)
+	assert TSVZ.readTabularFile(base) == {}
+	assert open(base, 'rb').read() == b'a\t1\n'
+	assert open(base + '.2', 'rb').read() == b'b\t2\na\nb\n'
+	assert any('older parts are not compacted' in w for w in _tsvz_warnings(capsys))
+
+
+def test_spec_clear_creates_missing_and_empty_files(tmp_path):
+	p = str(tmp_path / 'n.tsvz')
+	TSVZ.clearTabularFile(p, header='id\tv')
+	assert open(p, 'rb').read() == b'#id\tv\n'
+	e = str(tmp_path / 'e.tsvz')
+	_touch(e)
+	TSVZ.clearTabularFile(e)
+	assert open(e, 'rb').read() == b''
+
+
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
