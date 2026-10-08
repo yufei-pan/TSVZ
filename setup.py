@@ -4,8 +4,8 @@ from TSVZ import version
 setup(
     name='TSVZ',
     version=version,  
-    py_modules=['TSVZ', 'TSVZ_old', 'TSVZ_new'],
-    description='Append-only tabular key–value store (tsvz-spec-v1)',
+    py_modules=['TSVZ'],
+    description='Key-value store kept in a TSV / CSV / NSV / PSV file, with tsvz-spec-v1 support',
     author='Yufei Pan',
     author_email='pan@zopyr.us',
     url='https://github.com/yufei-pan/TSVZ',  # URL to the project’s homepage
