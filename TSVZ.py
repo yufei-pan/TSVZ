@@ -801,6 +801,10 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 	Returns:
 		list: The last valid line as a list of strings, or an empty list if no valid line is found.
 	"""
+	if _isSpecPath(fileName):
+		return _specReadTabularFile(fileName, teeLogger=teeLogger, lastLineOnly=True, verifyHeader=False,
+									verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter,
+									defaults=defaults, correctColumnNum=correctColumnNum, storeOffset=storeOffset)
 	chunk_size = 1024  # Read in chunks of 1024 bytes
 	last_valid_line = []
 	if defaults is ...:
@@ -1081,6 +1085,11 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
+	if _isSpecPath(fileName):
+		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
+									lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
+									taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
+									defaults=defaults, correctColumnNum=correctColumnNum, storeOffset=storeOffset)
 	if taskDic is None:
 		taskDic = {}
 	if defaults is ...:
@@ -1813,6 +1822,179 @@ def _storeParts(path, reporter=None):
 	parts = [path] if os.path.isfile(path) else []
 	parts += [os.path.join(directory, entry) for _, entry in numbered]
 	return parts, (parts[-1] if numbered else path)
+
+
+
+class _SpecLoad(object):
+	"""Result of ``_specLoad``."""
+
+	def __init__(self):
+		self.data = None
+		self.state = None
+		self.parts = []
+		self.active = None
+		self.infos = []
+		self.transitions = []
+		self.correctColumnNum = -1
+		self.lastLine = None
+		self.headerLine = None
+
+
+def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, defaults=None,
+			  correctColumnNum=-1, storeOffset=False, taskDic=None, reporter=None, teeLogger=None,
+			  verbose=False):
+	"""Replay the store ``fileName`` names into ``taskDic`` (design §4).
+
+	``defaults`` is the normalised ``['#_defaults_#', ...]`` preamble. Rows are
+	padded to ``max(W, len(row-bound defaults))`` with the row-bound defaults;
+	nothing is trimmed or dropped for its width. Header verification follows
+	3.39 (``strict`` raises ``ValueError`` on a mismatch) against the first
+	line of part 0 that is neither a marker nor blank.
+	"""
+	if reporter is None:
+		reporter = _Reporter(fileName, teeLogger)
+	result = _SpecLoad()
+	result.data = taskDic if taskDic is not None else {}
+	data = result.data
+	state = _SpecState(defaults)
+	result.state = state
+	parts, active = _storeParts(fileName, reporter)
+	result.parts, result.active = parts, active
+	activeIndex = len(parts) - 1
+	width = correctColumnNum
+	headerPending = bool(header and any(header) and verifyHeader)
+	firstPartPending = True
+	lastRowState = None
+	for partIndex, offset, text, record in _specReplay(parts, delimiter, state, reporter, result.infos):
+		if partIndex == 0 and firstPartPending and text.strip() and not _MARKER_RE.match(text.split(delimiter, 1)[0]):
+			firstPartPending = False
+			isComment = text.startswith('#')
+			if isComment:
+				result.headerLine = text
+			if headerPending:
+				headerPending = False
+				candidate = text[1:] if isComment else text
+				if _lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
+					if not isComment:
+						reporter.note('header-as-data', 'line 1', 'first line matches the header but is not a # comment; read as data key {!r} (prefix it with #)'.format(record[0] if record else text))
+					if width == -1:
+						width = len(header)
+		if record is None:
+			if verbose and text.startswith('#_'):
+				f0 = text.split(delimiter, 1)[0]
+				if _MARKER_RE.match(f0) and f0.lower() not in _SPEC_MARKER_KEYS:
+					__teePrintOrNot('Ignored unrecognised marker line {!r}'.format(text[:80]), teeLogger=teeLogger)
+			continue
+		key, row = record
+		if row is None:
+			data.pop(key, None)
+			continue
+		if width == -1:
+			width = len(state.defaults) if len(state.defaults) > 1 else len(row)
+		target = max(width, len(state.defaults))
+		if len(row) < target:
+			bound = state.defaults
+			row.extend(bound[j] if j < len(bound) else '' for j in range(len(row), target))
+		result.lastLine = (offset, row)
+		if storeOffset and partIndex == activeIndex and not result.infos[partIndex].codec:
+			if state.rowState is not lastRowState:
+				result.transitions.append((offset, state.rowState))
+				lastRowState = state.rowState
+			data[key] = offset
+		else:
+			data[key] = row
+	if headerPending:
+		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
+	result.correctColumnNum = width
+	return result
+
+
+def _specOptions(fileName, delimiter, encoding, reporter):
+	"""Return ``(delimiter, 'utf8')`` for a spec path, overriding conflicting arguments (spec §4.1, §5.1)."""
+	expected = _EXTENSION_DELIMITERS[_parsePartName(fileName).ext]
+	if delimiter is not ... and delimiter and get_delimiter(delimiter) != expected:
+		reporter.note('delimiter', None, 'delimiter {!r} conflicts with the file extension; using {!r} (spec §5.1)'.format(get_delimiter(delimiter), expected))
+	if encoding:
+		try:
+			name = codecs.lookup(encoding).name
+		except LookupError:
+			name = str(encoding)
+		if name != 'utf-8':
+			reporter.note('encoding', None, 'encoding {!r} conflicts with spec §4.1; using UTF-8'.format(encoding))
+	return expected, 'utf8'
+
+
+def _specHeaderComment(header, delimiter):
+	"""Format a header as a spec §11 comment line (without its '\\n')."""
+	line = delimiter.join(_specEncodeField(cell, delimiter) for cell in header)
+	return line if line.startswith('#') else '#' + line
+
+
+def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLogger, delimiter):
+	"""Make sure the store exists (3.39 ``_verifyFileExistence`` semantics).
+
+	A new file starts with the header comment and, when ``defaults`` carry a
+	value, the ``#_defaults_#`` marker; with neither it is 0 bytes. Returns
+	False when the store is missing and may not be created (non-strict).
+	"""
+	parts, _ = _storeParts(fileName)
+	if parts:
+		return True
+	if not createIfNotExist:
+		if strict:
+			__teePrintOrNot('File not found','error',teeLogger=teeLogger)
+			raise FileNotFoundError("File not found")
+		return False
+	lines = []
+	if header and any(header):
+		lines.append(_specHeaderComment(header, delimiter))
+	if defaults and any(defaults[1:]):
+		lines.append(_specFormatRecord(defaults, delimiter, marker=True))
+	content = ''.join(line + '\n' for line in lines).encode('utf-8')
+	codec = _parsePartName(fileName).codec
+	try:
+		with open(fileName, 'xb') as f:
+			f.write(_compressBytes(codec, content) if codec and content else content)
+		__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
+	except FileExistsError:
+		pass
+	except Exception:
+		__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
+		if strict:
+			raise FileNotFoundError("Failed to create file")
+		return False
+	return True
+
+
+def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
+						 verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=True,
+						 delimiter=..., defaults=..., correctColumnNum=-1, storeOffset=False):
+	"""``readTabularFile`` for spec paths (same signature and return values as 3.39)."""
+	if taskDic is None:
+		taskDic = {}
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		initial = _normalizeDefaults(defaults, delimiter)
+		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
+			if lastLineOnly:
+				return -1 if storeOffset else []
+			return taskDic
+		load = _specLoad(fileName, delimiter, header=header, verifyHeader=verifyHeader, strict=strict,
+						 defaults=initial, correctColumnNum=correctColumnNum,
+						 storeOffset=storeOffset and not lastLineOnly,
+						 taskDic={} if lastLineOnly else taskDic, reporter=reporter,
+						 teeLogger=teeLogger, verbose=verbose)
+	finally:
+		reporter.flush()
+	if isinstance(defaults, list):
+		defaults[:] = load.state.defaults
+	if lastLineOnly:
+		if load.lastLine is None:
+			return -1 if storeOffset else []
+		return load.lastLine[0] if storeOffset else load.lastLine[1]
+	return taskDic
 
 
 def getListView(tsvzDic,header = [],delimiter = ...):

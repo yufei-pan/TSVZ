@@ -1103,5 +1103,117 @@ def test_spec_unreadable_part_is_skipped(tmp_path, capsys):
 	assert 'skipped unreadable part' in _tsvz_warnings(capsys)[0]
 
 
+# ==========================================================================
+# Spec dialect: loading a store through readTabularFile
+# ==========================================================================
+APPENDIX_C = b'#_version_#\t1\n#_defaults_#\tguest\t0\nalice\tAlice\t30\nbob\tBob\ncarol\t\t25\nalice\tAlice\t31\nbob\n'
+
+
+def test_spec_appendix_c_via_read_tabular_file(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, APPENDIX_C)
+	data = TSVZ.readTabularFile(p)
+	assert list(data) == ['alice', 'carol']
+	assert data['alice'] == ['alice', 'Alice', '31']
+	assert data['carol'] == ['carol', '', '25']
+
+
+def test_spec_absent_columns_use_row_bound_defaults(tmp_path):
+	p = str(tmp_path / 'd.tsvz')
+	_touch(p, b'a\t1\n#_defaults_#\tX\tY\tZ\nb\t2\n#_defaults_#\tQ\nc\t3\n')
+	data = TSVZ.readTabularFile(p)
+	assert data['a'] == ['a', '1']
+	assert data['b'] == ['b', '2', 'Y', 'Z']
+	assert data['c'] == ['c', '3']
+
+
+def test_spec_wide_rows_are_kept_and_strict_does_not_drop(tmp_path):
+	p = str(tmp_path / 'w.tsvz')
+	_touch(p, b'#id\tv\na\t1\nb\t2\t3\t4\nc\n')
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1'], 'b': ['b', '2', '3', '4']}
+
+
+def test_spec_header_comment_after_markers(tmp_path):
+	p = str(tmp_path / 'h.tsvz')
+	_touch(p, b'#_version_#\t1\n#id\tv\na\t1\n')
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
+	with pytest.raises(ValueError):
+		TSVZ.readTabularFile(p, header='other\tcols', strict=True)
+
+
+def test_spec_header_written_as_data_is_data(tmp_path, capsys):
+	p = str(tmp_path / 'h.tsvz')
+	_touch(p, b'id\tv\na\t1\n')
+	assert TSVZ.readTabularFile(p, header='id\tv') == {'id': ['id', 'v'], 'a': ['a', '1']}
+	assert any('not a # comment' in w for w in _tsvz_warnings(capsys))
+
+
+def test_spec_read_creates_store(tmp_path):
+	p = str(tmp_path / 'n.tsvz')
+	assert TSVZ.readTabularFile(p, header='id\tv', createIfNotExist=True) == {}
+	assert open(p, 'rb').read() == b'#id\tv\n'
+	q = str(tmp_path / 'e.tsvz')
+	TSVZ.readTabularFile(q, createIfNotExist=True, defaults=['NA'])
+	assert open(q, 'rb').read() == b'#_defaults_#\tNA\n'
+	z = str(tmp_path / 'z.tsvz.gz')
+	TSVZ.readTabularFile(z, header='id\tv', createIfNotExist=True)
+	assert gzip.decompress(open(z, 'rb').read()) == b'#id\tv\n'
+	e = str(tmp_path / 'empty.tsvz')
+	TSVZ.readTabularFile(e, createIfNotExist=True)
+	assert open(e, 'rb').read() == b''
+	with pytest.raises(FileNotFoundError):
+		TSVZ.readTabularFile(str(tmp_path / 'missing.tsvz'))
+	assert TSVZ.readTabularFile(str(tmp_path / 'missing.tsvz'), strict=False) == {}
+
+
+def test_spec_conflicting_delimiter_and_encoding(tmp_path, capsys):
+	p = str(tmp_path / 'c.csvz')
+	_touch(p, 'k,v<sep>w\n'.encode())
+	assert TSVZ.readTabularFile(p, delimiter='\t', encoding='latin-1') == {'k': ['k', 'v,w']}
+	warnings = _tsvz_warnings(capsys)
+	assert any("delimiter '\\t' conflicts" in w for w in warnings) and any('encoding' in w for w in warnings)
+	assert TSVZ.readTabularFile(p, delimiter='comma', encoding='UTF-8') == {'k': ['k', 'v,w']}
+	assert _tsvz_warnings(capsys) == []
+
+
+def test_spec_defaults_argument_is_a_preamble_updated_in_place(tmp_path):
+	p = str(tmp_path / 'p.tsvz')
+	_touch(p, b'a\t1\n#_defaults_#\tX\tY\nb\t2\n')
+	defaults = ['#_defaults_#', 'P', 'Q']
+	data = TSVZ.readTabularFile(p, defaults=defaults)
+	assert data['a'] == ['a', '1', 'Q'] and data['b'] == ['b', '2', 'Y']
+	assert defaults == ['#_defaults_#', 'X', 'Y']
+
+
+def test_spec_last_line_only_and_offsets(tmp_path):
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'#_defaults_#\tD\na\t1\nb\nb\t2\n#_defaults_#\tE\nc\n')
+	assert TSVZ.readTabularFile(p, lastLineOnly=True) == ['b', '2']
+	assert TSVZ.read_last_valid_line(p, {}, -1) == ['b', '2']
+	b_offset = len(b'#_defaults_#\tD\na\t1\nb\n')
+	assert TSVZ.readTabularFile(p, lastLineOnly=True, storeOffset=True) == b_offset
+	assert TSVZ.readTabularFile(p, storeOffset=True) == {'a': len(b'#_defaults_#\tD\n'), 'b': b_offset}
+
+
+def test_spec_multipart_read_and_fragment(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'#_defaults_#\tD\na\t1\n')
+	_touch(base + '.f', b'b\t2\n')
+	_touch(base + '.10', b'a\nc\n')
+	_touch(base + '.11.rotated', b'z\t9\n')
+	assert TSVZ.readTabularFile(base) == {'b': ['b', '2']}
+	assert TSVZ.readTabularFile(base + '.f') == {'b': ['b', '2']}
+	assert any('one part of a multi-part store' in w for w in _tsvz_warnings(capsys))
+
+
+def test_spec_empty_and_marker_only_stores(tmp_path):
+	for content in (b'', b'#only a comment\n', b'#_defaults_#\tD\n#_version_#\t1\n'):
+		p = str(tmp_path / 'e.tsvz')
+		_touch(p, content)
+		assert TSVZ.readTabularFile(p) == {}
+		assert TSVZ.readTabularFile(p, lastLineOnly=True) == []
+
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
