@@ -664,7 +664,7 @@ def _dirMtimeNs(path):
 
 
 def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,defaults = ...,
-				 storeOffset = False, offset = -1):
+				 storeOffset = False, offset = -1, reporter = None):
 	"""
 	Process a line of text and update the task dictionary.
 
@@ -676,6 +676,7 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 	defaults (list, optional): The default values to use for missing columns. Defaults to [].
 	storeOffset (bool, optional): Whether to store the offset of the line in the taskDic. Defaults to False.
 	offset (int, optional): The offset of the line in the file. Defaults to -1.
+	reporter (_Reporter, optional): Receives a note for each line dropped by strict mode (L4).
 
 	Returns:
 	tuple: A tuple containing the updated correctColumnNum and the processed lineCache or offset.
@@ -716,8 +717,8 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 		return correctColumnNum , []
 	elif len(lineCache) != correctColumnNum:
 		if strict and not any(defaults[1:]):
-			# if verbose:
-			# 	__teePrintOrNot(f"Ignoring line with {len(lineCache)} columns: {line}",teeLogger=teeLogger)
+			if reporter is not None:
+				reporter.note('strict-drop', None, 'dropped a line whose column count is not {} (strict mode)'.format(correctColumnNum))
 			return correctColumnNum , []
 		else:
 			# fill / cut the line with empty entries til the correct number of columns
@@ -1100,8 +1101,30 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 			# if lineCache:
 			# 	taskDic[lineCache[0]] = lineCache
 			return lineCache
-		for line in file:
-			correctColumnNum, _ = _processLine(line.decode(encoding=encoding,errors='replace'),taskDic,correctColumnNum,strict = strict,delimiter=delimiter,defaults = defaults,storeOffset=storeOffset,offset=file.tell()-len(line))
+		lineNo = 1 if (any(header) and verifyHeader) else 0
+		reporter = _Reporter(fileName, teeLogger)
+		lines = iter(file)
+		try:
+			while True:
+				try:
+					line = next(lines)
+				except StopIteration:
+					break
+				except Exception as e:
+					# L5: a damaged compressed stream ends the read instead of raising.
+					if not _isCompressedFile(fileName):
+						raise
+					reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+					break
+				lineNo += 1
+				try:
+					text = line.decode(encoding=encoding)
+				except UnicodeDecodeError:
+					text = line.decode(encoding=encoding,errors='replace')
+					reporter.note('decode', 'line {}'.format(lineNo), 'invalid {} replaced with U+FFFD'.format(encoding))
+				correctColumnNum, _ = _processLine(text,taskDic,correctColumnNum,strict = strict,delimiter=delimiter,defaults = defaults,storeOffset=storeOffset,offset=file.tell()-len(line),reporter=reporter)
+		finally:
+			reporter.flush()
 	return taskDic
 
 def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):

@@ -708,5 +708,38 @@ def test_l6_map_to_file_keeps_newline_at_end_of_file(tmp_path):
 	assert open(p, 'rb').read() == b'id\ta\tb\nk1\tx2\ty2\nk2\tp\tq\nk3\tr\ts\n'
 
 
+# ==========================================================================
+# Legacy fixes L4 and L5
+# ==========================================================================
+def test_l4_invalid_utf8_is_reported_once(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\nk1\t\xff\nk2\t\xfe\n')
+	data = TSVZ.readTabularFile(p, header='id\tv')
+	assert data['k1'] == ['k1', '�']
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: invalid utf8 replaced with U+FFFD (2 occurrences, first at line 2)' % p]
+
+
+def test_l4_strict_drops_are_reported(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\nk1\tx\nk2\ty\tEXTRA\n')
+	data = TSVZ.readTabularFile(p, header='id\tv', strict=True)
+	assert list(data) == ['k1']
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: dropped a line whose column count is not 2 (strict mode)' % p]
+
+
+def test_l5_damaged_gzip_reads_up_to_the_damage(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv.gz')
+	_touch(p, gzip.compress(b'id\tv\nk1\tx\n') + gzip.compress(b'k2\ty\n')[:-6])
+	data = TSVZ.readTabularFile(p, header='id\tv')
+	assert data['k1'] == ['k1', 'x']
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'compressed stream is damaged' in warnings[0]
+
+
+def test_l5_corrupt_uncompressed_errors_still_raise(tmp_path):
+	with pytest.raises(FileNotFoundError):
+		TSVZ.readTabularFile(str(tmp_path / 'missing.tsv'))
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
