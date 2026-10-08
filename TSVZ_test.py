@@ -741,5 +741,22 @@ def test_l5_corrupt_uncompressed_errors_still_raise(tmp_path):
 		TSVZ.readTabularFile(str(tmp_path / 'missing.tsv'))
 
 
+def test_l5_damaged_header_line_reads_up_to_the_damage(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv.gz')
+	_touch(p, gzip.compress(b'id\tv\nk1\tx\n')[:12])
+	data = TSVZ.readTabularFile(p, header='id\tv')
+	assert data == {}
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'compressed stream is damaged' in warnings[0]
+
+
+def test_l4_invalid_utf8_in_header_is_reported_and_matches_339(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\xff\nk1\tx\n')
+	data = TSVZ.readTabularFile(p, header='id\tv')
+	assert data == TSVZ_old.readTabularFile(p, header='id\tv')
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: invalid utf8 replaced with U+FFFD (line 1)' % p]
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

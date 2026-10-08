@@ -1089,22 +1089,35 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
 		return taskDic
-	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
-		if any(header) and verifyHeader:
-				line = file.readline().decode(encoding=encoding,errors='replace')
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
+			lineNo = 0
+			if any(header) and verifyHeader:
+				try:
+					raw = file.readline()
+				except Exception as e:
+					# L5: a compressed stream damaged inside the header line ends the read.
+					if lastLineOnly or not _isCompressedFile(fileName):
+						raise
+					reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+					return taskDic
+				lineNo = 1
+				try:
+					line = raw.decode(encoding=encoding)
+				except UnicodeDecodeError:
+					line = raw.decode(encoding=encoding,errors='replace')
+					reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
 				if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter) and correctColumnNum == -1:
 					correctColumnNum = len(header)
 					if verbose:
 						__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-		if lastLineOnly:
-			lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset)
-			# if lineCache:
-			# 	taskDic[lineCache[0]] = lineCache
-			return lineCache
-		lineNo = 1 if (any(header) and verifyHeader) else 0
-		reporter = _Reporter(fileName, teeLogger)
-		lines = iter(file)
-		try:
+			if lastLineOnly:
+				lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset)
+				# if lineCache:
+				# 	taskDic[lineCache[0]] = lineCache
+				return lineCache
+			lines = iter(file)
 			while True:
 				try:
 					line = next(lines)
@@ -1123,8 +1136,8 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 					text = line.decode(encoding=encoding,errors='replace')
 					reporter.note('decode', 'line {}'.format(lineNo), 'invalid {} replaced with U+FFFD'.format(encoding))
 				correctColumnNum, _ = _processLine(text,taskDic,correctColumnNum,strict = strict,delimiter=delimiter,defaults = defaults,storeOffset=storeOffset,offset=file.tell()-len(line),reporter=reporter)
-		finally:
-			reporter.flush()
+	finally:
+		reporter.flush()
 	return taskDic
 
 def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):
