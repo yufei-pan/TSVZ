@@ -1316,5 +1316,73 @@ def test_spec_clear_creates_missing_and_empty_files(tmp_path):
 
 
 
+# ==========================================================================
+# Spec dialect: archival scrub (design §5.7)
+# ==========================================================================
+def test_spec_scrub_compacts_in_place(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#id\tv\n#_defaults_#\tD\na\t1\nb\t2\n# comment\na\t3\nb\n#__tool__#\tmeta\n#_checksum_crc32_#\n')
+	ino = os.stat(p).st_ino
+	before = TSVZ.readTabularFile(p, header='id\tv')
+	assert TSVZ.scrubTabularFile(p, header='id\tv') == before
+	assert open(p, 'rb').read() == b'#id\tv\n#_version_#\t1\n#_defaults_#\tD\na\t3\n'
+	assert os.stat(p).st_ino == ino
+	assert TSVZ.readTabularFile(p, header='id\tv') == before
+	mtime = os.stat(p).st_mtime_ns
+	TSVZ.scrubTabularFile(p, header='id\tv')
+	assert os.stat(p).st_mtime_ns == mtime  # identical content is not rewritten
+
+
+def test_spec_scrub_fidelity_when_markers_changed(tmp_path):
+	p = str(tmp_path / 'f.tsvz')
+	_touch(p, b'#id\tname\tage\n#_strip_trailing_whites_#\tfalse\na\tx  \t1\n#_strip_trailing_whites_#\ttrue\n'
+			  b'b\tq\n#_defaults_#\tD1\tD2\tD3\n#_fill_empty_with_default_#\ttrue\nc\t\t5\n')
+	before = TSVZ.readTabularFile(p, header='id\tname\tage')
+	TSVZ.scrubTabularFile(p, header='id\tname\tage')
+	after = TSVZ.readTabularFile(p, header='id\tname\tage')
+	assert list(after) == list(before)
+	for key, row in before.items():
+		assert after[key][:len(row)] == row and not any(after[key][len(row):]), (key, row, after[key])
+	text = open(p, 'rb').read()
+	assert text.index(b'#_fill_empty_with_default_#\tfalse') < text.index(b'a\tx  \t1') < text.index(b'#_fill_empty_with_default_#\ttrue')
+	load = TSVZ._specLoad(p, '\t')
+	assert load.state.strip and load.state.fillEmpty and load.state.defaults == ['#_defaults_#', 'D1', 'D2', 'D3']
+
+
+def test_spec_scrub_keeps_marker_like_data_keys_as_data(tmp_path):
+	p = str(tmp_path / 'k.tsvz')
+	_touch(p, b'<#>_defaults_#\tdata\n<#>plain\tv\n')
+	TSVZ.scrubTabularFile(p)
+	assert open(p, 'rb').read() == b'#_version_#\t1\n<#>_defaults_#\tdata\n<#>plain\tv\n'
+	assert TSVZ.readTabularFile(p) == {'#_defaults_#': ['#_defaults_#', 'data'], '#plain': ['#plain', 'v']}
+
+
+def test_spec_scrub_refuses_multipart_and_fragments(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\na\n')
+	_touch(base + '.2', b'b\t2\n')
+	assert TSVZ.scrubTabularFile(base) == {'b': ['b', '2']}
+	assert TSVZ.scrubTabularFile(base + '.2') == {'b': ['b', '2']}
+	assert open(base, 'rb').read() == b'a\t1\na\n' and open(base + '.2', 'rb').read() == b'b\t2\n'
+	assert sum('scrub skipped' in w for w in _tsvz_warnings(capsys)) == 2
+
+
+def test_spec_scrub_compressed_in_place(tmp_path):
+	p = str(tmp_path / 's.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + gzip.compress(b'a\t2\nb\t3\nb\n'))
+	ino = os.stat(p).st_ino
+	TSVZ.scrubTabularFile(p)
+	assert gzip.decompress(open(p, 'rb').read()) == b'#_version_#\t1\na\t2\n'
+	assert os.stat(p).st_ino == ino
+
+
+def test_spec_scrub_empty_stores(tmp_path):
+	for content in (b'', b'#id\tv\n', b'a\t1\na\n'):
+		p = str(tmp_path / 'e.tsvz')
+		_touch(p, content)
+		assert TSVZ.scrubTabularFile(p) == {}
+		assert TSVZ.readTabularFile(p) == {}
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

@@ -1393,6 +1393,11 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
+	if _isSpecPath(fileName):
+		return _specScrubTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
+									 lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
+									 taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
+									 defaults=defaults, correctColumnNum=correctColumnNum)
 	file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 							lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 							encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum)
@@ -2199,6 +2204,86 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 		reporter.flush()
 	if verbose:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
+
+
+def _specPostamble(state, delimiter):
+	"""Marker lines that restore stripping / fill-empty after a compensating scrub layout."""
+	lines = []
+	if state.strip:
+		lines.append('#_strip_trailing_whites_#' + delimiter + 'true')
+	if state.fillEmpty:
+		lines.append('#_fill_empty_with_default_#' + delimiter + 'true')
+	return lines
+
+
+def _specScrubCells(row, state):
+	"""Cells to write for a materialised row: extended with '' to the final defaults' width.
+
+	A materialised row already carries every column that is not '' (design
+	§4.7); the explicit '' cells keep a final default it was never bound to
+	from filling the columns beyond it.
+	"""
+	final = state.defaults
+	if len(final) > len(row):
+		return row + [''] * (len(final) - len(row))
+	return row
+
+
+def _specRoundTrips(cells, state):
+	"""True when ``cells`` read back unchanged under the final marker state (spec §19.4)."""
+	if state.strip:
+		for cell in cells:
+			if cell and cell[-1] in ' \t':
+				return False
+	if state.fillEmpty:
+		final = state.defaults
+		for j in range(1, len(cells)):
+			if not cells[j] and j < len(final) and final[j]:
+				return False
+	return True
+
+
+def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
+						  verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=False,
+						  delimiter=..., defaults=..., correctColumnNum=-1):
+	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7)."""
+	if lastLineOnly:
+		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
+									lastLineOnly=True, verifyHeader=verifyHeader, verbose=verbose, encoding=encoding,
+									strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum)
+	if taskDic is None:
+		taskDic = {}
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
+		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		initial = _normalizeDefaults(defaults, delimiter)
+		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
+			return taskDic
+		load = _specLoad(fileName, delimiter, header=header, verifyHeader=verifyHeader, strict=strict,
+						 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
+						 reporter=reporter, teeLogger=teeLogger, verbose=verbose)
+		name = _parsePartName(fileName)
+		if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
+			reporter.note('multipart', None, 'scrub skipped: 4.1 does not compact multi-part stores or single parts of them; nothing was written')
+			return taskDic
+		state = load.state
+		rows = [_specScrubCells(row, state) for row in taskDic.values()]
+		compensate = not all(_specRoundTrips(cells, state) for cells in rows)
+		lines = []
+		headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
+		if headerLine:
+			lines.append(headerLine)
+		lines += _specPreamble(state, delimiter, compensate=compensate)
+		lines += [_specFormatRecord(cells, delimiter) for cells in rows]
+		if compensate:
+			lines += _specPostamble(state, delimiter)
+		written = _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'))
+		if verbose:
+			__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
+	finally:
+		reporter.flush()
+	return taskDic
 
 
 def getListView(tsvzDic,header = [],delimiter = ...):
