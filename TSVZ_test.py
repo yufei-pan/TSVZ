@@ -1668,11 +1668,57 @@ def test_tsvzed_spec_survives_a_failed_external_reload(tmp_path, capsys):
 	st = os.stat(p)
 	os.utime(p, (st.st_atime + 1, st.st_mtime + 1))
 	assert _wait_for(lambda: not t.deSynced and t._specLoaded)
-	time.sleep(0.1)
+	time.sleep(0.3)
 	t['k'] = ['k', 'v']
+	assert t.appendThread.is_alive()
+	assert _wait_for(lambda: b'k\tv\n' in open(p, 'rb').read())
 	t.close()
-	assert b'k\tv\n' in open(p, 'rb').read()
-	assert 'Failed to reload' in capsys.readouterr().out
+	assert capsys.readouterr().out.count('Failed to reload') == 1
+
+
+def test_tsvzed_spec_lone_surrogate_does_not_kill_the_worker(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	t['bad'] = ['bad', b'\xff'.decode('utf-8', 'surrogateescape')]
+	assert _wait_for(lambda: b'bad\t?\n' in open(p, 'rb').read())
+	t['c'] = ['c', '1']
+	assert _wait_for(lambda: b'c\t1\n' in open(p, 'rb').read())
+	assert t.appendThread.is_alive()
+	t.close()
+
+
+def test_tsvzed_spec_clear_after_set_leaves_nothing(tmp_path):
+	p = str(tmp_path / 'o.tsvz')
+	for _ in range(20):
+		t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.001)
+		t['a'] = ['a', '1']
+		t.clear()
+		t.close()
+		assert TSVZ.readTabularFile(p, header='id\tv') == {}
+
+
+def test_tsvzed_spec_width_matches_a_reload(tmp_path):
+	p = str(tmp_path / 'wd.tsvz')
+	t = TSVZ.TSVZed(p, defaults=['X'])
+	t['a'] = ['a', '1', '2']
+	t['b'] = ['b', '5']
+	mem = dict(t)
+	t.close()
+	assert mem == dict(TSVZ.TSVZed(p, defaults=['X']))
+
+
+def test_tsvzed_spec_sync_keeps_memory_while_writes_fail(tmp_path):
+	d = tmp_path / 'sub'
+	d.mkdir()
+	p = str(d / 'f.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01, monitor_external_changes=False)
+	t._activePath = str(d / 'nodir' / 'f.tsvz')
+	t['a'] = ['a', '1']
+	t.deSynced = True
+	assert t._specSync(True) is False
+	assert t['a'] == ['a', '1'] and t.deSynced
+	t._activePath = p
+	t.close()
 
 
 if __name__ == '__main__':

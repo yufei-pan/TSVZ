@@ -2486,6 +2486,7 @@ class TSVZed(OrderedDict):
 			self._activeInfo = None
 			self._dirMtimeNs = _dirMtimeNs(fileName)
 			self._writeFailing = False
+			self._forceRepair = False
 			self._specLoaded = False
 		#self.appendEvent = threading.Event()
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
@@ -2616,9 +2617,20 @@ class TSVZed(OrderedDict):
 		if reloadInternalFromFile:
 			try:
 				self.commitAppendToFile()
+				if self.appendQueue:
+					return False  # writes are failing: keep the queue in memory, retry next tick
 				self.reload()
 			except Exception as e:
 				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
+				# Mark the change as seen so the failure is reported once, not every tick.
+				try:
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+					self._dirMtimeNs = _dirMtimeNs(self._fileName)
+					self._parts = _storeParts(self._fileName)[0]
+				except Exception:
+					pass
+				self.deSynced = False
+				return False
 		self.deSynced = False
 		return True
 
@@ -2797,7 +2809,7 @@ class TSVZed(OrderedDict):
 				value[i] = defaults[i]
 		written = list(value)
 		if self.correctColumnNum <= 0:
-			self.correctColumnNum = len(value)
+			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
 		target = max(self.correctColumnNum, len(defaults))
 		if len(value) < target:
 			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
@@ -2848,8 +2860,13 @@ class TSVZed(OrderedDict):
 		"""Append the queued records to the active part (design §5.4).
 
 		Records stay queued until the write succeeds; a failure is reported once
-		and retried on the next tick.
+		and retried on the next tick. Nothing raised here may reach the worker.
 		"""
+		with self.writeLock:
+			return self._specCommitLocked()
+
+	def _specCommitLocked(self):
+		# The caller holds self.writeLock (a non-reentrant lock).
 		if not self.appendQueue:
 			return self
 		if self.memoryOnly:
@@ -2858,40 +2875,46 @@ class TSVZed(OrderedDict):
 		items = []
 		while self.appendQueue:
 			items.append(self.appendQueue.popleft())
-		payload = ''.join(item + '\n' for item in items).encode('utf-8')
 		reporter = _Reporter(self._fileName, self.teeLogger)
-		with self.writeLock:
-			try:
-				info = self._activeInfo
-				repair = bool(info is not None and info.codec and (info.damaged or info.tail))
-				_specAppendPayload(self._activePath, payload, reporter, repair=repair, fsync=True)
-				self._activeInfo = None
-				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
-				if self._writeFailing:
-					self._writeFailing = False
-					_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
-			except Exception as e:
-				self.appendQueue.extendleft(reversed(items))
-				if not self._writeFailing:
-					self._writeFailing = True
-					self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._activePath}: {e}; will retry",'error')
-					import traceback
-					self.__teePrintOrNot(traceback.format_exc(),'error')
+		try:
+			payload = ''.join(item + '\n' for item in items).encode('utf-8', errors='replace')
+			info = self._activeInfo
+			repair = bool(self._forceRepair or (info is not None and info.codec and (info.damaged or info.tail)))
+			_specAppendPayload(self._activePath, payload, reporter, repair=repair, fsync=True)
+			self._forceRepair = False
+			self._activeInfo = None
+			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+			if self._writeFailing:
+				self._writeFailing = False
+				_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
+		except Exception as e:
+			self.appendQueue.extendleft(reversed(items))
+			# A failed append to a compressed part may have left a torn member.
+			self._forceRepair = True
+			if not self._writeFailing:
+				self._writeFailing = True
+				self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._activePath}: {e}; will retry",'error')
+				import traceback
+				self.__teePrintOrNot(traceback.format_exc(),'error')
 		reporter.flush()
 		return self
 
 	def _specClearFile(self):
 		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place."""
 		try:
-			self.commitAppendToFile()
-			self.appendQueue.clear()
 			with self.writeLock:
+				self._specCommitLocked()
+				if self.appendQueue:
+					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
+					self.deSynced = True
+					return self
 				_specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
 									  verbose=self.verbose, delimiter=self.delimiter)
 				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			self.dirty = False
 			self.deSynced = False
 		except Exception as e:
+			self.deSynced = True
 			self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
