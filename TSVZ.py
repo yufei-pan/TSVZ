@@ -1385,6 +1385,222 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 		appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
 	return file
 
+# ===========================================================================
+# TSVZ spec v1 dialect (.tsvz / .csvz / .nsvz / .psvz) -- see tsvz-spec-v1.md
+# ===========================================================================
+MAX_SPEC_VERSION = 1
+_MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
+_CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
+_SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|lt|#)>')
+_SPEC_TOKENS = {'<LF>': '\n', '<lt>': '<', '<#>': '#'}
+_RowState = namedtuple('_RowState', 'defaults strip fillEmpty')
+_BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True,
+				'false': False, 'no': False, 'off': False, '0': False}
+#: Stateful boolean markers: key -> (state attribute, built-in default).
+_BOOL_MARKERS = {'#_strip_trailing_whites_#': ('strip', True),
+				 '#_fill_empty_with_default_#': ('fillEmpty', False),
+				 '#_return_defaults_when_missing_#': ('returnDefaults', True)}
+#: Advisory enumerated markers: key -> (state attribute, choices; first is the default).
+_ENUM_MARKERS = {'#_rotate_#': ('rotate', ('keep', 'rename', 'delete')),
+				 '#_write_ack_#': ('writeAck', ('memory', 'disk'))}
+_SPEC_MARKER_KEYS = frozenset(['#_version_#', DEFAULTS_INDICATOR_KEY]) | frozenset(_BOOL_MARKERS) | frozenset(_ENUM_MARKERS)
+
+
+def _specDecodeField(field, delimiter):
+	"""Decode spec §13 tokens; any other ``<...>`` passes through literally."""
+	if '<' not in field:
+		return field
+	return _SPEC_DECODE_RE.sub(lambda m: delimiter if m.group(0) == '<sep>' else _SPEC_TOKENS[m.group(0)], field)
+
+
+def _specEncodeField(value, delimiter, isKey=False):
+	"""Encode one field per spec §13.3 (``isKey`` also escapes a leading '#')."""
+	if '<' in value:
+		value = value.replace('<', '<lt>')
+	if delimiter in value:
+		value = value.replace(delimiter, '<sep>')
+	if '\n' in value:
+		value = value.replace('\n', '<LF>')
+	if isKey and value.startswith('#'):
+		value = '<#>' + value[1:]
+	return value
+
+
+def _specFormatRecord(cells, delimiter, marker=False):
+	"""Format one record without its '\\n'. ``marker`` writes ``cells[0]`` raw as a marker key."""
+	first = cells[0] if marker else _specEncodeField(cells[0], delimiter, isKey=True)
+	if len(cells) == 1:
+		return first
+	return delimiter.join([first] + [_specEncodeField(cell, delimiter) for cell in cells[1:]])
+
+
+class _SpecState(object):
+	"""Reader state of spec §12, carried across records and parts."""
+
+	def __init__(self, defaults=None):
+		self.version = 1
+		self.defaults = list(defaults) if defaults and len(defaults) > 1 else [DEFAULTS_INDICATOR_KEY]
+		self.strip = True
+		self.fillEmpty = False
+		self.returnDefaults = True
+		self.rotate = 'keep'
+		self.writeAck = 'memory'
+		self.sawDefaults = False
+		self.digests = {}
+		self.rowState = None
+		self.refresh()
+
+	def refresh(self):
+		"""Rebuild ``rowState``, the part of the state a data row binds to (spec §12.4.4)."""
+		self.rowState = _RowState(tuple(self.defaults), self.strip, self.fillEmpty)
+
+	@classmethod
+	def fromRowState(cls, rowState):
+		state = cls(list(rowState.defaults))
+		state.strip = rowState.strip
+		state.fillEmpty = rowState.fillEmpty
+		state.rowState = rowState
+		return state
+
+
+def _specApplyMarker(state, keyLower, values, reporter, where):
+	"""Apply an official marker (spec §12.4). Returns False when its value was rejected."""
+	value = values[0].strip() if values else ''
+	if keyLower == DEFAULTS_INDICATOR_KEY:
+		state.defaults = [DEFAULTS_INDICATOR_KEY] + list(values)
+		state.sawDefaults = True
+	elif keyLower == '#_version_#':
+		if not value:
+			state.version = 1
+		elif not value.isdigit() or int(value) < 1:
+			reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
+			return False
+		else:
+			if int(value) > MAX_SPEC_VERSION:
+				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(value, MAX_SPEC_VERSION))
+			state.version = int(value)
+	elif keyLower in _BOOL_MARKERS:
+		attr, default = _BOOL_MARKERS[keyLower]
+		if not value:
+			setattr(state, attr, default)
+		elif value.lower() in _BOOL_VALUES:
+			setattr(state, attr, _BOOL_VALUES[value.lower()])
+		else:
+			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
+			return False
+	elif keyLower in _ENUM_MARKERS:
+		attr, choices = _ENUM_MARKERS[keyLower]
+		if not value:
+			setattr(state, attr, choices[0])
+		elif value.lower() in choices:
+			setattr(state, attr, value.lower())
+		else:
+			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
+			return False
+	state.refresh()
+	return True
+
+
+def _specProcessRecord(text, state, delimiter, reporter, where):
+	"""Classify and apply one committed record (spec §7.2-§7.9).
+
+	``text`` is the decoded line without its terminator. Returns None for a
+	comment, a marker or an empty key; ``(key, None)`` for a tombstone; and
+	``(key, row)`` for a data row, where ``row`` holds the key and the written
+	cells after stripping, decoding and fill-empty.
+	"""
+	fields = text.split(delimiter)
+	f0 = fields[0]
+	if f0.startswith('#'):
+		if _MARKER_RE.match(f0):
+			keyLower = f0.lower()
+			if keyLower in _SPEC_MARKER_KEYS:
+				_specApplyMarker(state, keyLower, [_specDecodeField(f, delimiter) for f in fields[1:]], reporter, where)
+		return None
+	strip = state.strip
+	key = _specDecodeField(f0.rstrip(' \t') if strip else f0, delimiter)
+	if not key:
+		return None
+	if len(fields) == 1:
+		return (key, None)
+	defaults = state.defaults
+	fill = state.fillEmpty
+	row = [key]
+	for j in range(1, len(fields)):
+		cell = fields[j]
+		if strip:
+			cell = cell.rstrip(' \t')
+		if '<' in cell:
+			cell = _specDecodeField(cell, delimiter)
+		if not cell and fill and j < len(defaults):
+			cell = defaults[j]
+		row.append(cell)
+	return (key, row)
+
+
+class _Crc32(object):
+	def __init__(self):
+		self.value = 0
+
+	def update(self, data):
+		import zlib
+		self.value = zlib.crc32(data, self.value)
+
+	def hexdigest(self):
+		return '%08x' % (self.value & 0xffffffff)
+
+
+_HASHLIB_ALGORITHMS = frozenset(name.lower() for name in hashlib.algorithms_available)
+_DIGEST_SUPPORT = {}
+
+
+def _newDigest(algo):
+	"""Return a fresh accumulator for ``algo`` (spec §15), or None if unsupported."""
+	if algo == 'crc32':
+		return _Crc32()
+	if algo not in _HASHLIB_ALGORITHMS:
+		return None
+	try:
+		digest = hashlib.new(algo)
+		digest.hexdigest()
+		return digest
+	except (ValueError, TypeError):
+		return None
+
+
+def _digestSupported(algo):
+	if algo not in _DIGEST_SUPPORT:
+		_DIGEST_SUPPORT[algo] = _newDigest(algo) is not None
+	return _DIGEST_SUPPORT[algo]
+
+
+def _normalizeDefaults(defaults, delimiter):
+	"""Accept every 3.39 ``defaults=`` form and return ``['#_defaults_#', d1, ...]``."""
+	if not defaults or defaults is ...:
+		return [DEFAULTS_INDICATOR_KEY]
+	if isinstance(defaults, str):
+		defaults = defaults.split(delimiter)
+	else:
+		try:
+			defaults = list(defaults)
+		except Exception:
+			return [DEFAULTS_INDICATOR_KEY]
+	defaults = [str(s).rstrip() if s else '' for s in defaults]
+	if not any(defaults):
+		return [DEFAULTS_INDICATOR_KEY]
+	if defaults[0] != DEFAULTS_INDICATOR_KEY:
+		defaults = [DEFAULTS_INDICATOR_KEY] + defaults
+	return defaults
+
+
+def _cellText(item):
+	"""3.39's conversion of a non-str cell given to the append helpers."""
+	try:
+		return str(item).rstrip()
+	except Exception as e:
+		return str(e)
+
+
 def getListView(tsvzDic,header = [],delimiter = ...):
 	if header:
 		if isinstance(header,str):

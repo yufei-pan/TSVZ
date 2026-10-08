@@ -822,5 +822,108 @@ def test_l3_tsvzedlite_hash_keys_are_readable(tmp_path):
 	lite.close()
 
 
+# ==========================================================================
+# Spec dialect: codec, reader state, record pipeline (spec §7–§14)
+# ==========================================================================
+def test_spec_field_codec_roundtrip_every_variant():
+	for d in ('\t', ',', '\0', '|'):
+		for value in ['a' + d + 'b', '<sep>', '<LF>', 'a<b', '#x', 'x\ny', '<lt>', '<#>', '', 'é<中>']:
+			assert TSVZ._specDecodeField(TSVZ._specEncodeField(value, d), d) == value, (d, value)
+			assert TSVZ._specDecodeField(TSVZ._specEncodeField(value, d, isKey=True), d) == value, (d, value)
+
+
+def test_spec_13_5_examples():
+	E, D = TSVZ._specEncodeField, TSVZ._specDecodeField
+	assert E('a\tb', '\t') == 'a<sep>b'
+	assert E('<sep>', '\t') == '<lt>sep>'
+	assert E('<LF>', '\t') == '<lt>LF>'
+	assert E('#foo', '\t', isKey=True) == '<#>foo'
+	assert E('#foo', '\t') == '#foo'
+	assert E('a<b', '\t') == 'a<lt>b'
+	assert D('<future>', '\t') == '<future>'
+	assert D('</sep/>', '\t') == '</sep/>'
+
+
+def test_spec_format_record():
+	F = TSVZ._specFormatRecord
+	assert F(['#k', 'v'], '\t') == '<#>k\tv'
+	assert F(['k'], '\t') == 'k'
+	assert F(['#_defaults_#', 'a<b', ''], '\t', marker=True) == '#_defaults_#\ta<lt>b\t'
+	assert F(['#_defaults_#', 'v'], '\t') == '<#>_defaults_#\tv'
+
+
+def _process(lines, d='\t', state=None):
+	state = state or TSVZ._SpecState()
+	reporter = TSVZ._Reporter('t')
+	return [TSVZ._specProcessRecord(text, state, d, reporter, None) for text in lines], state, reporter
+
+
+def test_spec_tombstone_only_without_delimiter():
+	out, _, _ = _process(['k', 'k\t', 'k\t\t', '\tv', '', '#c', ' #notcomment\tv', '<#>h\tv'])
+	assert out == [('k', None), ('k', ['k', '']), ('k', ['k', '', '']), None, None, None,
+				   (' #notcomment', [' #notcomment', 'v']), ('#h', ['#h', 'v'])]
+
+
+def test_spec_strip_trailing_whites_marker():
+	out, _, _ = _process(['k \tv \t', '#_strip_trailing_whites_#\tFALSE', 'k \tv ', '#_STRIP_TRAILING_WHITES_#', 'j\tv '])
+	assert out[0] == ('k', ['k', 'v', ''])
+	assert out[2] == ('k ', ['k ', 'v '])
+	assert out[4] == ('j', ['j', 'v'])
+
+
+def test_spec_fill_empty_and_defaults_binding():
+	out, state, _ = _process(['#_defaults_#\tg\t0', 'a\t\t5', '#_fill_empty_with_default_#\ttrue', 'b\t\t5', '#_defaults_#', 'c\t\t5'])
+	assert out[1] == ('a', ['a', '', '5'])
+	assert out[3] == ('b', ['b', 'g', '5'])
+	assert out[5] == ('c', ['c', '', '5'])
+	assert state.defaults == ['#_defaults_#']
+
+
+def test_spec_bad_marker_values_keep_state(capsys):
+	_, state, reporter = _process(['#_fill_empty_with_default_#\tmaybe', '#_version_#\tx',
+								   '#_return_defaults_when_missing_#\tno', '#_version_#\t3',
+								   '#__custom__#\tanything', '#_unknown_#\t1', '#_rotate_#\tRENAME'])
+	reporter.flush()
+	assert state.fillEmpty is False and state.returnDefaults is False and state.version == 3
+	assert state.rotate == 'rename'
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 2
+	assert 'invalid value' in warnings[0] and '2 occurrences' in warnings[0]
+	assert 'declares spec version 3' in warnings[1]
+
+
+def test_spec_marker_keys_are_case_insensitive_and_values_decoded():
+	_, state, _ = _process(['#_DEFAULTS_#\ta<sep>b\t<lt>'])
+	assert state.defaults == ['#_defaults_#', 'a\tb', '<']
+	assert state.sawDefaults and state.rowState.defaults == ('#_defaults_#', 'a\tb', '<')
+
+
+def test_spec_state_from_row_state():
+	state = TSVZ._SpecState(['#_defaults_#', 'x'])
+	state.strip = False
+	state.refresh()
+	copy = TSVZ._SpecState.fromRowState(state.rowState)
+	assert copy.defaults == ['#_defaults_#', 'x'] and copy.strip is False and copy.fillEmpty is False
+
+
+def test_spec_digests():
+	crc = TSVZ._newDigest('crc32')
+	crc.update(b'abc')
+	assert crc.hexdigest() == '352441c2'
+	assert TSVZ._newDigest('sha256') is not None
+	assert TSVZ._newDigest('shake_128') is None and TSVZ._newDigest('crc32c') is None and TSVZ._newDigest('blake3') is None
+	assert TSVZ._digestSupported('md5') and not TSVZ._digestSupported('nope')
+
+
+def test_normalize_defaults():
+	N = TSVZ._normalizeDefaults
+	assert N(None, '\t') == ['#_defaults_#']
+	assert N(..., '\t') == ['#_defaults_#']
+	assert N('#_defaults_#\tNA\t0', '\t') == ['#_defaults_#', 'NA', '0']
+	assert N(['NA', ' 0 '], '\t') == ['#_defaults_#', 'NA', ' 0']
+	assert N(['', ''], '\t') == ['#_defaults_#']
+	assert N('NA,0', ',') == ['#_defaults_#', 'NA', '0']
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
