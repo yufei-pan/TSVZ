@@ -273,7 +273,9 @@ def test_version_is_4_1():
 # ==========================================================================
 # Shared helpers for the 4.1 tests
 # ==========================================================================
+import contextlib
 import gzip
+import io
 import random
 import subprocess
 from collections import OrderedDict
@@ -347,6 +349,95 @@ def _apply_op(store, op):
 # Legacy dialect: differential tests against the frozen 3.39 module
 # ==========================================================================
 LEGACY_SUFFIXES = ['.tsv', '.csv', '.nsv', '.psv', '.tsv.gz']
+SUFFIX_DELIMITERS = {'.tsv': '\t', '.csv': ',', '.nsv': '\x00', '.psv': '|'}
+
+
+# 3.39's background append worker races the test's own writes, so these lines
+# appear or vanish with thread timing. They are dropped before comparison; every
+# other stdout line is still compared.
+_RACY_STDOUT_PREFIXES = ('External changes detected in ', 'Time anomalies detected in ',
+						 'Warning: Overwriting external changes in ')
+
+
+def _observe(fn, twin_dir):
+	"""Run fn with stdout captured; return (outcome, stdout) with the twin dir masked."""
+	buf = io.StringIO()
+	try:
+		with contextlib.redirect_stdout(buf):
+			outcome = ('ok', fn())
+	except Exception as e:
+		outcome = ('raise', type(e).__name__)
+	text = buf.getvalue().replace(twin_dir, '<dir>')
+	return outcome, ''.join(line for line in text.splitlines(True)
+							if not line.startswith(_RACY_STDOUT_PREFIXES))
+
+
+def _tsvzed_snapshot(mod, path):
+	t = mod.TSVZed(path, header=LEGACY_HEADER, rewrite_on_load=False)
+	snap = dict(t)
+	t.close()
+	return snap
+
+
+def _lite_snapshot(mod, path):
+	lite = mod.TSVZedLite(path, header=LEGACY_HEADER, strict=False)
+	snap = {k: lite[k] for k in list(lite.indexes)}
+	lite.close()
+	return snap
+
+
+def _legacy_read_observations(mod, path, delimiter, twin_dir, compressed):
+	obs = []
+	for header in (LEGACY_HEADER, ''):
+		for strict in (True, False):
+			for verify in (True, False):
+				obs.append(_observe(lambda: mod.readTabularFile(
+					path, header=header, strict=strict, verifyHeader=verify), twin_dir))
+	if not compressed:
+		obs.append(_observe(lambda: mod.readTabularFile(
+			path, header=LEGACY_HEADER, storeOffset=True), twin_dir))
+	obs.append(_observe(lambda: mod.read_last_valid_line(path, {}, -1, delimiter=delimiter), twin_dir))
+	obs.append(_observe(lambda: _tsvzed_snapshot(mod, path), twin_dir))
+	if not compressed:
+		obs.append(_observe(lambda: _lite_snapshot(mod, path), twin_dir))
+	return obs
+
+
+def _legacy_corpora(d):
+	"""Hand-written legacy files (bytes) using delimiter d."""
+	def line(*cells):
+		return d.join(cells).encode('utf-8')
+	main = [
+		line('id', 'c1', 'c2'),
+		line('a', 'b c', 'x'),
+		line('dup', 'one', 'two'),
+		line('dup'),                       # lone key: delete
+		line('dup', 'three', 'four'),      # re-set after the delete
+		line('k2', 'z', 'w'),
+		line('k3', '', ''),                # key followed by empty cells
+		line('wide', 'a', 'b', 'c', 'd'),  # wider than header
+		line('narrow', 'a'),               # narrower than header
+		b'',
+		b'   ',
+		line('crlf', 'x', 'y') + b'\r',
+		b'# a comment',
+		line('#note', 'q', 'r'),
+		line('#_defaults_#', '', 'NA'),
+		line('#_defaults_#'),              # empty defaults line
+		line('ts', 'trail  ', 'x '),
+		line('tok', '</sep/>', '<sep>'),
+		line('lf', '<LF>', 'a'),
+		line('late', 'v', 'w'),            # last line, no trailing newline
+	]
+	return {
+		'main': b'\n'.join(main),
+		'badheader': b'\n'.join([line('ID', 'X', 'Y'), line('a', 'b', 'c'), line('b', 'c', 'd')]) + b'\n',
+		'utf8': b'\n'.join([line('id', 'c1', 'c2'), line('u', 'ok', 'fine'),
+		                    b'bad' + d.encode('utf-8') + b'\xff' + d.encode('utf-8') + b'z']) + b'\n',
+		'nul': b'\n'.join([line('id', 'c1', 'c2'), line('nul', 'v', 'w') + b'\x00', line('n2', 'p', 'q')]) + b'\n',
+	}
+
+
 
 
 def _drive_tsvzed(mod, path, ops):
@@ -410,7 +501,8 @@ def test_legacy_tsvzed_matches_339(tmp_path):
 		for seed in range(4):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
 			ops = _legacy_ops(seed)
-			assert _drive_tsvzed(TSVZ, new_path, ops) == _drive_tsvzed(TSVZ_old, old_path, ops), (suffix, seed)
+			assert _observe(lambda: _drive_tsvzed(TSVZ, new_path, ops), os.path.dirname(new_path)) == \
+				_observe(lambda: _drive_tsvzed(TSVZ_old, old_path, ops), os.path.dirname(old_path)), (suffix, seed)
 			assert _content(new_path) == _content(old_path), (suffix, seed)
 
 
@@ -419,7 +511,8 @@ def test_legacy_tsvzedlite_matches_339(tmp_path):
 		for seed in range(4):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
 			ops = _legacy_ops(seed, hash_keys=False)
-			assert _drive_lite(TSVZ, new_path, ops) == _drive_lite(TSVZ_old, old_path, ops), (suffix, seed)
+			assert _observe(lambda: _drive_lite(TSVZ, new_path, ops), os.path.dirname(new_path)) == \
+				_observe(lambda: _drive_lite(TSVZ_old, old_path, ops), os.path.dirname(old_path)), (suffix, seed)
 			assert _content(new_path) == _content(old_path), (suffix, seed)
 
 
@@ -427,20 +520,29 @@ def test_legacy_stateless_helpers_match_339(tmp_path):
 	for suffix in LEGACY_SUFFIXES:
 		for seed in range(3):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
-			assert _drive_stateless(TSVZ, new_path, seed) == _drive_stateless(TSVZ_old, old_path, seed), (suffix, seed)
+			assert _observe(lambda: _drive_stateless(TSVZ, new_path, seed), os.path.dirname(new_path)) == \
+				_observe(lambda: _drive_stateless(TSVZ_old, old_path, seed), os.path.dirname(old_path)), (suffix, seed)
+
+def test_legacy_read_corpus_matches_339(tmp_path):
+	for suffix, d in SUFFIX_DELIMITERS.items():
+		for name, content in _legacy_corpora(d).items():
+			old_path, new_path = _twin_paths(tmp_path / ('%s-%s' % (name, suffix.replace('.', ''))), suffix)
+			_touch(old_path, content)
+			_touch(new_path, content)
+			old_obs = _legacy_read_observations(TSVZ_old, old_path, d, os.path.dirname(old_path), False)
+			new_obs = _legacy_read_observations(TSVZ, new_path, d, os.path.dirname(new_path), False)
+			assert new_obs == old_obs, (name, suffix)
+			assert _content(new_path) == _content(old_path), (name, suffix)
+	# gzip-compressed intact copy of the main corpus file (tab-delimited)
+	main = _legacy_corpora('\t')['main']
+	old_path, new_path = _twin_paths(tmp_path / 'main-gz', '.tsv.gz')
+	_touch(old_path, gzip.compress(main))
+	_touch(new_path, gzip.compress(main))
+	old_obs = _legacy_read_observations(TSVZ_old, old_path, '\t', os.path.dirname(old_path), True)
+	new_obs = _legacy_read_observations(TSVZ, new_path, '\t', os.path.dirname(new_path), True)
+	assert new_obs == old_obs
+	assert _content(new_path) == _content(old_path)
+
 
 if __name__ == '__main__':
-	funcs = [(n, f) for n, f in sorted(globals().items())
-			 if n.startswith('test_') and callable(f)]
-	failed = 0
-	for name, fn in funcs:
-		try:
-			fn()
-			print(f"PASS {name}")
-		except Exception as e:
-			failed += 1
-			import traceback
-			print(f"FAIL {name}: {type(e).__name__}: {e}")
-			traceback.print_exc()
-	print(f"\n{len(funcs) - failed}/{len(funcs)} passed")
-	sys.exit(1 if failed else 0)
+	sys.exit(pytest.main([__file__] + sys.argv[1:]))
