@@ -1602,6 +1602,219 @@ def _cellText(item):
 		return str(e)
 
 
+class _PartInfo(object):
+	"""What reading one part found: its codec, uncommitted tail and damage."""
+
+	def __init__(self, path):
+		self.path = path
+		self.codec = _parsePartName(path).codec
+		self.tail = b''
+		self.damaged = ''
+		self.goodRawEnd = 0
+
+
+def _newDecompressor(codec):
+	if codec in ('gz', 'gzip'):
+		import zlib
+		return zlib.decompressobj(wbits=47)
+	if codec in ('bz2', 'bzip2'):
+		import bz2
+		return bz2.BZ2Decompressor()
+	if codec in ('xz', 'lzma'):
+		import lzma
+		return lzma.LZMADecompressor()
+	from compression import zstd  # Python 3.14+
+	return zstd.ZstdDecompressor()
+
+
+def _decompressChunks(f, info):
+	"""Decompress ``f`` member by member, recording damage on ``info``.
+
+	Zero padding between gzip members is skipped, as Python's gzip module does.
+	A truncated trailing member still yields what it decompresses to
+	(``info.damaged = 'truncated'``); a corrupt member ends the stream
+	(``'corrupt (...)'``). ``info.goodRawEnd`` is the raw offset after the last
+	complete member.
+	"""
+	try:
+		decompressor = _newDecompressor(info.codec)
+	except ImportError as e:
+		info.damaged = 'cannot decompress ({})'.format(e)
+		return
+	isGzip = info.codec in ('gz', 'gzip')
+	rawPos = 0
+	inMember = False
+	pending = b''
+	while True:
+		chunk = pending or f.read(_CHUNK)
+		pending = b''
+		if not chunk:
+			break
+		if not inMember and isGzip:
+			stripped = chunk.lstrip(b'\0')
+			rawPos += len(chunk) - len(stripped)
+			if not stripped:
+				continue
+			chunk = stripped
+		inMember = True
+		try:
+			out = decompressor.decompress(chunk)
+		except Exception as e:
+			info.damaged = 'corrupt ({})'.format(e)
+			return
+		if out:
+			yield out
+		if decompressor.eof:
+			pending = decompressor.unused_data
+			rawPos += len(chunk) - len(pending)
+			info.goodRawEnd = rawPos
+			inMember = False
+			decompressor = _newDecompressor(info.codec)
+		else:
+			rawPos += len(chunk)
+	if inMember:
+		info.damaged = 'truncated'
+
+
+def _iterPartLines(info, reporter):
+	"""Yield ``(rawLine, offset)`` for each committed line of one part (spec §4.3).
+
+	Bytes after the last b'\\n' are not yielded; they are kept on ``info.tail``
+	and reported, as is any damage. An unreadable part is reported and skipped.
+	"""
+	try:
+		f = open(info.path, 'rb')
+	except OSError as e:
+		reporter.note('unreadable', None, 'skipped unreadable part {} ({})'.format(info.path, e))
+		return
+	rest = b''
+	with f:
+		chunks = _decompressChunks(f, info) if info.codec else iter(lambda: f.read(_CHUNK), b'')
+		offset = 0
+		try:
+			for chunk in chunks:
+				data = rest + chunk if rest else chunk
+				start = 0
+				while True:
+					nl = data.find(b'\n', start)
+					if nl < 0:
+						break
+					yield data[start:nl + 1], offset
+					offset += nl + 1 - start
+					start = nl + 1
+				rest = data[start:]
+		except OSError as e:
+			reporter.note('unreadable', None, 'stopped reading part {} ({})'.format(info.path, e))
+			return
+	if rest:
+		info.tail = rest
+		reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(rest[:80]))
+	if info.damaged:
+		reporter.note('damaged', None, 'compressed part {} is damaged ({}); read up to the damage'.format(info.path, info.damaged))
+
+
+def _decodeLine(raw, reporter, where):
+	"""Decode one committed line as UTF-8 (replacing bad bytes) and drop its terminator (spec §4.2)."""
+	try:
+		text = raw.decode('utf-8')
+	except UnicodeDecodeError:
+		text = raw.decode('utf-8', errors='replace')
+		reporter.note('utf8', where, 'invalid UTF-8 replaced with U+FFFD')
+	if text.endswith('\n'):
+		text = text[:-1]
+	if text.endswith('\r'):
+		text = text[:-1]
+	return text
+
+
+def _specChecksum(state, algo, text, delimiter, reporter, where):
+	"""Arm or verify-and-reset the ``algo`` accumulator (spec §15.3)."""
+	if algo in state.digests:
+		fields = text.split(delimiter)
+		expected = fields[1].strip().lower() if len(fields) > 1 else ''
+		if expected:
+			actual = state.digests[algo].hexdigest()
+			if actual != expected:
+				reporter.note('checksum', where, '#_checksum_{}_# mismatch: expected {}, computed {}; data kept'.format(algo, expected, actual))
+	state.digests[algo] = _newDigest(algo)
+
+
+def _specReplay(parts, delimiter, state, reporter, infos):
+	"""Replay ``parts`` as one stream (spec §7, §17.4).
+
+	Yields ``(partIndex, offset, text, record)`` for every committed line except
+	checksum markers of supported algorithms, where ``record`` is what
+	``_specProcessRecord`` returned. Marker state and checksum accumulators in
+	``state`` carry across parts. One ``_PartInfo`` per part is appended to
+	``infos``.
+	"""
+	multi = len(parts) > 1
+	for partIndex, path in enumerate(parts):
+		info = _PartInfo(path)
+		infos.append(info)
+		label = os.path.basename(path) + ' ' if multi else ''
+		lineNo = 0
+		for raw, offset in _iterPartLines(info, reporter):
+			lineNo += 1
+			where = '{}line {}'.format(label, lineNo)
+			if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
+				raw = raw[3:]
+				reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+			text = _decodeLine(raw, reporter, where)
+			check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+			algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
+			for name, digest in state.digests.items():
+				if name != algo:
+					digest.update(raw)
+			if algo:
+				_specChecksum(state, algo, text, delimiter, reporter, where)
+				continue
+			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
+
+
+def _storeParts(path, reporter=None):
+	"""Return ``(parts, active)`` for the store ``path`` names (spec §17).
+
+	``parts`` lists existing parts in replay order: the unnumbered file (part
+	0) first, then ``<store>.<hex>`` parts by integer ordinal; ``.rotated``
+	parts are excluded. ``active`` is the part appends go to: the highest
+	numbered part, else ``path``. A path naming a numbered or rotated part is
+	read alone (with a warning).
+	"""
+	name = _parsePartName(path)
+	if name.ordinal is not None or name.rotated:
+		if reporter is not None:
+			reporter.note('fragment', None, 'names one part of a multi-part store; reading that part alone')
+		return ([path] if os.path.isfile(path) else []), path
+	directory = os.path.dirname(name.store)
+	base = os.path.basename(name.store)
+	own = os.path.basename(path)
+	try:
+		entries = os.listdir(directory or '.')
+	except OSError:
+		entries = []
+	numbered = []
+	for entry in entries:
+		if entry == own or not (entry == base or entry.startswith(base + '.')):
+			continue
+		part = _parsePartName(entry)
+		if not part.ext or part.store != base or part.rotated:
+			continue
+		if part.ordinal is None:
+			if reporter is not None:
+				reporter.note('part0-ambiguous', None, 'ignored {} beside {}: only the named file is part 0'.format(entry, own))
+			continue
+		numbered.append((part.ordinal, entry))
+	numbered.sort()
+	if reporter is not None:
+		for i in range(1, len(numbered)):
+			if numbered[i][0] == numbered[i - 1][0]:
+				reporter.note('ordinal-tie', None, 'parts {} and {} share an ordinal; ordered by name'.format(numbered[i - 1][1], numbered[i][1]))
+	parts = [path] if os.path.isfile(path) else []
+	parts += [os.path.join(directory, entry) for _, entry in numbered]
+	return parts, (parts[-1] if numbered else path)
+
+
 def getListView(tsvzDic,header = [],delimiter = ...):
 	if header:
 		if isinstance(header,str):

@@ -934,5 +934,174 @@ def test_spec_version_marker_with_unicode_digits_is_rejected(capsys):
 	assert 'invalid value' in warnings[0] and '2 occurrences' in warnings[0]
 
 
+# ==========================================================================
+# Spec dialect: part reader, checksums, multi-part assembly (§4, §15–§17)
+# ==========================================================================
+def _replay(paths, d='\t'):
+	state = TSVZ._SpecState()
+	reporter = TSVZ._Reporter('t')
+	infos = []
+	data = OrderedDict()
+	for _, _, _, record in TSVZ._specReplay(paths, d, state, reporter, infos):
+		if record is None:
+			continue
+		key, row = record
+		if row is None:
+			data.pop(key, None)
+		else:
+			data[key] = row
+	reporter.flush()
+	return data, state, infos
+
+
+def test_spec_commit_rule_crlf_and_bom(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'\xef\xbb\xbfa\t1\r\nb\t2\r\nc\t3')
+	data, _, infos = _replay([p])
+	assert dict(data) == {'a': ['a', '1'], 'b': ['b', '2']}
+	assert infos[0].tail == b'c\t3'
+	assert sorted(_tsvz_warnings(capsys)) == sorted([
+		'TSVZ warning: t: stripped a UTF-8 byte order mark (line 1)',
+		"TSVZ warning: t: ignored uncommitted bytes after the last newline: b'c\\t3'",
+	])
+
+
+def test_spec_invalid_utf8_is_replaced_and_reported(tmp_path, capsys):
+	p = str(tmp_path / 'u.tsvz')
+	_touch(p, b'a\t\xff\nb\t\xfe\n')
+	data, _, _ = _replay([p])
+	assert dict(data) == {'a': ['a', '�'], 'b': ['b', '�']}
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: t: invalid UTF-8 replaced with U+FFFD (2 occurrences, first at line 1)']
+
+
+def test_spec_lines_split_across_chunks(tmp_path, monkeypatch):
+	monkeypatch.setattr(TSVZ, '_CHUNK', 3)
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, 'ключ\tзначение\r\nk2\t中文\n'.encode('utf-8'))
+	data, _, _ = _replay([p])
+	assert dict(data) == {'ключ': ['ключ', 'значение'], 'k2': ['k2', '中文']}
+	g = str(tmp_path / 'b.tsvz.gz')
+	_touch(g, gzip.compress('ключ\tзначение\r\n'.encode('utf-8')) + gzip.compress(b'k2\tv\n'))
+	data, _, infos = _replay([g])
+	assert dict(data) == {'ключ': ['ключ', 'значение'], 'k2': ['k2', 'v']}
+	assert not infos[0].damaged
+
+
+def test_spec_gzip_damage(tmp_path, capsys):
+	g = str(tmp_path / 'g.tsvz.gz')
+	_touch(g, gzip.compress(b'a\t1\n') + b'\0\0\0' + gzip.compress(b'b\t2\n') + gzip.compress(b'c\t3\n')[:-6])
+	data, _, infos = _replay([g])
+	assert dict(data) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}
+	assert infos[0].damaged == 'truncated'
+	_touch(g, gzip.compress(b'a\t1\n') + b'garbage!')
+	data, _, infos = _replay([g])
+	assert dict(data) == {'a': ['a', '1']} and infos[0].damaged.startswith('corrupt')
+	assert len(_tsvz_warnings(capsys)) == 2
+
+
+def test_spec_bz2_and_xz_parts(tmp_path):
+	import bz2
+	import lzma
+	b = str(tmp_path / 'a.tsvz.bz2')
+	x = str(tmp_path / 'b.tsvz.xz')
+	_touch(b, bz2.compress(b'a\t1\n') + bz2.compress(b'b\t2\n'))
+	_touch(x, lzma.compress(b'a\t1\n') + lzma.compress(b'b\t2\n'))
+	assert dict(_replay([b])[0]) == dict(_replay([x])[0]) == {'a': ['a', '1'], 'b': ['b', '2']}
+
+
+def test_spec_zst_without_support_is_skipped(tmp_path):
+	try:
+		from compression import zstd  # noqa: F401
+		pytest.skip('compression.zstd is available')
+	except ImportError:
+		pass
+	z = str(tmp_path / 'a.tsvz.zst')
+	_touch(z, b'\x28\xb5\x2f\xfdjunk')
+	data, _, infos = _replay([z])
+	assert dict(data) == {} and infos[0].damaged.startswith('cannot decompress')
+
+
+def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):
+	import zlib
+	base = str(tmp_path / 'm.tsvz')
+	body = b'b\t2\n'
+	crc = '%08x' % (zlib.crc32(b'a\t1\r\n' + body) & 0xffffffff)
+	_touch(base, b'#_checksum_crc32_#\tIGNORED\na\t1\r\n')
+	_touch(base + '.f', body + ('#_checksum_crc32_#\t' + crc.upper() + '\n').encode()
+		   + b'#_checksum_crc32_#\tdeadbeef\n#_checksum_nope_#\t1\n')
+	data, _, _ = _replay([base, base + '.f'])
+	assert dict(data) == {'a': ['a', '1'], 'b': ['b', '2']}
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1
+	assert 'mismatch: expected deadbeef, computed 00000000' in warnings[0] and 'm.tsvz.f line 3' in warnings[0]
+
+
+def test_spec_checksum_covers_other_algorithms_markers(tmp_path, capsys):
+	import zlib
+	p = str(tmp_path / 'a.tsvz')
+	sha_line = b'#_checksum_sha256_#\n'
+	crc = '%08x' % (zlib.crc32(sha_line + b'a\t1\n') & 0xffffffff)
+	_touch(p, b'#_checksum_crc32_#\n' + sha_line + b'a\t1\n' + ('#_checksum_crc32_#\t%s\n' % crc).encode())
+	_replay([p])
+	assert _tsvz_warnings(capsys) == []
+
+
+def test_store_parts_order_and_exclusions(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	for name in ['m.tsvz', 'm.tsvz.10', 'm.tsvz.f', 'm.tsvz.0', 'm.tsvz.11.rotated', 'm.tsvz.12.rotated.gz',
+				 'm.tsvz.zz', 'other.tsvz.1', 'm.tsv.2']:
+		_touch(str(tmp_path / name))
+	reporter = TSVZ._Reporter(base)
+	parts, active = TSVZ._storeParts(base, reporter)
+	assert [os.path.basename(p) for p in parts] == ['m.tsvz', 'm.tsvz.0', 'm.tsvz.f', 'm.tsvz.10']
+	assert os.path.basename(active) == 'm.tsvz.10'
+	reporter.flush()
+	assert _tsvz_warnings(capsys) == []
+
+
+def test_store_parts_without_part_zero_and_ties(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1a')
+	_touch(base + '.1A.gz')
+	reporter = TSVZ._Reporter(base)
+	parts, active = TSVZ._storeParts(base, reporter)
+	assert [os.path.basename(p) for p in parts] == ['m.tsvz.1A.gz', 'm.tsvz.1a']
+	assert active == parts[-1]
+	reporter.flush()
+	assert len(_tsvz_warnings(capsys)) == 1
+
+
+def test_store_parts_ambiguous_part_zero(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base)
+	_touch(base + '.gz')
+	reporter = TSVZ._Reporter(base)
+	assert TSVZ._storeParts(base, reporter) == ([base], base)
+	reporter.flush()
+	assert len(_tsvz_warnings(capsys)) == 1
+
+
+def test_store_parts_fragment_and_missing(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base)
+	_touch(base + '.1')
+	reporter = TSVZ._Reporter(base + '.1')
+	assert TSVZ._storeParts(base + '.1', reporter) == ([base + '.1'], base + '.1')
+	reporter.flush()
+	assert 'one part of a multi-part store' in _tsvz_warnings(capsys)[0]
+	missing = str(tmp_path / 'none.tsvz')
+	assert TSVZ._storeParts(missing) == ([], missing)
+
+
+def test_spec_unreadable_part_is_skipped(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	os.mkdir(base + '.1')  # a directory named like a part cannot be read
+	parts, _ = TSVZ._storeParts(base)
+	data, _, _ = _replay(parts)
+	assert dict(data) == {'a': ['a', '1']}
+	assert 'skipped unreadable part' in _tsvz_warnings(capsys)[0]
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
