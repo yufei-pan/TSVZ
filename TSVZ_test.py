@@ -663,5 +663,50 @@ def test_path_lock_is_shared_per_real_path(tmp_path):
 	assert TSVZ._pathLock(p) is TSVZ._pathLock(os.path.join(str(tmp_path), '.', 'a.tsvz'))
 
 
+# ==========================================================================
+# Legacy fixes L1 and L6
+# ==========================================================================
+def test_l1_stateless_append_adds_missing_newline(tmp_path, capsys):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\nk1\tx')
+	TSVZ.appendTabularFile(p, ['k2', 'y'], header='id\tv')
+	assert open(p, 'rb').read() == b'id\tv\nk1\tx\nk2\ty\n'
+	assert dict(TSVZ.readTabularFile(p, header='id\tv')) == {'k1': ['k1', 'x'], 'k2': ['k2', 'y']}
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: last line had no trailing newline; added one before appending' % p]
+
+
+def test_l1_tsvzed_append_adds_missing_newline(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\nk1\tx')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False)
+	t['k2'] = ['k2', 'y']
+	t.close()
+	assert open(p, 'rb').read() == b'id\tv\nk1\tx\nk2\ty\n'
+
+
+def test_l1_tsvzedlite_append_adds_missing_newline(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\nk1\tx')
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	lite['k2'] = ['k2', 'y']
+	assert lite['k2'] == ['k2', 'y'] and lite['k1'] == ['k1', 'x']
+	lite.close()
+	assert open(p, 'rb').read() == b'id\tv\nk1\tx\nk2\ty\n'
+
+
+def test_l6_map_to_file_keeps_newline_at_end_of_file(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\ta\tb\nk1\txx\tyy\n')
+	t = TSVZ.TSVZed(p, header='id\ta\tb', rewrite_on_load=False)
+	t.memoryOnly = True  # keep these rows out of the append queue
+	t['k1'] = ['k1', 'x2', 'y2']  # same length: rewritten in place
+	t['k2'] = ['k2', 'p', 'q']    # beyond the end of the file
+	t['k3'] = ['k3', 'r', 's']
+	t.memoryOnly = False
+	t.mapToFile()
+	t.close()
+	assert open(p, 'rb').read() == b'id\ta\tb\nk1\tx2\ty2\nk2\tp\tq\nk3\tr\ts\n'
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

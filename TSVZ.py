@@ -1208,14 +1208,18 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 			formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
 		elif len(formatedLines[i]) > correctColumnNum:
 			formatedLines[i] = formatedLines[i][:correctColumnNum]
-	with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
-		# check if the file ends in a newline
-		# file.seek(-1, os.SEEK_END)
-		# if file.read(1) != b'\n':
-		#     file.write(b'\n')
-		file.write(b'\n'.join([delimiter.join(line).encode(encoding=encoding,errors='replace') for line in formatedLines]) + b'\n')
-		if verbose:
-			__teePrintOrNot(f"Appended {len(formatedLines)} lines to {fileName}",teeLogger=teeLogger)
+	payload = b'\n'.join([delimiter.join(line).encode(encoding=encoding,errors='replace') for line in formatedLines]) + b'\n'
+	if _isCompressedFile(fileName):
+		with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
+			file.write(payload)
+	else:
+		# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
+		# instead of gluing the new record onto it.
+		reporter = _Reporter(fileName, teeLogger)
+		_lockedAppend(fileName, payload, 'newline', reporter)
+		reporter.flush()
+	if verbose:
+		__teePrintOrNot(f"Appended {len(formatedLines)} lines to {fileName}",teeLogger=teeLogger)
 
 def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t'):
 	"""
@@ -1967,7 +1971,8 @@ memoryOnly:{self.memoryOnly}
 				if not line or pos == aftPos:
 					if self.verbose:
 						self.__teePrintOrNot(f"End of file reached. Appending {value} to {self._fileName}")
-					file.write(strToWrite.encode(encoding=self.encoding,errors='replace'))
+					# L6: 3.39 omitted this newline and glued the row to the next one.
+					file.write(strToWrite.encode(encoding=self.encoding,errors='replace')+b'\n')
 					overWrite = True
 					continue
 				strToWrite = strToWrite.encode(encoding=self.encoding,errors='replace').ljust(len(line)-1)+b'\n'
@@ -2037,12 +2042,18 @@ memoryOnly:{self.memoryOnly}
 				if self.verbose:
 					self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
 					self.__teePrintOrNot(f"Before size of {self._fileName}: {os.path.getsize(self._fileName)}")
-				file = self.get_file_obj('ab')
-				buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
+				compressed = _isCompressedFile(self._fileName)
+				file = self.get_file_obj('ab' if compressed else 'a+b')
+				chunks = []
 				while self.appendQueue:
 					line = _sanitize(self.appendQueue.popleft(),delimiter=self.delimiter)
-					buf.write(self.delimiter.join(line).encode(encoding=self.encoding,errors='replace')+b'\n')
-				buf.flush()
+					chunks.append(self.delimiter.join(line).encode(encoding=self.encoding,errors='replace')+b'\n')
+				payload = b''.join(chunks)
+				if not compressed and _endsWithoutNewline(file):
+					# L1: terminate a hand-edited last line instead of gluing onto it.
+					payload = b'\n' + payload
+					_warn(f'TSVZ warning: {self._fileName}: last line had no trailing newline; added one before appending', self.teeLogger)
+				file.write(payload)
 				self.release_file_obj(file)
 				if self.verbose:
 					self.__teePrintOrNot(f"Records commited to {self._fileName}")
@@ -2339,8 +2350,16 @@ class TSVZedLite(MutableMapping):
 	# Private methods for reading and writing values for TSVZedLite
 
 	def __writeValues(self,data):
-		self.fileObj.seek(0, os.SEEK_END)
-		write_at = self.fileObj.tell()
+		write_at = self.fileObj.seek(0, os.SEEK_END)
+		if write_at:
+			self.fileObj.seek(write_at - 1)
+			if self.fileObj.read(1) != b'\n':
+				# L1: terminate a hand-edited last line instead of gluing onto it.
+				self.fileObj.seek(write_at)
+				self.fileObj.write(b'\n')
+				write_at += 1
+				_warn(f'TSVZ warning: {self._fileName}: last line had no trailing newline; added one before appending')
+			self.fileObj.seek(write_at)
 		if self.verbose:
 			eprint(f"Writing at position {write_at}")
 		data = _sanitize(data,delimiter=self.delimiter)
