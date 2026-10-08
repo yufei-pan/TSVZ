@@ -3540,6 +3540,7 @@ class TSVZedLite(MutableMapping):
 				self.fileObj = fileObj
 		atexit.register(self.close)
 
+	# Implement custom methods just for TSVZedLite
 	def getResourceUsage(self,return_dict = False):
 		return get_resource_usage(return_dict = return_dict)
 
@@ -3827,6 +3828,8 @@ class TSVZedLite(MutableMapping):
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		return self
+
+	# Private methods for reading and writing values for TSVZedLite
 
 	def __writeValues(self,data):
 		if self.fileObj is None:
