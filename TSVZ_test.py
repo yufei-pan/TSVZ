@@ -2173,5 +2173,92 @@ def test_lite_spec_write_locks_and_unlocks_at_raw_offset_zero(tmp_path, monkeypa
 	assert positions == [('lock', 0), ('unlock', 0)]
 
 
+# ==========================================================================
+# CLI (spec §20): parser, logger, writers
+# ==========================================================================
+def test_cli_parse_canonical_and_file_first_forms():
+	P = TSVZ._cliParseArgs
+	a = P(['get', 'data.tsvz', 'alice', 'bob'])
+	assert (a.operation, a.store, a.args) == ('get', 'data.tsvz', ['alice', 'bob'])
+	a = P(['data.tsvz', 'append', 'k', 'v'])
+	assert (a.operation, a.store, a.args) == ('append', 'data.tsvz', ['k', 'v'])
+	a = P(['data.tsvz'])
+	assert (a.operation, a.store, a.args) == ('read', 'data.tsvz', [])
+	a = P(['read', './read'])
+	assert (a.operation, a.store) == ('read', './read')
+	a = P(['./read'])
+	assert (a.operation, a.store) == ('read', './read')
+	a = P(['set', 'my store.tsvz', 'k', 'v'])
+	assert (a.operation, a.store, a.args) == ('set', 'my store.tsvz', ['k', 'v'])
+
+
+def test_cli_parse_options_anywhere_and_double_dash():
+	P = TSVZ._cliParseArgs
+	a = P(['-q', 'set', '--format', 'records', 'd.tsvz', 'k', '-v', 'v1', '--x-header=id\\tv'])
+	assert a.quiet and a.verbose and a.format == 'records' and a.header == 'id\\tv'
+	assert (a.operation, a.store, a.args) == ('set', 'd.tsvz', ['k', 'v1'])
+	a = P(['set', 'd.tsvz', 'k', '-5', '-.5', '-'])
+	assert a.args == ['k', '-5', '-.5', '-']
+	a = P(['set', 'd.tsvz', '--', 'k', '-v', '--format'])
+	assert a.args == ['k', '-v', '--format'] and not a.verbose and a.format is None
+	assert P(['-dcomma', 'read', 'd.csv']).delimiter == 'comma'
+	assert P(['read', 'd.csv', '--delimiter', '|']).delimiter == '|'
+	a = P(['-qv', 'read', 'd.tsvz'])
+	assert a.quiet and a.verbose
+	assert P(['set', 'd.tsvz', '-']).args == ['-']
+	assert P(['set', 'd.tsvz', 'k', '']).args == ['k', '']
+
+
+def test_cli_parse_legacy_aliases():
+	P = TSVZ._cliParseArgs
+	a = P(['d.tsv', '-c', 'id\\tv', '-s', 'append', 'k', 'v', '--defaults', 'NA'])
+	assert a.header == 'id\\tv' and a.strict is True and a.defaults == 'NA'
+	assert P(['d.tsv', '-s', '-f', 'read']).strict is False
+	assert P(['d.tsv', '--x-strict', 'read']).strict is True
+	assert P(['-cid', 'read', 'd.tsv']).header == 'id'
+
+
+def test_cli_parse_usage_errors():
+	P = TSVZ._cliParseArgs
+	bad = ([], ['read'], ['frob', 'd.tsvz'], ['d.tsvz', 'frob'], ['read', 'd.tsvz', 'extra'],
+		   ['get', 'd.tsvz'], ['set', 'd.tsvz'], ['delete', 'd.tsvz'], ['--bogus', 'read', 'd.tsvz'],
+		   ['x-export', 'd.tsvz'], ['read', 'd.tsvz', '--x-bogus'], ['read', 'd.tsvz', '--format', 'json'],
+		   ['read', 'd.tsvz', '--format'], ['read', 'd.tsvz', '--quiet=yes'], ['set', 'd.tsvz', '', 'v'],
+		   ['get', 'd.tsvz', 'a', ''], ['delete', 'd.tsvz', ''])
+	for argv in bad:
+		with pytest.raises(TSVZ._CliUsageError):
+			P(argv)
+	assert P(['-h']).help and P(['read', '--version']).version
+
+
+def test_cli_logger_and_writers():
+	err = io.StringIO()
+	log = TSVZ._CliLogger(err)
+	log.teelog('w', 'warning')
+	log.teelog('i', callerStackDepth=3)
+	assert err.getvalue() == 'w\ni\n'
+	err = io.StringIO()
+	log = TSVZ._CliLogger(err, quiet=True)
+	log.teelog('w', 'warning')
+	log.teelog('e', 'error')
+	log.teelog('i')
+	assert err.getvalue() == 'e\n'
+	args = TSVZ._CliArgs()
+	out = io.StringIO()
+	TSVZ._cliEmitRows([['#k', 'a<b', 'x\ty']], args, out, True, '\t')
+	assert out.getvalue() == '<#>k\ta<lt>b\tx<sep>y\n'
+	out = io.StringIO()
+	TSVZ._cliEmitRows([['k', '<sep>']], args, out, False, '\t')
+	assert out.getvalue() == 'k\t</sep/>\n'
+	out = io.StringIO()
+	TSVZ._cliEmitFields([['0', '', 'a\tb.tsvz', 'active']], ['index', 'ordinal', 'path', 'flags'], args, out)
+	assert out.getvalue() == '0\t\ta<sep>b.tsvz\tactive\n'
+	args.format = 'table'
+	out = io.StringIO()
+	TSVZ._cliEmitRows([['k', 'v']], args, out, True, '\t')
+	assert out.getvalue() == 'k | v\n--+--\n\n'
+	assert TSVZ._cliFormat(TSVZ._CliArgs(), io.StringIO()) == 'records'
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

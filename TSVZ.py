@@ -4298,6 +4298,223 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 
 
 
+# ===========================================================================
+# Command-line interface (tsvz-spec-v1 §20)
+# ===========================================================================
+_CLI_OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts')
+#: option -> (destination, takes a value). The 3.39 spellings -c/--header,
+#: --defaults, -s/--strict and -f/--force are undocumented aliases of the
+#: --x- extensions (spec §20.7.4).
+_CLI_OPTIONS = {
+	'-h': ('help', False), '--help': ('help', False),
+	'-V': ('version', False), '--version': ('version', False),
+	'-q': ('quiet', False), '--quiet': ('quiet', False),
+	'-v': ('verbose', False), '--verbose': ('verbose', False),
+	'--format': ('format', True),
+	'-d': ('delimiter', True), '--delimiter': ('delimiter', True),
+	'--x-header': ('header', True), '-c': ('header', True), '--header': ('header', True),
+	'--x-defaults': ('defaults', True), '--defaults': ('defaults', True),
+	'--x-strict': ('strict', False), '-s': ('strict', False), '--strict': ('strict', False),
+	'--x-force': ('force', False), '-f': ('force', False), '--force': ('force', False),
+}
+_CLI_NEGATIVE_NUMBER_RE = re.compile(r'^-[0-9.]')
+_CLI_USAGE = 'usage: tsvz [OPTION ...] OPERATION STORE [ARG ...]   (tsvz -h for help)'
+_CLI_HELP = '''usage: tsvz [OPTION ...] OPERATION STORE [ARG ...]
+       tsvz [OPTION ...] STORE [OPERATION] [ARG ...]   (3.39 form; OPERATION defaults to read)
+
+TSVZ {version}: key-value stores in .tsv/.csv/.nsv/.psv files (TSVZ 3.39 rules)
+and in .tsvz/.csvz/.nsvz/.psvz files (tsvz-spec-v1).
+
+operations:
+  read STORE                   print every live row
+  get STORE KEY [KEY ...]      print the rows of KEYs (exit 3 if one is missing)
+  set STORE KEY [VALUE ...]    write a row; KEY alone deletes it; '-' reads rows from stdin
+  append ...                   same as set
+  delete STORE KEY [KEY ...]   delete KEYs; '-' reads keys from stdin
+  clear STORE                  empty the store, keeping its header and markers
+  scrub STORE                  compact the store in place (archival maintenance)
+  verify STORE                 check #_checksum_*_# segments (exit 4 on a mismatch)
+  parts STORE                  list the parts of a multi-part store
+
+options:
+  -h, --help                   show this help
+  -V, --version                show the version
+  --format table|records       output format (default: table on a terminal, else records)
+  -q, --quiet                  print errors only
+  -v, --verbose                print more detail
+  -d, --delimiter D            .tsv-family delimiter: tab, comma, pipe, null or one character
+  --x-header H                 header to check, or to create a new file with
+  --x-defaults D               defaults row KEY D1 D2 ... joined by the delimiter (KEY is ignored)
+  --x-strict, --x-force        turn the 3.39 column and header checks on or off (default: off)
+  --                           every argument after this is positional
+  (--x-header and --x-defaults decode backslash escapes such as \\t)
+
+exit status: 0 done, 1 failed or refused, 2 usage error, 3 missing key, 4 checksum mismatch
+'''
+
+
+class _CliUsageError(Exception):
+	"""A command line that does not follow spec §20.1 / §20.7 (exit status 2)."""
+
+
+class _CliArgs(object):
+	"""A parsed command line (spec §20.1)."""
+
+	def __init__(self):
+		self.help = False
+		self.version = False
+		self.quiet = False
+		self.verbose = False
+		self.format = None
+		self.delimiter = ...
+		self.header = ''
+		self.defaults = None
+		self.strict = False
+		self.operation = None
+		self.store = None
+		self.args = []
+
+
+def _cliDecodeArgv(argv):
+	"""Re-decode arguments as UTF-8 where Python decoded them as ASCII (Python 3.6 under LANG=C)."""
+	if os.name != 'posix' or codecs.lookup(sys.getfilesystemencoding()).name == 'utf-8':
+		return list(argv)
+	return [os.fsencode(arg).decode('utf-8', 'replace') for arg in argv]
+
+
+def _cliParseArgs(argv):
+	"""Split ``argv`` per spec §20.1 into a ``_CliArgs``; raise ``_CliUsageError`` if it does not parse.
+
+	Options may appear anywhere before a lone ``--``. ``-`` and negative numbers
+	(``-5``, ``-.5``) are positional. Single-letter flags combine (``-qv``) and a
+	single-letter option takes its value attached (``-dcomma``). The first
+	positional argument decides the form: an operation name selects
+	``OPERATION STORE [ARG ...]``, anything else the 3.39
+	``STORE [OPERATION] [ARG ...]`` form.
+	"""
+	args = _CliArgs()
+	argv = list(argv)
+	positionals = []
+	i = 0
+	while i < len(argv):
+		arg = argv[i]
+		i += 1
+		if arg == '--':
+			positionals.extend(argv[i:])
+			break
+		if not arg.startswith('-') or arg == '-' or _CLI_NEGATIVE_NUMBER_RE.match(arg):
+			positionals.append(arg)
+			continue
+		if arg.startswith('--'):
+			name, eq, value = arg.partition('=')
+		elif len(arg) > 2 and _CLI_OPTIONS.get(arg[:2], (None, False))[1]:
+			name, eq, value = arg[:2], '=', arg[2:]  # -dcomma
+		elif len(arg) > 2:
+			name, eq, value = arg[:2], '', ''
+			argv.insert(i, '-' + arg[2:])  # -qv: take one flag at a time
+		else:
+			name, eq, value = arg, '', ''
+		if name not in _CLI_OPTIONS:
+			raise _CliUsageError('unknown option {}'.format(name))
+		dest, takesValue = _CLI_OPTIONS[name]
+		if takesValue:
+			if not eq:
+				if i >= len(argv):
+					raise _CliUsageError('option {} needs a value'.format(name))
+				value = argv[i]
+				i += 1
+			setattr(args, dest, value)
+		elif eq:
+			raise _CliUsageError('option {} takes no value'.format(name))
+		elif dest == 'force':
+			args.strict = False
+		else:
+			setattr(args, dest, True)
+	if args.help or args.version:
+		return args
+	if args.format not in (None, 'table', 'records'):
+		raise _CliUsageError('--format must be table or records, not {!r}'.format(args.format))
+	if not positionals:
+		raise _CliUsageError('missing OPERATION and STORE')
+	if positionals[0] in _CLI_OPERATIONS:
+		if len(positionals) < 2:
+			raise _CliUsageError('{} needs a STORE'.format(positionals[0]))
+		args.operation, args.store, args.args = positionals[0], positionals[1], positionals[2:]
+	else:
+		args.store = positionals[0]
+		if len(positionals) == 1:
+			args.operation = 'read'
+		elif positionals[1] in _CLI_OPERATIONS:
+			args.operation, args.args = positionals[1], positionals[2:]
+		else:
+			raise _CliUsageError('unknown operation: neither {!r} nor {!r} is one of {}'.format(
+				positionals[0], positionals[1], ', '.join(_CLI_OPERATIONS)))
+	if args.operation in ('read', 'clear', 'scrub', 'verify', 'parts') and args.args:
+		raise _CliUsageError('{} takes no arguments after STORE'.format(args.operation))
+	if args.operation in ('get', 'set', 'append', 'delete'):
+		if not args.args:
+			raise _CliUsageError('{} needs a KEY'.format(args.operation))
+		keys = args.args if args.operation in ('get', 'delete') else args.args[:1]
+		if '' in keys:
+			raise _CliUsageError('{}: a KEY must not be empty'.format(args.operation))
+	return args
+
+
+def _cliWrite(stream, text):
+	"""Write ``text`` to ``stream`` as UTF-8 and flush (Python 3.6 under LANG=C cannot encode non-ASCII)."""
+	buffer = getattr(stream, 'buffer', None)
+	if buffer is None:
+		stream.write(text)
+	else:
+		stream.flush()  # keep the order of text already written through the text layer
+		buffer.write(text.encode('utf-8', 'replace'))
+	stream.flush()
+
+
+class _CliLogger(object):
+	"""``teeLogger`` for the CLI: every diagnostic on stderr (spec §20.5); ``quiet`` keeps errors only."""
+
+	def __init__(self, stream, quiet=False):
+		self.stream = stream
+		self.quiet = quiet
+
+	def teelog(self, message, level='info', callerStackDepth=None):
+		if self.quiet and level not in ('error', 'critical'):
+			return
+		_cliWrite(self.stream, '{}\n'.format(message))
+
+
+def _cliFormat(args, stdout):
+	"""The output format (spec §20.4.3): ``--format``, else table on a terminal and records otherwise."""
+	if args.format:
+		return args.format
+	try:
+		return 'table' if stdout.isatty() else 'records'
+	except Exception:
+		return 'records'
+
+
+def _cliEmitRows(rows, args, stdout, spec, delimiter):
+	"""Print store rows for ``read`` / ``get`` (spec §20.4): §13 records, 3.39 records or the 3.39 table."""
+	if _cliFormat(args, stdout) == 'table':
+		_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter) + '\n')
+		return
+	if spec:
+		lines = [_specFormatRecord(row, delimiter) for row in rows]
+	else:
+		lines = [delimiter.join(_sanitize(row, delimiter=delimiter)) for row in rows]
+	_cliWrite(stdout, ''.join(line + '\n' for line in lines))
+
+
+def _cliEmitFields(rows, header, args, stdout):
+	"""Print ``verify`` / ``parts`` rows: TAB-joined §13-encoded fields, or a table under ``header``."""
+	if _cliFormat(args, stdout) == 'table':
+		if rows:
+			_cliWrite(stdout, pretty_format_table([header] + rows) + '\n')
+		return
+	_cliWrite(stdout, ''.join('\t'.join(_specEncodeField(str(field), '\t') for field in row) + '\n' for row in rows))
+
+
 def __main__():
 	import argparse
 	parser = argparse.ArgumentParser(description='TSVZ: a TSV / CSV / NSV / PSV key-value file manager (.tsvz / .csvz / .nsvz / .psvz follow tsvz-spec-v1)')
