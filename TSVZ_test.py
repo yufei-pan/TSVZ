@@ -3406,5 +3406,109 @@ def test_tsvz_commands_through_tsvz_serve(tmp_path):
 	assert open(p, 'rb').read() == b'k\tv\nj\tw\n'
 
 
+# ==========================================================================
+# TSVZClient: a served store from Python (spec §21)
+# ==========================================================================
+def _mapping_story(t):
+	"""Run the same dict operations on a TSVZed or a TSVZClient; return what they returned."""
+	seen = []
+	t['alice'] = ['alice', 'Alice', '30']
+	t['bob'] = 'bob\tBob\t7'
+	t['carol'] = ['Carol', '5']  # the key is put first
+	seen += [t['bob'], t.get('nobody', 'missing'), 'alice' in t, 'zed' in t, len(t), list(t)]
+	del t['bob']
+	seen += [t.pop('carol'), t.pop('carol', 'gone')]
+	seen += [t.setdefault('dave', ['dave', 'D', '1']), t.setdefault('dave', ['dave', 'X', '2'])]
+	t.update({'erin': ['erin', 'E', '2'], 'fay': 'fay\tF\t3'})
+	seen += [sorted(t.keys()), t.popitem(), t.popitem(last=False)]
+	del t['nobody']  # a missing key is not an error
+	return seen
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+@pytest.mark.parametrize('ext', ['tsvz', 'tsv'])
+def test_tsvz_client_behaves_like_tsvzed(tmp_path, served, ext):
+	header = 'id\tname\tn' if ext == 'tsvz' else ''  # a .tsv header line is a row when served, as in `tsvz read`
+	paths = [str(tmp_path / '{}.{}'.format(name, ext)) for name in ('tsvzed', 'served', 'local')]
+	for path in paths[1:]:
+		TSVZ.appendLinesTabularFile(path, [], header=header, createIfNotExist=True)
+	served(paths[1])
+	with TSVZ.TSVZed(paths[0], header=header) as t:
+		expected = _mapping_story(t)
+	results = []
+	for path in paths[1:]:
+		with TSVZ.TSVZClient(path) as c:
+			results.append(_mapping_story(c))
+			assert c.items() == [(row[0], row) for row in _view(path)]
+	assert results == [expected, expected]
+	assert expected[:6] == [['bob', 'Bob', '7'], 'missing', True, False, 3, ['alice', 'bob', 'carol']]
+	views = [[row for row in _view(path) if row[0] != 'id'] for path in paths]
+	assert views[0] == views[1] == views[2] == [['dave', 'D', '1'], ['erin', 'E', '2']]
+
+
+def test_tsvz_client_missing_keys_follow_the_store(tmp_path):
+	p = str(tmp_path / 'm.tsvz')
+	_touch(p, b'#_defaults_#\t\tNA\na\t1\t2\n')
+	with TSVZ.TSVZClient(p) as c:
+		assert c['zed'] == ['zed', '', 'NA'] and c.get('zed') is None and 'zed' not in c
+		c['#_return_defaults_when_missing_#'] = ['false']  # a marker write
+		with pytest.raises(KeyError):
+			c['zed']
+		c.setDefaults(['', 'X'])
+		assert c['a'] == ['a', '1', '2'] and open(p, 'rb').read().endswith(
+			b'#_return_defaults_when_missing_#\tfalse\n#_defaults_#\t\tX\n')
+		for method in ('move_to_end', 'rewrite', 'mapToFile', 'hardMapToFile'):
+			with pytest.raises(NotImplementedError):
+				getattr(c, method)('a')
+
+
+def test_tsvz_client_warns_once_when_no_handler_runs(tmp_path, capsys):
+	p = str(tmp_path / 'w.tsvz')
+	with TSVZ.TSVZClient(p) as c:
+		c['k'] = ['k', 'v']
+		assert c['k'] == ['k', 'v'] and len(c) == 1
+		assert repr(c) == 'TSVZClient({!r}, local)'.format(p)
+	err = capsys.readouterr().err
+	assert err.count('working on the files in this process') == 1
+	assert open(p, 'rb').read() == b'k\tv\n'
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_tsvz_client_sync_asks_for_disk_acknowledgement(tmp_path, served, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	served(p)
+	lines = []
+	real = TSVZ._serveRespond
+	monkeypatch.setattr(TSVZ, '_serveRespond', lambda store, line, bulk=None, logger=None: (
+		lines.append(line), real(store, line, bulk, logger))[1])
+	with TSVZ.TSVZClient(p, sync=True) as c:
+		c['k'] = 'k\tv'
+		assert c['k'] == ['k', 'v']
+	assert lines == ['--sync\tset\tk\tv', 'get\tk']
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_tsvz_client_reconnects_or_falls_back(tmp_path, served):
+	p = str(tmp_path / 'r.tsvz')
+	first = served(p)
+	client = TSVZ.TSVZClient(p)
+	try:
+		client['k'] = ['k', 'v']
+		first.stop()
+		first.thread.join(10)
+		first.close()
+		second = served(p)
+		assert client['k'] == ['k', 'v']  # the lost connection was replaced by one to the new handler
+		assert repr(client).endswith('served)')
+		second.stop()
+		second.thread.join(10)
+		second.close()
+		with pytest.raises(ConnectionError):
+			client.pop('k')  # not retried: it may have been applied
+		assert repr(client).endswith('local)') and client['k'] == ['k', 'v']
+	finally:
+		client.close()
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

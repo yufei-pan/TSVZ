@@ -5508,6 +5508,206 @@ def _serveSignals():
 	return lambda: signal.signal(signal.SIGTERM, old)
 
 
+class TSVZClient(MutableMapping):
+	"""A store kept by ``tsvz serve`` (spec §21), as a mapping with ``TSVZed``'s semantics.
+
+	Every operation is one request to the handler that the store's pointer
+	file names, so many processes share one loaded store and one writer.
+	Without a running handler (or when it goes away) the client warns once
+	and runs the same engine in this process: the code keeps working, it just
+	does not share the loaded store.
+
+	- ``c[key]`` returns the row; for a missing key of a ``.tsvz`` store the
+	  defaults row while ``#_return_defaults_when_missing_#`` is true (spec
+	  §14.5), else ``KeyError``. ``get``, ``in``, ``len`` and iteration behave
+	  like a dict; ``keys()``, ``values()`` and ``items()`` return lists.
+	- ``c[key] = value`` normalises ``value`` as ``TSVZed`` does (a string is
+	  split on the delimiter, cells are right-stripped, the key goes first).
+	- ``sync=True`` acknowledges every write only after it is on disk.
+	- ``timeout``: seconds to wait for each answer (None: no limit).
+	"""
+
+	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None):
+		self._fileName = fileName
+		self._sync = sync
+		self._timeout = timeout
+		self.teeLogger = teeLogger
+		self._spec = _isSpecPath(fileName)
+		if self._spec:
+			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(fileName).ext]
+		else:
+			self.delimiter = get_delimiter(..., file_name=fileName)
+		self._backend = None
+		self._connect()
+
+	def _connect(self):
+		info = _serveFind(self._fileName)
+		reason = 'no handler is running'
+		if info is not None:
+			try:
+				self._backend = _ServeConnection(info, self._timeout)
+				return
+			except _ServeUnreachable as e:
+				reason = 'its handler cannot be used ({})'.format(e)
+		_warnOnce(self, 'local', self._fileName, '{}; working on the files in this process'.format(reason),
+				  self.teeLogger)
+		self._backend = _ServeLocal(_ServeStore(self._fileName, teeLogger=self.teeLogger, create=True))
+
+	def _request(self, fields, write=False, bulk=None, retry=True):
+		"""Send a request; return ``(lines, status, message)``. Usage errors raise ``ValueError``."""
+		line = '\t'.join((['--sync'] if write and self._sync else []) + fields)
+		try:
+			lines, diagnostics, status, message = self._backend.request(line, bulk)
+		except _ServeLost as e:
+			self._backend.close()
+			self._connect()
+			if not retry:
+				raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been applied'
+									  .format(self._fileName, e, fields[0]))
+			lines, diagnostics, status, message = self._backend.request(line, bulk)
+		for text in diagnostics:
+			_warn(text, self.teeLogger)
+		if status == 2:
+			raise ValueError(message)
+		if status == 1 and write:
+			raise OSError(message)
+		if status == 1:
+			_warn('TSVZ warning: {}: {}'.format(self._fileName, message), self.teeLogger)
+		return lines, status, message
+
+	def _cells(self, key, value):
+		"""``value`` normalised as ``TSVZed.__setitem__`` does, with ``key`` first."""
+		key = str(key).rstrip()
+		if isinstance(value, str):
+			value = value.split(self.delimiter)
+		cells = [str(cell).rstrip() if cell else '' for cell in value]
+		if not cells or cells[0] != key:
+			cells = [key] + cells
+		return cells
+
+	@staticmethod
+	def _fields(cells):
+		return [_serveEncode(cell) for cell in cells]
+
+	@property
+	def dialect(self):
+		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
+		return 'tsvz' if self._spec else 'tsv'
+
+	def __getitem__(self, key):
+		lines = self._request(['get', _serveEncode(str(key))])[0]
+		if not lines:
+			raise KeyError(key)
+		return _serveDecodeLine(lines[0])
+
+	def get(self, key, default=None):
+		lines, status, _ = self._request(['get', _serveEncode(str(key))])
+		return _serveDecodeLine(lines[0]) if status == 0 and lines else default
+
+	def __contains__(self, key):
+		return self._request(['has', _serveEncode(str(key))])[1] == 0
+
+	def __len__(self):
+		return int(self._request(['len'])[0][0])
+
+	def __iter__(self):
+		return iter(self.keys())
+
+	def keys(self):
+		return [_specDecodeField(line, '\t') for line in self._request(['keys'])[0]]
+
+	def values(self):
+		return [_serveDecodeLine(line) for line in self._request(['read'])[0]]
+
+	def items(self):
+		return [(row[0], row) for row in self.values()]
+
+	def __setitem__(self, key, value):
+		cells = self._cells(key, value)
+		if not cells[0]:
+			_warn('TSVZ error: {}: a key cannot be empty'.format(self._fileName), self.teeLogger)
+			return
+		self._request(['set'] + self._fields(cells), write=True)
+
+	def __delitem__(self, key):
+		"""Delete ``key``; a missing key is not an error (as in ``TSVZed``)."""
+		self._request(['delete', _serveEncode(str(key))], write=True)
+
+	_marker = object()
+
+	def pop(self, key, default=_marker):
+		lines, status, _ = self._request(['pop', _serveEncode(str(key))], write=True, retry=False)
+		if lines:
+			return _serveDecodeLine(lines[0])
+		if default is TSVZClient._marker:
+			raise KeyError(key)
+		return default
+
+	def popitem(self, last=True):
+		lines = self._request(['popitem', 'last' if last else 'first'], write=True, retry=False)[0]
+		if not lines:
+			raise KeyError('popitem(): {} is empty'.format(self._fileName))
+		row = _serveDecodeLine(lines[0])
+		return row[0], row
+
+	def setdefault(self, key, default=None):
+		"""The row of ``key``; when it is missing, first set it to ``default`` (None: only look it up)."""
+		if default is None:
+			return self.get(key)
+		cells = self._cells(key, default)
+		if len(cells) < 2:
+			return self.get(key)
+		lines = self._request(['setdefault'] + self._fields(cells), write=True, retry=False)[0]
+		return _serveDecodeLine(lines[0]) if lines else None
+
+	def update(self, other=(), **kwds):
+		"""Set many keys with one request (one batch append)."""
+		pairs = list(other.items()) if hasattr(other, 'items') else list(other)
+		pairs += list(kwds.items())
+		bulk = []
+		for key, value in pairs:
+			cells = self._cells(key, value)
+			if cells[0]:
+				bulk.append(_serveRecordLine(cells, bool(_MARKER_RE.match(cells[0]))))
+		if bulk:
+			self._request(['set', '-'], write=True, bulk=bulk)
+
+	def clear(self):
+		self._request(['clear'], write=True)
+
+	def setDefaults(self, defaults):
+		"""Write ``defaults`` as the store's ``#_defaults_#`` marker (as ``TSVZed.setDefaults``)."""
+		if isinstance(defaults, str):
+			defaults = defaults.split(self.delimiter)
+		cells = [str(cell).rstrip() if cell else '' for cell in (defaults or [])]
+		if not cells or cells[0] != DEFAULTS_INDICATOR_KEY:
+			cells = [DEFAULTS_INDICATOR_KEY] + cells
+		self._request(['set'] + self._fields(cells), write=True)
+
+	def move_to_end(self, key, last=True):
+		raise NotImplementedError('a served store keeps first-appearance order (spec §3.4)')
+
+	def rewrite(self, *args, **kwargs):
+		raise NotImplementedError('a served store is compacted with `tsvz scrub`')
+
+	mapToFile = hardMapToFile = rewrite
+
+	def close(self):
+		if self._backend is not None:
+			self._backend.close()
+			self._backend = None
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc_value, traceback):
+		self.close()
+
+	def __repr__(self):
+		return 'TSVZClient({!r}, {})'.format(self._fileName, 'local' if isinstance(self._backend, _ServeLocal)
+											   else 'served')
+
+
 # ===========================================================================
 # Command-line interface (tsvz-spec-v1 §20)
 # ===========================================================================
