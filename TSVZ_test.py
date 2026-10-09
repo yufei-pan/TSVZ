@@ -2755,5 +2755,220 @@ def test_parse_record_lines():
 	assert reporter._events['empty-key'][0] == 2
 
 
+# ==========================================================================
+# Write handler (spec §21): the store engine
+# ==========================================================================
+def _view(path):
+	"""Rows a direct reader returns for ``path``, in order (what ``tsvz read`` prints)."""
+	return [list(row) for row in TSVZ.readTabularFile(path, verifyHeader=False, strict=False).values()]
+
+
+@pytest.fixture
+def engines():
+	"""Open ``_ServeStore``s through this fixture so their writer threads stop."""
+	opened = []
+
+	def make(path, **kwargs):
+		store = TSVZ._ServeStore(path, **kwargs)
+		opened.append(store)
+		return store
+	yield make
+	for store in opened:
+		store.close()
+
+
+@pytest.mark.parametrize('name', ['e.tsvz', 'e.psvz', 'e.tsv', 'e.csv'])
+def test_engine_follows_direct_appends(tmp_path, engines, name):
+	p = str(tmp_path / name)
+	d = TSVZ._EXTENSION_DELIMITERS[name.rpartition('.')[2]].encode()
+	_touch(p, b'a' + d + b'1\nb' + d + b'2\n')
+	store = engines(p)
+	assert store.read(None) == _view(p) == [['a', '1'], ['b', '2']]
+	TSVZ.appendLinesTabularFile(p, [['c', '3'], ['a']])
+	assert store.read(None) == _view(p) == [['b', '2'], ['c', '3']]
+	TSVZ.appendLinesTabularFile(p, [['a', '9'], ['b', 'x' + d.decode() + 'y']])
+	assert store.read(None) == _view(p)
+	assert store.keys(None) == ['b', 'c', 'a'] and store.length(None) == 3
+	assert store.has('a', None) and not store.has('z', None)
+
+
+def test_engine_ignores_a_torn_tail_until_it_is_completed(tmp_path, engines, capsys):
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'a\t1\n')
+	store = engines(p)
+	with open(p, 'ab') as f:
+		f.write(b'b\t2')
+	assert store.read(None) == [['a', '1']]
+	assert store.read(None) == [['a', '1']]
+	assert capsys.readouterr().err.count('ignored uncommitted bytes') == 1  # noted once, not per request
+	with open(p, 'ab') as f:
+		f.write(b'2\n')
+	assert store.read(None) == _view(p) == [['a', '1'], ['b', '22']]
+
+
+def test_engine_reloads_when_the_store_changes_other_than_by_appending(tmp_path, engines):
+	p = str(tmp_path / 'r.tsvz')
+	_touch(p, b'a\t1\nb\t2\na\n')
+	store = engines(p)
+	assert store.read(None) == [['b', '2']]
+	TSVZ.scrubTabularFile(p, verifyHeader=False)  # shrinks the file in place
+	TSVZ.appendTabularFile(p, ['c', '3'])
+	assert store.read(None) == _view(p) == [['b', '2'], ['c', '3']]
+	other = str(tmp_path / 'other')
+	_touch(other, b'x\t1\ny\t2\n')
+	os.replace(other, p)  # a new inode
+	assert store.read(None) == [['x', '1'], ['y', '2']]
+	with open(p, 'r+b') as f:  # rewritten in place, same size
+		f.write(b'q\t7\nz\t8\n')
+	st = os.stat(p)  # file times can be coarser than these steps; make the rewrite visible to stat()
+	os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+	assert store.read(None) == [['q', '7'], ['z', '8']]
+	_touch(p + '.1', b'n\t1\n')  # a new part
+	assert store.read(None) == _view(p) == [['q', '7'], ['z', '8'], ['n', '1']]
+
+
+def test_engine_follows_compressed_and_multi_part_stores(tmp_path, engines):
+	g = str(tmp_path / 'g.tsvz.gz')
+	_touch(g, gzip.compress(b'a\t1\n'))
+	store = engines(g)
+	TSVZ.appendTabularFile(g, ['b', '2'])
+	assert store.read(None) == _view(g) == [['a', '1'], ['b', '2']]
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'a\t1\n')
+	_touch(m + '.1', b'b\t2\n')
+	store = engines(m)
+	TSVZ.appendTabularFile(m, ['c', '3'])  # goes to the active part, m.tsvz.1
+	assert store.read(None) == _view(m) == [['a', '1'], ['b', '2'], ['c', '3']]
+	assert open(m + '.1', 'rb').read() == b'b\t2\nc\t3\n'
+
+
+def test_engine_sees_a_new_part_within_one_directory_timestamp(tmp_path, engines, monkeypatch):
+	"""A part created in the same timestamp tick as the last directory change is still found."""
+	m = str(tmp_path / 'n.tsvz')
+	_touch(m, b'a\t1\n')
+	frozen = TSVZ._dirMtimeNs(m)
+	monkeypatch.setattr(TSVZ, '_dirMtimeNs', lambda path: frozen)  # the new part leaves the mtime as it was
+	store = engines(m)
+	_touch(m + '.1', b'b\t2\n')
+	assert store.read(None) == [['a', '1'], ['b', '2']]
+
+def test_engine_get_resolves_keys_and_missing_rows(tmp_path, engines):
+	p = str(tmp_path / 'g.tsvz')
+	_touch(p, b'#_defaults_#\t\tNA\nalice\tAlice\t30\nbob\tBob\n')
+	store = engines(p)
+	assert store.get(['bob', 'alice  ', 'carol'], None) == ([['bob', 'Bob', 'NA'], ['alice', 'Alice', '30'],
+															['carol', '', 'NA']], True)
+	assert store.get(['alice'], None) == ([['alice', 'Alice', '30']], False)
+
+
+def test_engine_writes_what_the_direct_writers_write(tmp_path, engines):
+	for name in ('w.tsvz', 'w.tsv'):
+		direct, served = str(tmp_path / ('d' + name)), str(tmp_path / ('s' + name))
+		store = engines(served, create=True)
+		_touch(direct, open(served, 'rb').read())
+		rows = [(['k', 'a\tb', ''], False), (['#tag', 'x<y'], False), (['#_defaults_#', '', 'D'], True), (['gone'], False)]
+		store.write(rows, False, None)
+		TSVZ.appendLinesTabularFile(direct, [cells for cells, marker in rows])
+		assert store.read(None) == _view(direct)  # read-your-writes: the read waits for the queued batch
+		assert open(served, 'rb').read() == open(direct, 'rb').read()
+
+
+def test_engine_acknowledges_disk_writes_after_fsync(tmp_path, engines, monkeypatch):
+	synced = []
+	real = os.fsync
+	monkeypatch.setattr(os, 'fsync', lambda fd: (synced.append(fd), real(fd)))
+	p = str(tmp_path / 'a.tsvz')
+	_touch(p, b'a\t1\n')
+	store = engines(p)
+	store.write([(['b', '2'], False)], False, None)  # memory: no fsync needed to answer
+	store.write([(['c', '3'], False)], True, None)  # --sync
+	assert synced
+	synced[:] = []
+	store.write([(['#_write_ack_#', 'disk'], True)], False, None)
+	store.read(None)
+	store.write([(['d', '4'], False)], False, None)
+	assert synced  # the store's own marker asks for disk
+
+
+def test_engine_pop_popitem_and_setdefault(tmp_path, engines):
+	p = str(tmp_path / 'p.tsvz')
+	_touch(p, b'a\t1\nb\t2\nc\t3\n')
+	store = engines(p)
+	assert store.pop('b', False, None) == ['b', '2'] and store.pop('b', False, None) is None
+	assert store.popitem(True, False, None) == ['c', '3'] and store.popitem(False, False, None) == ['a', '1']
+	assert store.popitem(True, False, None) is None
+	assert store.setdefault(['k', 'v'], False, None) == ['k', 'v']
+	assert store.setdefault(['k', 'other'], False, None) == ['k', 'v']
+	assert open(p, 'rb').read() == b'a\t1\nb\t2\nc\t3\nb\nc\na\nk\tv\n'
+
+
+def test_engine_pop_is_atomic_under_concurrency(tmp_path, engines):
+	p = str(tmp_path / 'race.tsvz')
+	_touch(p, b''.join(b'k%d\t%d\n' % (i, i) for i in range(200)))
+	store = engines(p)
+	popped = []
+
+	def worker():
+		while True:
+			row = store.popitem(True, False, None)
+			if row is None:
+				return
+			popped.append(row[0])
+	threads = [threading.Thread(target=worker) for _ in range(8)]
+	for t in threads:
+		t.start()
+	for t in threads:
+		t.join()
+	assert sorted(popped) == sorted('k%d' % i for i in range(200))
+	assert store.read(None) == [] == _view(p)
+
+
+def test_engine_clear_scrub_verify_and_parts(tmp_path, engines):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, b'#id\tval\na\t1\nb\t2\na\n')
+	store = engines(p)
+	assert store.scrub(None) is True and open(p, 'rb').read() == b'#id\tval\n#_version_#\t1\nb\t2\n'
+	assert store.read(None) == [['b', '2']]
+	assert store.clear(None) is True and store.read(None) == []
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'a\t1\n')
+	_touch(m + '.1', b'#_checksum_crc32_#\nb\t2\n#_checksum_crc32_#\t00000000\n')
+	store = engines(m)
+	assert store.scrub(None) is False  # 4.1 refuses to compact a multi-part store
+	mismatches, readable = store.verify(None)
+	assert readable and [entry[:3] for entry in mismatches] == [(m + '.1', 3, 'crc32')]
+	assert store.partRows(None) == [['0', '', m, ''], ['1', '1', m + '.1', 'active']]
+
+
+def test_engine_reports_an_unreadable_part(tmp_path, engines):
+	m = str(tmp_path / 'u.tsvz')
+	_touch(m, b'a\t1\n')
+	os.mkdir(m + '.1')
+	store = engines(m)
+	assert store.unreadable and store.read(None) == [['a', '1']]
+
+
+def test_engine_close_writes_and_fsyncs_queued_writes(tmp_path, monkeypatch):
+	synced = []
+	real = os.fsync
+	monkeypatch.setattr(os, 'fsync', lambda fd: (synced.append(fd), real(fd)))
+	p = str(tmp_path / 'q.tsvz')
+	store = TSVZ._ServeStore(p, create=True)
+	for i in range(50):
+		store.write([(['k%d' % i, 'v'], False)], False, None)
+	store.close()
+	assert synced and _view(p) == [['k%d' % i, 'v'] for i in range(50)]
+
+def test_engine_survives_the_store_being_deleted(tmp_path, engines):
+	"""Review focus 4: a store removed under the server is recreated by the next write."""
+	p = str(tmp_path / 'x.tsvz')
+	_touch(p, b'a\t1\n')
+	store = engines(p)
+	os.remove(p)
+	assert store.read(None) == []
+	store.write([(['b', '2'], False)], False, None)
+	assert store.read(None) == _view(p) == [['b', '2']] and open(p, 'rb').read() == b'b\t2\n'
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

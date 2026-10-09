@@ -4446,6 +4446,511 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 
 
 # ===========================================================================
+# Write handler (tsvz-spec-v1 §21): the store engine
+# ===========================================================================
+#: Bytes before the read offset that must be unchanged for an incremental read.
+_SERVE_CHECK_BYTES = 64
+#: A directory modified less than this long ago may change again within the same
+#: timestamp tick, so its part list is checked on every sync until it is older.
+_SERVE_RACY_SECONDS = 2.0
+
+
+def _partRows(store, reporter):
+	"""Rows for ``parts`` (spec §20.2): index, ordinal as the file name spells it, path, flags."""
+	if _isSpecPath(store):
+		parts, active = _storeParts(store, reporter)
+	else:
+		parts, active = [store], store  # a loose file is its only part (spec §20.2.4)
+	rows = []
+	for index, path in enumerate(parts):
+		name = _parsePartName(path)
+		ordinal = ''
+		if name.ordinal is not None:
+			base = os.path.basename(path)
+			if name.codec:
+				base = base[:-len(name.codec) - 1]
+			ordinal = base.rpartition('.')[2]
+		flags = (['active'] if path == active else []) + ([name.codec] if name.codec else [])
+		rows.append([str(index), ordinal, path, ','.join(flags)])
+	return rows
+
+
+class _ServeWriter(object):
+	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
+
+	``submit`` returns a sequence number; ``wait`` blocks until that payload
+	is written (or written and fsync'd). The thread never takes the store's
+	state lock.
+	"""
+
+	def __init__(self, store):
+		self.store = store
+		self.cond = threading.Condition()
+		self.queue = []
+		self.submitted = 0
+		self.written = 0
+		self.durable = 0
+		self.failures = deque(maxlen=64)
+		self.unsynced = False
+		self.closing = False
+		self.thread = threading.Thread(target=self._run, name='tsvz-writer')
+		self.thread.daemon = True
+		self.thread.start()
+
+	def submit(self, payload, durable):
+		with self.cond:
+			if self.closing:
+				raise RuntimeError('the store is closing')
+			self.submitted += 1
+			self.queue.append((self.submitted, payload, durable))
+			self.cond.notify_all()
+			return self.submitted
+
+	def wait(self, seq, durable=False):
+		"""Block until payload ``seq`` is written (``durable``: and fsync'd); raise its write error."""
+		with self.cond:
+			while (self.durable if durable else self.written) < seq:
+				self.cond.wait()
+			for first, last, error in self.failures:
+				if first <= seq <= last:
+					raise error
+
+	def barrier(self):
+		"""Block until everything submitted so far is written (spec §21.8 read-your-writes)."""
+		with self.cond:
+			while self.written < self.submitted:
+				self.cond.wait()
+
+	def close(self):
+		"""Write everything queued, fsync it, and stop the thread."""
+		with self.cond:
+			self.closing = True
+			self.cond.notify_all()
+		self.thread.join()
+
+	def _run(self):
+		while True:
+			with self.cond:
+				while not self.queue and not self.closing:
+					self.cond.wait()
+				if not self.queue:
+					break
+				batch, self.queue = self.queue, []
+			durable = any(entry[2] for entry in batch)
+			error = None
+			try:
+				self.store._append(b''.join(entry[1] for entry in batch), durable)
+			except Exception as e:
+				error = e
+				_warn('TSVZ error: {}: a batch of {} writes failed: {}'.format(self.store.path, len(batch), e),
+					  self.store.teeLogger)
+			with self.cond:
+				last = batch[-1][0]
+				self.written = last
+				if durable or error is not None:
+					self.durable = last
+				if error is not None:
+					self.failures.append((batch[0][0], last, error))
+				elif not durable:
+					self.unsynced = True
+				self.cond.notify_all()
+		if self.unsynced:
+			try:
+				self.store._fsync()
+			except Exception as e:
+				_warn('TSVZ error: {}: fsync failed: {}'.format(self.store.path, e), self.store.teeLogger)
+
+
+class _ServeStore(object):
+	"""One store's live view for the write handler (spec §21, design §3).
+
+	``data`` maps each live key to its resolved row, in first-appearance
+	order, and is always a replay of the store's files: writes are appended
+	through ``_ServeWriter`` and come back through ``sync()`` like any other
+	writer's. ``sync()`` replays the newly committed bytes of the active part
+	and reloads everything when anything else changed. Every public method
+	takes ``self.lock``; ``log`` is the teeLogger its messages go to.
+	"""
+
+	def __init__(self, fileName, delimiter=..., header='', defaults=None, strict=False, teeLogger=None,
+				 verbose=False, create=False, createDefaults=None):
+		self.path = fileName
+		self.spec = _isSpecPath(fileName)
+		if self.spec:
+			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(fileName).ext]
+		else:
+			self.delimiter = get_delimiter(delimiter, file_name=fileName)
+		self.defaults = list(defaults) if defaults else []
+		self.strict = strict
+		self.teeLogger = teeLogger
+		self.verbose = verbose
+		self.lock = threading.RLock()
+		self.data = OrderedDict()
+		self.unreadable = False
+		if create:
+			self._create(header, self.defaults if createDefaults is None else createDefaults)
+		self.reload(teeLogger)
+		self.writer = _ServeWriter(self)
+
+	def _create(self, header, defaults):
+		header = _formatHeader(header, teeLogger=self.teeLogger, delimiter=self.delimiter)
+		if self.spec:
+			_specEnsureStore(self.path, True, header, _normalizeDefaults(defaults, self.delimiter), False,
+							 self.teeLogger, self.delimiter)
+		else:
+			_verifyFileExistence(self.path, createIfNotExist=True, teeLogger=self.teeLogger, header=header,
+								 strict=False, delimiter=self.delimiter)
+
+	# -- reading the files ---------------------------------------------------
+	def reload(self, log):
+		"""Replay the whole store."""
+		with self.lock:
+			reporter = _Reporter(self.path, log)
+			try:
+				self._noteDirMtime(_dirMtimeNs(self.path))
+				if self.spec:
+					self._loadSpec(reporter, log)
+				else:
+					self._loadLegacy(reporter)
+				self.unreadable = reporter.has('unreadable')
+			finally:
+				reporter.flush()
+
+	def _noteDirMtime(self, dirMtime):
+		self.dirMtime = dirMtime
+		self.dirRacy = time.time() - dirMtime / 1e9 < _SERVE_RACY_SECONDS
+
+	def _stamps(self, parts):
+		stamps = {}
+		for path in parts:
+			try:
+				stamps[path] = _specStamp(os.stat(path))
+			except OSError:
+				stamps[path] = None
+		return stamps
+
+	def _loadSpec(self, reporter, log):
+		self.parts = _storeParts(self.path)[0]
+		self.stamps = self._stamps(self.parts)
+		load = _specLoad(self.path, self.delimiter, defaults=_normalizeDefaults(self.defaults, self.delimiter),
+						 strict=self.strict, taskDic=OrderedDict(), reporter=reporter, teeLogger=log,
+						 verbose=self.verbose)
+		self.data, self.state, self.width = load.data, load.state, load.correctColumnNum
+		if load.parts != self.parts:  # the part list changed while it was read
+			self.parts = load.parts
+			self.stamps = {}
+		info = load.infos[-1] if load.infos else None
+		self.offset = info.committed if info is not None else 0
+		self.lineNo = info.lines if info is not None else 0
+		self.tailSeen = info.tail if info is not None else b''
+		self.label = os.path.basename(self.parts[-1]) + ' ' if len(self.parts) > 1 else ''
+		self.check = self._readCheck()
+
+	def _loadLegacy(self, reporter):
+		self.parts = [self.path] if os.path.isfile(self.path) else []
+		self.stamps = self._stamps(self.parts)
+		self.data = OrderedDict()
+		self.legacyDefaults = list(self.defaults)
+		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
+		if self.parts:
+			try:
+				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
+					self.width, self.offset, self.lineNo = _legacyReadLoop(
+						f, self.path, self.data, -1, 0, self.strict, self.delimiter, self.legacyDefaults, False,
+						'utf8', reporter)
+			except OSError as e:
+				reporter.note('unreadable', None, 'could not read {} ({})'.format(self.path, e))
+		self.label = ''
+		self.check = self._readCheck()
+
+	def _readCheck(self):
+		"""The bytes just before the read offset of the active part ('' when compressed or empty)."""
+		if not self.parts or _parsePartName(self.parts[-1]).codec or not self.offset:
+			return b''
+		try:
+			with open(self.parts[-1], 'rb') as f:
+				start = max(0, self.offset - _SERVE_CHECK_BYTES)
+				f.seek(start)
+				return f.read(self.offset - start)
+		except OSError:
+			return b''
+
+	def sync(self, log):
+		"""Bring the view up to date with the files: follow appends, reload on anything else."""
+		with self.lock:
+			dirMtime = _dirMtimeNs(self.path)
+			if dirMtime != self.dirMtime or self.dirRacy:
+				parts = _storeParts(self.path)[0] if self.spec else ([self.path] if os.path.isfile(self.path) else [])
+				if parts != self.parts:
+					return self.reload(log)
+				self._noteDirMtime(dirMtime)
+			for path in self.parts:
+				try:
+					stamp = _specStamp(os.stat(path))
+				except OSError:
+					return self.reload(log)
+				if stamp == self.stamps.get(path):
+					continue
+				if path != self.parts[-1] or not self._follow(path, stamp, log):
+					return self.reload(log)
+
+	def _follow(self, path, stamp, log):
+		"""Replay what was appended to the active part; False when it changed some other way."""
+		old = self.stamps.get(path)
+		if _parsePartName(path).codec or old is None or stamp[0] != old[0] or stamp[1] < self.offset:
+			return False
+		try:
+			with open(path, 'rb') as f:
+				f.seek(self.offset - len(self.check))
+				if f.read(len(self.check)) != self.check:
+					return False
+				data = f.read()
+		except OSError:
+			return False
+		end = data.rfind(b'\n') + 1
+		reporter = _Reporter(self.path, log)
+		try:
+			if end:
+				for raw in data[:end].split(b'\n')[:-1]:
+					self._apply(raw + b'\n', reporter)
+			tail = data[end:]
+			if tail and tail != self.tailSeen:
+				reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(tail[:80]))
+			self.tailSeen = tail
+		finally:
+			reporter.flush()
+		self.offset += end
+		self.check = (self.check + data[:end])[-_SERVE_CHECK_BYTES:]
+		self.stamps[path] = (stamp[0], self.offset + len(data) - end, stamp[2])
+		return True
+
+	def _apply(self, raw, reporter):
+		"""Replay one appended committed line of the active part into the view."""
+		self.lineNo += 1
+		if not self.spec:
+			try:
+				text = raw.decode('utf8')
+			except UnicodeDecodeError:
+				text = raw.decode('utf8', errors='replace')
+				reporter.note('decode', 'line {}'.format(self.lineNo), 'invalid utf8 replaced with U+FFFD')
+			self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
+										 defaults=self.legacyDefaults, reporter=reporter)
+			return
+		replayed = _specReplayLine(raw, self.lineNo, self.label, self.parts[-1], self.state, self.delimiter,
+								   reporter)
+		if replayed is None or replayed[1] is None:
+			return
+		key, row = replayed[1]
+		if row is None:
+			self.data.pop(key, None)
+			return
+		self.width = _specPadRow(row, self.state, self.width)
+		self.data[key] = row
+
+	def _fresh(self, log):
+		"""Read-your-writes (spec §21.8): wait for queued writes, then follow the files."""
+		self.writer.barrier()
+		self.sync(log)
+
+	# -- reads ----------------------------------------------------------------
+	def resolve(self, key):
+		"""A requested key as a reader resolves it (spec §7.7; 3.39 rstrip for loose files)."""
+		if self.spec:
+			return key.rstrip(' \t') if self.state.strip else key
+		return key.rstrip()
+
+	def read(self, log):
+		with self.lock:
+			self._fresh(log)
+			return [list(row) for row in self.data.values()]
+
+	def get(self, keys, log):
+		"""Rows for ``keys`` and whether one was missing (spec §20.2 ``get``, §14.5)."""
+		with self.lock:
+			self._fresh(log)
+			rows = []
+			missing = False
+			for key in keys:
+				key = self.resolve(key)
+				row = self.data.get(key)
+				if row is None:
+					missing = True
+					if not (self.spec and self.state.returnDefaults):
+						continue
+					row = [key] + list(self.state.defaults[1:])
+					row += [''] * (self.width - len(row))
+				rows.append(list(row))
+			return rows, missing
+
+	def has(self, key, log):
+		with self.lock:
+			self._fresh(log)
+			return self.resolve(key) in self.data
+
+	def length(self, log):
+		with self.lock:
+			self._fresh(log)
+			return len(self.data)
+
+	def keys(self, log):
+		with self.lock:
+			self._fresh(log)
+			return list(self.data)
+
+	def verify(self, log):
+		"""Checksum mismatches (spec §15) and whether every part could be read."""
+		with self.lock:
+			self.writer.barrier()
+			if not self.spec:
+				return [], True
+			reporter = _Reporter(self.path, log)
+			try:
+				mismatches = _specVerify(self.path, self.delimiter, reporter)
+				return mismatches, not reporter.has('unreadable')
+			finally:
+				reporter.flush()
+
+	def partRows(self, log):
+		with self.lock:
+			self.writer.barrier()
+			reporter = _Reporter(self.path, log)
+			try:
+				return _partRows(self.path, reporter)
+			finally:
+				reporter.flush()
+
+	# -- writes ---------------------------------------------------------------
+	def _payload(self, rows, log):
+		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
+		if self.spec:
+			return ''.join(_specFormatRecord(cells, self.delimiter, marker=marker) + '\n'
+						   for cells, marker in rows).encode('utf-8')
+		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, [''], True, self.verbose,
+									'utf8', self.strict, self.delimiter)[0]
+
+	def _durable(self, sync):
+		return sync or (self.spec and self.state.writeAck == 'disk')
+
+	def _submit(self, rows, sync, log):
+		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write."""
+		payload = self._payload(rows, log)
+		if not payload:
+			return None
+		durable = self._durable(sync)
+		return self.writer.submit(payload, durable), durable
+
+	def _ack(self, queued):
+		"""Acknowledge per spec §21.9: at once for ``memory``, after fsync for ``disk``."""
+		if queued is not None and queued[1]:
+			self.writer.wait(queued[0], durable=True)
+
+	def write(self, rows, sync, log):
+		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set``, ``delete`` and bulk input."""
+		with self.lock:
+			queued = self._submit(rows, sync, log)
+		self._ack(queued)
+
+	def pop(self, key, sync, log):
+		"""Atomically return the row of ``key`` and append its tombstone; None when it is missing."""
+		with self.lock:
+			self._fresh(log)
+			key = self.resolve(key)
+			row = self.data.get(key)
+			if row is None:
+				return None
+			row = list(row)
+			queued = self._submit([([key], False)], sync, log)
+		self._ack(queued)
+		return row
+
+	def popitem(self, last, sync, log):
+		"""Atomically return the row of the last (or first) live key and delete it; None when empty."""
+		with self.lock:
+			self._fresh(log)
+			if not self.data:
+				return None
+			key = next(reversed(self.data)) if last else next(iter(self.data))
+			row = list(self.data[key])
+			queued = self._submit([([key], False)], sync, log)
+		self._ack(queued)
+		return row
+
+	def setdefault(self, cells, sync, log):
+		"""Atomically return the row of ``cells[0]``, appending ``cells`` first when the key is missing."""
+		with self.lock:
+			self._fresh(log)
+			key = self.resolve(cells[0])
+			row = self.data.get(key)
+			if row is not None:
+				return list(row)
+			queued = self._submit([(cells, False)], sync, log)
+			if queued is not None:
+				self.writer.wait(queued[0])
+			self.sync(log)
+			row = self.data.get(key)
+			row = list(row) if row is not None else None
+		self._ack(queued)
+		return row
+
+	def clear(self, log):
+		"""``clear`` (spec §20.2) through the library; True when the store was cleared."""
+		with self.lock:
+			self.writer.barrier()
+			try:
+				if self.spec:
+					return _specClearTabularFile(self.path, teeLogger=log, verbose=self.verbose,
+												 delimiter=self.delimiter)
+				clearTabularFile(self.path, teeLogger=log, verbose=self.verbose, delimiter=self.delimiter)
+				return True
+			finally:
+				self.reload(log)
+
+	def scrub(self, log):
+		"""``scrub`` (spec §20.2) through the library; True when it was not refused."""
+		with self.lock:
+			self.writer.barrier()
+			try:
+				if self.spec:
+					return _specScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
+									  strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
+				scrubTabularFile(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
+								 strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)
+				return True
+			finally:
+				self.reload(log)
+
+	def flush(self):
+		"""Write and fsync everything submitted so far (``stop``, spec §21.9)."""
+		self.writer.barrier()
+		with self.lock:
+			self._fsync()
+
+	def close(self):
+		"""Write and fsync everything queued and stop the writer."""
+		self.writer.close()
+
+	# -- called by the writer thread -----------------------------------------------
+	def _append(self, payload, fsync):
+		reporter = _Reporter(self.path, self.teeLogger)
+		try:
+			if self.spec:
+				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync)
+			elif _isCompressedFile(self.path):
+				with openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger) as f:
+					f.write(payload)
+			else:
+				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync)
+		finally:
+			reporter.flush()
+
+	def _fsync(self):
+		path = _storeParts(self.path)[1] if self.spec else self.path
+		if os.path.exists(path):
+			with open(path, 'ab') as f:
+				os.fsync(f.fileno())
+
+
+# ===========================================================================
 # Command-line interface (tsvz-spec-v1 §20)
 # ===========================================================================
 _CLI_OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts')
@@ -4980,25 +5485,11 @@ def _cliParts(args, delimiter, logger, stdin, stdout):
 	"""``parts STORE`` (spec §20.2): index, hexadecimal ordinal, path and flags of each part, in replay order."""
 	if not _cliStoreExists(args.store):
 		raise _CliStoreMissing()
-	if _isSpecPath(args.store):
-		reporter = _Reporter(args.store, logger)
-		try:
-			parts, active = _storeParts(args.store, reporter)
-		finally:
-			reporter.flush()
-	else:
-		parts, active = [args.store], args.store  # a loose file is its only part (spec §20.2.4)
-	rows = []
-	for index, path in enumerate(parts):
-		name = _parsePartName(path)
-		ordinal = ''
-		if name.ordinal is not None:
-			base = os.path.basename(path)
-			if name.codec:
-				base = base[:-len(name.codec) - 1]
-			ordinal = base.rpartition('.')[2]  # as the file name spells it
-		flags = (['active'] if path == active else []) + ([name.codec] if name.codec else [])
-		rows.append([str(index), ordinal, path, ','.join(flags)])
+	reporter = _Reporter(args.store, logger)
+	try:
+		rows = _partRows(args.store, reporter)
+	finally:
+		reporter.flush()
 	_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
 	return 0
 
