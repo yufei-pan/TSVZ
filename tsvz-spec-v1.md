@@ -1076,14 +1076,26 @@ implementations.
 
 21.2.3 A handler MUST hold an exclusive advisory lock on its pointer file (on
 POSIX, `flock(2)` on the whole file) for as long as it serves, and MUST refuse to
-start while another process holds that lock. It writes the pointer file in place
-under the lock, never by renaming another file over it, and removes it when it
+start while another process holds that lock. It never writes through a symbolic
+link or into a file it did not create: it takes over a stale pointer file by
+locking it, removing it and creating a new one exclusively. Its pointer file is
+never writable by users other than its owner, and it removes the file when it
 stops cleanly.
 
-21.2.4 A client MUST NOT use a pointer file whose first line is not
-`tsvz-handler<TAB>1`, that names another host, or whose handler does not accept a
-connection. Such a pointer is stale until a handler obtains the lock and rewrites
-it.
+21.2.4 A client MUST NOT use a pointer file that:
+
+- is not a regular file;
+- is owned by a user other than the client's user and the store's owner, or may
+  be written by users other than its owner;
+- does not begin with `tsvz-handler<TAB>1`, or has control characters in a value
+  or a token that is not hexadecimal;
+- names another host, or a TCP address that is not a loopback address;
+- names a Unix-domain socket that does not belong to the pointer file's owner, or
+  (where the platform reports it) whose listening process runs as another user;
+- or whose handler does not accept a connection.
+
+A client SHOULD warn when it ignores a pointer file for one of these reasons. Such
+a pointer is stale until a handler obtains the lock and replaces it.
 
 ### 21.3 Transport
 
@@ -1195,9 +1207,11 @@ as, for example through a Unix socket of mode 0600 in a directory only that user
 can enter. Wider access MUST be an explicit choice of whoever starts it.
 
 21.11.2 A handler on TCP MUST require authentication: the first line of a
-connection is `auth<TAB>TOKEN`, with TOKEN from the pointer file, and the handler
-answers `#0`, or answers status 1 and closes the connection. The pointer file's
-permissions then govern who may connect.
+connection is `auth<TAB>TOKEN`, with TOKEN (hexadecimal) from the pointer file,
+and the handler answers `#0`, or answers status 1 and closes the connection. The
+pointer file's permissions then govern who may connect. Before a connection is
+authenticated a handler MAY limit the length of its first line and the time it
+takes to send it.
 
 ### 21.12 Extensions
 

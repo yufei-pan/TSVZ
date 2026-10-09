@@ -3484,7 +3484,7 @@ def test_tsvz_client_sync_asks_for_disk_acknowledgement(tmp_path, served, monkey
 	with TSVZ.TSVZClient(p, sync=True) as c:
 		c['k'] = 'k\tv'
 		assert c['k'] == ['k', 'v']
-	assert lines == ['--sync\tset\tk\tv', 'get\tk']
+	assert lines == ['--sync\t--x-written\tset\tk\tv', 'get\tk']
 
 
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
@@ -3508,6 +3508,283 @@ def test_tsvz_client_reconnects_or_falls_back(tmp_path, served):
 		assert repr(client).endswith('local)') and client['k'] == ['k', 'v']
 	finally:
 		client.close()
+
+
+# ==========================================================================
+# Write handler: final-review fixes
+# ==========================================================================
+_ROOT = hasattr(os, 'geteuid') and os.geteuid() == 0
+_NOBODY = 65534
+_UNIX = hasattr(__import__('socket'), 'AF_UNIX')
+
+
+def _write_pointer(path, lines, mode=0o644):
+	_touch(path, ''.join(line + '\n' for line in lines).encode('utf-8'))
+	os.chmod(path, mode)
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='symlinks')
+def test_serve_never_writes_through_a_symlinked_pointer(tmp_path):
+	"""C1: a symlink planted at STORE.serve is refused, and its target is left alone."""
+	victim = tmp_path / 'victim'
+	victim.write_bytes(b'precious\n')
+	os.chmod(str(victim), 0o600)
+	p = str(tmp_path / 'd.tsvz')
+	os.symlink(str(victim), p + '.serve')
+	status, out, err = _run('serve', p)
+	assert (status, out) == (1, '') and 'not a regular file' in err
+	assert victim.read_bytes() == b'precious\n' and os.stat(str(victim)).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(not _ROOT, reason='needs root to plant a file owned by another user')
+def test_serve_replaces_a_stale_pointer_instead_of_writing_into_it(tmp_path, served):
+	"""C1/I1: a stale pointer (here another user's) is replaced by a new file, never written into."""
+	p = str(tmp_path / 'o.tsvz')
+	_touch(p + '.serve', b'old\n')
+	os.chown(p + '.serve', _NOBODY, _NOBODY)
+	os.chmod(p + '.serve', 0o666)
+	old = open(p + '.serve', 'rb')  # a descriptor opened before the handler starts
+	try:
+		served(p, tcp=True)
+		st = os.stat(p + '.serve')
+		assert st.st_uid == os.geteuid() and st.st_mode & 0o777 == 0o600
+		assert st.st_ino != os.fstat(old.fileno()).st_ino and old.read() == b'old\n'
+	finally:
+		old.close()
+
+
+def test_tsvz_client_writes_survive_exit_without_close(tmp_path):
+	"""C2: the in-process engine writes everything when the interpreter exits."""
+	p = str(tmp_path / 'x.tsvz')
+	code = ("import sys\nsys.path.insert(0, {!r})\nimport TSVZ\nc = TSVZ.TSVZClient({!r})\n"
+			"for i in range(300):\n    c['k%d' % i] = ['k%d' % i, 'v']\n").format(HERE, p)
+	r = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	assert r.returncode == 0 and len(_view(p)) == 300
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX file types')
+def test_clients_ignore_untrusted_pointer_files(tmp_path):
+	"""C3: a pointer file that cannot be trusted is reported and the files are used."""
+	import socket
+	host = socket.gethostname()
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'a\t1\n')
+	sock = str(tmp_path / 'none.sock')
+	cases = [
+		(['tsvz-handler\t1', 'address\ttcp:10.255.255.1:9', 'host\t' + host, 'pid\t1', 'token\t' + 'ab' * 16],
+		 0o644, 'not a loopback'),
+		(['tsvz-handler\t1', 'address\tunix:' + sock, 'host\t' + host, 'pid\t1'], 0o664, 'writable by others'),
+		(['tsvz-handler\t1', 'address\ttcp:127.0.0.1:9', 'host\t' + host, 'pid\t1', 'token\tab<LF>set<sep>x'],
+		 0o644, 'token'),
+	]
+	for lines, mode, reason in cases:
+		_write_pointer(p + '.serve', lines, mode)
+		status, out, err = _run('get', p, 'a')
+		assert (status, out) == (0, 'a\t1\n') and reason in err, reason
+	os.remove(p + '.serve')
+	os.symlink('/dev/zero', p + '.serve')
+	status, out, err = _run('get', p, 'a')
+	assert (status, out) == (0, 'a\t1\n') and 'not a regular file' in err
+	os.remove(p + '.serve')
+	os.mkfifo(p + '.serve')
+	r = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'get', p, 'a'], stdout=subprocess.PIPE,
+					   stderr=subprocess.PIPE, universal_newlines=True, timeout=20)
+	assert (r.returncode, r.stdout) == (0, 'a\t1\n') and 'not a regular file' in r.stderr
+
+
+@pytest.mark.skipif(not (_ROOT and _UNIX), reason='needs root to make files owned by another user')
+def test_clients_trust_only_pointers_and_sockets_of_the_store_owner(tmp_path, served):
+	"""C3/I2: another user's pointer, or a socket another user re-created, is not used."""
+	import socket
+	p = str(tmp_path / 'w.tsvz')
+	_touch(p, b'a\t1\n')
+	host = socket.gethostname()
+	planted = str(tmp_path / 'planted.sock')
+	listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	listener.bind(planted)
+	listener.listen(1)
+	try:
+		os.chown(planted, _NOBODY, _NOBODY)
+		_write_pointer(p + '.serve', ['tsvz-handler\t1', 'address\tunix:' + planted, 'host\t' + host, 'pid\t1'])
+		status, out, err = _run('get', p, 'a')
+		assert (status, out) == (0, 'a\t1\n') and 'socket' in err and 'owned by' in err
+		os.chown(p + '.serve', _NOBODY, _NOBODY)
+		status, out, err = _run('get', p, 'a')
+		assert (status, out) == (0, 'a\t1\n') and 'owned by' in err
+	finally:
+		listener.close()
+
+
+def test_routed_writes_report_failures_and_pop_keeps_the_key(tmp_path, served, monkeypatch):
+	"""I3: a write the handler cannot make exits 1, as on the files; later answers warn until writes work."""
+	p = str(tmp_path / 'f.tsvz')
+	_touch(p, b'a\t1\n')
+	served(p)
+	real = TSVZ._specAppendPayload
+
+	def broken(*args, **kwargs):
+		raise OSError(28, 'No space left on device')
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', broken)
+	status, out, err = _run('set', p, 'b', '2')
+	assert (status, out) == (1, '') and 'No space left' in err
+	status, out, err = _run('pop', p, 'a')
+	assert (status, out) == (1, '') and 'No space left' in err
+	status, out, err = _run('get', p, 'a')
+	assert (status, out) == (0, 'a\t1\n') and 'writes are failing' in err
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', real)
+	assert _run('set', p, 'b', '2') == (0, '', '')
+	assert _run('get', p, 'b') == (0, 'b\t2\n', '')
+
+
+@pytest.mark.skipif(not _UNIX, reason='Unix sockets')
+def test_routed_output_matches_the_files_in_corner_cases(tmp_path, served, monkeypatch):
+	"""I4: parts/verify spelled differently, a deleted store, a legacy last line without a newline."""
+	monkeypatch.chdir(str(tmp_path))
+	p = str(tmp_path / 'p.tsvz')
+	_touch(p, b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t0\n')
+	served(p)  # the handler knows the absolute path; the client says p.tsvz
+	for argv in (['parts', 'p.tsvz'], ['verify', 'p.tsvz']):
+		assert _run(*argv)[:2] == _run('--x-direct', *argv)[:2], argv
+	os.remove(p)
+	for op in ('read', 'len', 'keys', 'get', 'has', 'pop', 'popitem'):
+		argv = [op, p] + (['a'] if op in ('get', 'has', 'pop') else [])
+		status, out, err = _run(*argv)
+		assert (status, out) == (1, '') and 'no such store' in err, op
+	q = str(tmp_path / 'q.tsv')
+	_touch(q, b'a\t1\nb\t2\n')
+	served(q)
+	with open(q, 'ab') as f:
+		f.write(b'c\t3\nd\t4')  # another writer's last line, without a newline
+	for argv in (['get', q, 'd'], ['len', q], ['keys', q]):
+		assert _run(*argv)[:2] == _run('--x-direct', *argv)[:2], argv
+
+
+@pytest.mark.skipif(not _UNIX, reason='Unix sockets')
+def test_tsvz_client_is_safe_to_share_between_threads(tmp_path, served):
+	"""I5: one TSVZClient used by many threads answers each call with its own result."""
+	p = str(tmp_path / 's.tsvz')
+	served(p)
+	client = TSVZ.TSVZClient(p)
+	errors = []
+
+	def work(n):
+		for i in range(30):
+			key = 't{}k{}'.format(n, i)
+			client[key] = [key, str(i)]
+			if client[key] != [key, str(i)]:
+				errors.append(key)
+	try:
+		threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+		for t in threads:
+			t.start()
+		for t in threads:
+			t.join()
+	finally:
+		client.close()
+	assert errors == [] and len(_view(p)) == 240
+
+
+@pytest.mark.skipif(not _UNIX, reason='Unix sockets')
+def test_serve_group_socket_is_not_put_in_a_private_runtime_dir(tmp_path, served, monkeypatch):
+	"""I6: a socket meant for a group does not go under a 0700 XDG_RUNTIME_DIR."""
+	xdg = tmp_path / 'xdg'
+	xdg.mkdir()
+	os.chmod(str(xdg), 0o700)
+	monkeypatch.setenv('XDG_RUNTIME_DIR', str(xdg))
+	handle = served(str(tmp_path / 'g.tsvz'), group=str(os.getgid()))
+	assert not handle.address.startswith('unix:' + str(xdg))
+	assert served(str(tmp_path / 'h.tsvz')).address.startswith('unix:' + str(xdg))
+
+
+@pytest.mark.skipif(not _UNIX, reason='Unix sockets')
+def test_serve_accepts_a_burst_of_connections(tmp_path, served):
+	"""I7: many clients connecting at the same moment are all served, none falls back."""
+	p = str(tmp_path / 'burst.tsvz')
+	served(p)
+	info = TSVZ._serveFind(p)
+	failures = []
+	start = threading.Event()
+
+	def connect():
+		start.wait()
+		try:
+			connection = TSVZ._ServeConnection(info)
+		except TSVZ._ServeUnreachable as e:
+			failures.append(str(e))
+			return
+		try:
+			connection.request('len')
+		finally:
+			connection.close()
+	threads = [threading.Thread(target=connect) for _ in range(64)]
+	for t in threads:
+		t.start()
+	start.set()
+	for t in threads:
+		t.join()
+	assert failures == []
+
+
+def test_serve_tcp_limits_unauthenticated_clients(tmp_path, served):
+	"""I8: before authentication a line is short and slow clients are cut off; a bad token gets #1."""
+	import socket
+	p = str(tmp_path / 'a.tsvz')
+	served(p, tcp=True)
+	host, port = TSVZ._serveFind(p)['address'][4:].rsplit(':', 1)
+	sock = socket.create_connection((host, int(port)), 2)
+	try:
+		sock.settimeout(10)
+		sock.sendall(b'auth\t' + b'x' * 5000)  # no newline: an oversized first line
+		try:
+			answer = sock.recv(100)
+		except ConnectionResetError:  # closed with unread bytes pending
+			answer = b''
+		assert answer == b''
+	finally:
+		sock.close()
+	sock = socket.create_connection((host, int(port)), 2)
+	try:
+		sock.settimeout(10)
+		sock.sendall('auth\té\n'.encode('utf-8'))
+		assert sock.makefile('rb').read().startswith(b'#1\t')
+	finally:
+		sock.close()
+
+
+def test_engine_reloads_on_a_same_size_edit(tmp_path, engines):
+	"""M1: an in-place edit that keeps the size is seen, even when the bytes before the offset are unchanged."""
+	p = str(tmp_path / 'm.tsvz')
+	tail = b''.join(b'filler%02d\tx\n' % i for i in range(10))
+	_touch(p, b'a\t100\n' + tail)
+	store = engines(p)
+	assert store.get(['a'], None)[0] == [['a', '100']]
+	with open(p, 'r+b') as f:
+		f.write(b'a\t999\n')
+	st = os.stat(p)
+	os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+	assert store.get(['a'], None)[0] == [['a', '999']]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='signals')
+def test_tsvz_serve_stops_cleanly_on_sighup(tmp_path):
+	"""M2: closing the terminal (SIGHUP) stops the handler cleanly."""
+	import signal
+	p = str(tmp_path / 'h.tsvz')
+	proc = _serve_process(p)
+	proc.send_signal(signal.SIGHUP)
+	assert proc.wait(10) == 0 and not os.path.exists(p + '.serve')
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='flock')
+def test_serve_reports_a_file_system_without_locks(tmp_path, monkeypatch):
+	"""M3: flock failing with ENOLCK is reported as such, not as another handler."""
+	import errno
+
+	def nolock(fd, operation):
+		raise OSError(errno.ENOLCK, 'No locks available')
+	monkeypatch.setattr(TSVZ.fcntl, 'flock', nolock)
+	status, out, err = _run('serve', str(tmp_path / 'l.tsvz'))
+	assert (status, out) == (1, '') and 'cannot lock' in err and 'already served' not in err
 
 
 if __name__ == '__main__':

@@ -132,7 +132,13 @@ status stay the same.
   `TSVZClient(..., sync=True)`). Reads always see acknowledged writes.
 - **Access.** Only the user who started the server can connect (socket mode 0600).
   `--x-group G` or `--x-mode 0660` opens it on purpose. `--x-tcp` listens on
-  127.0.0.1 with a token in the pointer file instead.
+  127.0.0.1 with a token in the pointer file instead (on Windows the token's
+  secrecy rests on the directory's permissions).
+- **Trust.** Clients use `STORE.serve` only when it is a regular file owned by
+  them or by the store's owner, not writable by anyone else, naming a socket that
+  belongs to that owner or a loopback address. Otherwise they warn and use the
+  files. `serve` never writes through a symbolic link or into a file it did not
+  create.
 - **Lifetime.** It runs in the foreground until `tsvz stop STORE`, SIGINT or
   SIGTERM, or `--x-idle-timeout S` seconds without connections. It then writes
   and `fsync`s everything and removes `STORE.serve`.
@@ -151,7 +157,10 @@ with TSVZ.TSVZClient('people.tsvz') as people:  # served, or in this process whe
 
 `TSVZClient` has `TSVZed`'s semantics for reading and setting keys, `del`, `in`,
 `len`, iteration, `pop`, `popitem`, `setdefault`, `update`, `clear` and
-`setDefaults`. Without a server it warns once and works on the files in-process.
+`setDefaults`. Its writes return once they are written (raising `OSError` if they
+cannot be), one client may be shared between threads, and without a server it
+warns once and works on the files in-process, finishing its writes when the
+program exits.
 
 ## Fault tolerance
 
@@ -233,7 +242,8 @@ and `-d=,`, except the ones C5 and C9 list.
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
 - §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, exit 1 with an error that `-q` keeps.
 - §21: a served `.tsv` file with a header line shows that line as a row, as `tsvz read` does (`TSVZed` hides it when given the header).
-- §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, but a rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
+- §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, and reloads a part whose size stayed the same but whose inode or modification time changed. A rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
+- §21.9: `tsvz` commands and `TSVZClient` ask the server to answer writes once they are written (`--x-written`), so a write the server cannot make fails as it would on the files. While writes fail, every answer carries a warning.
 - §17.7: the server appends to the store's current part; it does not start a new part when it starts.
 - §21.3: where Python has no Unix sockets (Windows), the server uses loopback TCP with a token. The test suite exercises the TCP transport on Linux only.
 - §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.

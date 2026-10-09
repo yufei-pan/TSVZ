@@ -16,6 +16,7 @@ import atexit
 import bisect
 import codecs
 import contextlib
+import errno
 import functools
 import hashlib
 import io
@@ -25,6 +26,7 @@ import shutil
 import threading
 import time
 import sys
+import weakref
 from collections import OrderedDict, deque, namedtuple
 from collections.abc import MutableMapping
 RESOURCE_LIB_AVAILABLE = True
@@ -600,8 +602,10 @@ def _tryLockFile(f):
 			os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)
 			msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
 		return True
-	except OSError:
-		return False
+	except OSError as e:
+		if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES, getattr(errno, 'EDEADLK', -1)):
+			return False
+		raise  # e.g. ENOLCK: this file system cannot lock
 
 
 def _unlockFile(f):
@@ -4475,6 +4479,19 @@ def _partRows(store, reporter):
 	return rows
 
 
+#: Writers not closed yet; ``_serveCloseWriters`` closes them when the interpreter exits.
+_SERVE_OPEN_WRITERS = weakref.WeakSet()
+
+
+def _serveCloseWriters():
+	"""At exit: write and fsync what still-open engines have queued (a TSVZClient never closed)."""
+	for writer in list(_SERVE_OPEN_WRITERS):
+		writer.close()
+
+
+atexit.register(_serveCloseWriters)
+
+
 class _ServeWriter(object):
 	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
 
@@ -4493,9 +4510,11 @@ class _ServeWriter(object):
 		self.failures = deque(maxlen=64)
 		self.unsynced = False
 		self.closing = False
+		self.failing = None  # the last write error, until a batch is written again
 		self.thread = threading.Thread(target=self._run, name='tsvz-writer')
 		self.thread.daemon = True
 		self.thread.start()
+		_SERVE_OPEN_WRITERS.add(self)
 
 	def submit(self, payload, durable):
 		with self.cond:
@@ -4527,6 +4546,7 @@ class _ServeWriter(object):
 			self.closing = True
 			self.cond.notify_all()
 		self.thread.join()
+		_SERVE_OPEN_WRITERS.discard(self)
 
 	def _run(self):
 		while True:
@@ -4551,8 +4571,11 @@ class _ServeWriter(object):
 					self.durable = last
 				if error is not None:
 					self.failures.append((batch[0][0], last, error))
-				elif not durable:
-					self.unsynced = True
+					self.failing = str(error) or type(error).__name__
+				else:
+					self.failing = None
+					if not durable:
+						self.unsynced = True
 				self.cond.notify_all()
 		if self.unsynced:
 			try:
@@ -4697,8 +4720,9 @@ class _ServeStore(object):
 	def _follow(self, path, stamp, log):
 		"""Replay what was appended to the active part; False when it changed some other way."""
 		old = self.stamps.get(path)
-		if _parsePartName(path).codec or old is None or stamp[0] != old[0] or stamp[1] < self.offset:
-			return False
+		if (_parsePartName(path).codec or old is None or stamp[0] != old[0] or stamp[1] < self.offset
+				or stamp[1] == old[1]):
+			return False  # an append always grows the part; anything else is a rewrite
 		try:
 			with open(path, 'rb') as f:
 				f.seek(self.offset - len(self.check))
@@ -4708,6 +4732,8 @@ class _ServeStore(object):
 		except OSError:
 			return False
 		end = data.rfind(b'\n') + 1
+		if not self.spec and end < len(data):
+			return False  # 3.39 reads an unterminated last line as a record; a reload does too
 		reporter = _Reporter(self.path, log)
 		try:
 			if end:
@@ -4753,6 +4779,12 @@ class _ServeStore(object):
 		self.sync(log)
 
 	# -- reads ----------------------------------------------------------------
+	def missing(self, log):
+		"""True when the store has no part (spec §20.2.2)."""
+		with self.lock:
+			self._fresh(log)
+			return not self.parts
+
 	def resolve(self, key):
 		"""A requested key as a reader resolves it (spec §7.7; 3.39 rstrip for loose files)."""
 		if self.spec:
@@ -4839,16 +4871,20 @@ class _ServeStore(object):
 		durable = self._durable(sync)
 		return self.writer.submit(payload, durable), durable
 
-	def _ack(self, queued):
-		"""Acknowledge per spec §21.9: at once for ``memory``, after fsync for ``disk``."""
-		if queued is not None and queued[1]:
+	def _ack(self, queued, written=False):
+		"""Acknowledge per spec §21.9: after fsync for ``disk``; after the write when ``written``; else at once."""
+		if queued is None:
+			return
+		if queued[1]:
 			self.writer.wait(queued[0], durable=True)
+		elif written:
+			self.writer.wait(queued[0])
 
-	def write(self, rows, sync, log):
+	def write(self, rows, sync, log, written=False):
 		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set``, ``delete`` and bulk input."""
 		with self.lock:
 			queued = self._submit(rows, sync, log)
-		self._ack(queued)
+		self._ack(queued, written)
 
 	def pop(self, key, sync, log):
 		"""Atomically return the row of ``key`` and append its tombstone; None when it is missing."""
@@ -4860,7 +4896,7 @@ class _ServeStore(object):
 				return None
 			row = list(row)
 			queued = self._submit([([key], False)], sync, log)
-		self._ack(queued)
+		self._ack(queued, written=True)  # the row is only popped once its tombstone is written
 		return row
 
 	def popitem(self, last, sync, log):
@@ -4872,7 +4908,7 @@ class _ServeStore(object):
 			key = next(reversed(self.data)) if last else next(iter(self.data))
 			row = list(self.data[key])
 			queued = self._submit([([key], False)], sync, log)
-		self._ack(queued)
+		self._ack(queued, written=True)
 		return row
 
 	def setdefault(self, cells, sync, log):
@@ -4963,6 +4999,13 @@ _SERVE_ARITY = {
 	'delete': (1, None), 'has': (1, 1), 'pop': (1, 1), 'popitem': (0, 1), 'setdefault': (2, None),
 }
 _SERVE_UNREADABLE = 'could not read every part of the store'
+#: Operations that fail on a missing store (spec §20.2.2).
+_SERVE_NEED_STORE = ('read', 'get', 'has', 'len', 'keys', 'pop', 'popitem', 'scrub', 'verify', 'parts')
+#: A pointer file larger than this is not one (spec §21.2).
+_SERVE_POINTER_LIMIT = 64 << 10
+#: Before a TCP client authenticates: its line limit (bytes) and how long it may take (seconds).
+_SERVE_AUTH_LIMIT = 1024
+_SERVE_AUTH_SECONDS = 5.0
 
 
 class _ServeUsage(Exception):
@@ -5029,9 +5072,10 @@ def _serveDispatch(store, line, bulk, log):
 	"""Run one request against ``store`` (spec §21.7); return ``(status, lines, message)``."""
 	options, operation, args, raw = _serveParseRequest(line)
 	for option in options:
-		if option != '--sync':
+		if option not in ('--sync', '--x-written'):
 			raise _ServeUsage('unknown option {}'.format(option))
 	sync = '--sync' in options
+	written = '--x-written' in options  # TSVZ extension: acknowledge once written, report failures
 	if operation not in _SERVE_ARITY:
 		raise _ServeUsage('unknown operation {}'.format(operation))
 	low, high = _SERVE_ARITY[operation]
@@ -5042,6 +5086,8 @@ def _serveDispatch(store, line, bulk, log):
 	if operation not in ('read', 'len', 'keys', 'clear', 'scrub', 'verify', 'parts', 'stop', 'popitem') \
 			and not isBulk and '' in keys:
 		raise _ServeUsage('a KEY must not be empty')
+	if operation in _SERVE_NEED_STORE and store.missing(log):
+		return 1, [], 'no such store'  # spec §20.2.2
 	unreadable = (1, _SERVE_UNREADABLE)
 	if operation == 'read':
 		rows = store.read(log)
@@ -5070,7 +5116,7 @@ def _serveDispatch(store, line, bulk, log):
 			rows = [([key], bool(_MARKER_RE.match(field))) for key, field in zip(args, raw)]
 		else:
 			rows = [(args, bool(_MARKER_RE.match(raw[0])))]
-		store.write(rows, sync, log)
+		store.write(rows, sync, log, written)
 		return 0, [], ''
 	if operation in ('pop', 'popitem'):
 		if operation == 'pop':
@@ -5108,6 +5154,10 @@ def _serveRespond(store, line, bulk=None, logger=None):
 		status, lines, message = 1, [], str(e) or type(e).__name__
 		if logger is not None:
 			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
+	failing = store.writer.failing
+	if failing:
+		log.lines.append('TSVZ warning: {}: writes are failing ({}); writes acknowledged before they were written '
+						 'may be lost'.format(store.path, failing))
 	response = ['#!\t' + _serveEncode(text) for text in log.lines] + list(lines)
 	response.append('#{}\t{}'.format(status, _serveEncode(message)) if message else '#{}'.format(status))
 	return response
@@ -5169,51 +5219,106 @@ def _servePointerPath(store):
 	return store + '.serve'
 
 
-def _serveFind(store):
-	"""Read the pointer file of ``store`` (spec §21.2); return its fields as a dict, or None.
+def _serveReadPointer(path):
+	"""Read a pointer file without following links or blocking: ``(fields, stat, problem)``.
 
-	None when there is no pointer file, or it does not parse even after one
-	short retry (a handler may be writing it).
+	``fields`` is None when there is no pointer file or it does not parse;
+	``problem`` says why a file there cannot be a pointer file.
+	"""
+	import stat
+	try:
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+	except FileNotFoundError:
+		return None, None, None
+	except OSError as e:
+		return None, None, '{} is not a regular file ({})'.format(path, e.strerror or e)
+	with os.fdopen(fd, 'rb') as f:
+		st = os.fstat(f.fileno())
+		if not stat.S_ISREG(st.st_mode):
+			return None, st, '{} is not a regular file'.format(path)
+		data = f.read(_SERVE_POINTER_LIMIT + 1)
+	if len(data) > _SERVE_POINTER_LIMIT:
+		return None, st, '{} is too large to be a pointer file'.format(path)
+	lines = data.decode('utf-8', 'replace').split('\n')
+	if lines[0] != 'tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION):
+		return None, st, None
+	fields = {}
+	for line in lines[1:]:
+		name, tab, value = line.partition('\t')
+		if tab:
+			fields[name] = _specDecodeField(value, '\t')
+	return fields, st, None
+
+
+def _serveStoreOwner(store):
+	"""The uid owning STORE (its unnumbered file, else its first part), or None."""
+	parts = _storeParts(store)[0] if _isSpecPath(store) else ([store] if os.path.exists(store) else [])
+	for path in parts:
+		try:
+			return os.stat(path).st_uid
+		except OSError:
+			continue
+	return None
+
+
+def _serveLookup(store):
+	"""The pointer file of ``store``, checked as spec §21.2.4 requires: ``(info, problem)``.
+
+	``info`` is None when there is no usable pointer file; ``problem`` then
+	says why one that exists was not trusted (None: nothing to report).
+	A pointer file is trusted only when it is a regular file owned by this
+	user or by the store's owner, not writable by others, with plain values,
+	a hexadecimal token and, for TCP, a loopback address.
 	"""
 	path = _servePointerPath(store)
 	for attempt in range(2):
 		if attempt:
-			time.sleep(0.05)
-		try:
-			with open(path, 'rb') as f:
-				lines = f.read().decode('utf-8', 'replace').split('\n')
-		except OSError:
-			return None
-		if lines[0] != 'tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION):
-			continue
-		info = {}
-		for line in lines[1:]:
-			name, tab, value = line.partition('\t')
-			if tab:
-				info[name] = _specDecodeField(value, '\t')
-		if 'address' in info and 'host' in info:
-			return info
-	return None
+			time.sleep(0.05)  # a handler may be writing it
+		fields, st, problem = _serveReadPointer(path)
+		if problem:
+			return None, problem
+		if st is None:
+			return None, None  # no pointer file: no handler
+		if fields is not None and 'address' in fields and 'host' in fields:
+			break
+	else:
+		return None, None
+	if hasattr(os, 'geteuid'):
+		trusted = (os.geteuid(), _serveStoreOwner(store))
+		if st.st_uid not in trusted:
+			return None, '{} is owned by uid {}, neither you nor the owner of the store'.format(path, st.st_uid)
+		if st.st_mode & 0o022:
+			return None, '{} is writable by others than its owner'.format(path)
+	for name, value in fields.items():
+		if any(ord(c) < 32 for c in value):
+			return None, '{} has control characters in its {}'.format(path, name)
+	token = fields.get('token')
+	if token is not None and not re.match(r'^[0-9a-f]{32,128}$', token):
+		return None, '{} has a malformed token'.format(path)
+	address = fields['address']
+	if address.startswith('tcp:') and address[4:].rpartition(':')[0] not in ('127.0.0.1', '[::1]', '::1'):
+		return None, '{} names {}, which is not a loopback address'.format(path, address)
+	fields['owner'] = getattr(st, 'st_uid', None)
+	return fields, None
+
+
+def _serveFind(store):
+	"""The trusted pointer file of ``store`` as a dict (spec §21.2), or None."""
+	return _serveLookup(store)[0]
 
 
 class _ServeConnection(object):
-	"""A connection to the handler a pointer file names (spec §21.3–§21.6, §21.11)."""
+	"""A connection to the handler a trusted pointer file names (spec §21.3–§21.6, §21.11)."""
 
 	def __init__(self, info, timeout=None):
-		import errno
 		import socket
 		if info.get('host') != socket.gethostname():
 			raise _ServeUnreachable('it runs on host {}'.format(info.get('host')), quiet=True)
 		address = info.get('address', '')
+		owner = info.get('owner')
 		try:
 			if address.startswith('unix:') and hasattr(socket, 'AF_UNIX'):
-				sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-				try:
-					sock.settimeout(0.5)
-					sock.connect(address[5:])
-				except Exception:
-					sock.close()
-					raise
+				sock = self._connectUnix(socket, address[5:], owner)
 			elif address.startswith('tcp:'):
 				host, _, port = address[4:].rpartition(':')
 				sock = socket.create_connection((host.strip('[]'), int(port)), 0.5)
@@ -5224,6 +5329,7 @@ class _ServeConnection(object):
 		sock.settimeout(timeout)
 		self.sock = sock
 		self.rfile = sock.makefile('rb')
+		self.lock = threading.Lock()
 		if info.get('token'):
 			try:
 				status = self.request('auth\t' + info['token'])[2]
@@ -5233,24 +5339,58 @@ class _ServeConnection(object):
 				self.close()
 				raise _ServeUnreachable('the handler refused the token')
 
+	@staticmethod
+	def _connectUnix(socket, path, owner):
+		"""Connect to the Unix socket ``path``, which must belong to ``owner`` (spec §21.2.4)."""
+		import stat
+		st = os.lstat(path)
+		if not stat.S_ISSOCK(st.st_mode):
+			raise _ServeUnreachable('{} is not a socket'.format(path))
+		if owner is not None and st.st_uid != owner:
+			raise _ServeUnreachable('the socket {} is owned by uid {}, not by the owner of the pointer file'.format(
+				path, st.st_uid))
+		deadline = time.monotonic() + 0.5
+		while True:
+			sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+			try:
+				sock.settimeout(max(0.05, deadline - time.monotonic()))
+				sock.connect(path)
+				break
+			except OSError as e:
+				sock.close()
+				if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK) and time.monotonic() < deadline:
+					time.sleep(0.01)  # the listen queue is full for a moment
+					continue
+				raise
+		peer = getattr(socket, 'SO_PEERCRED', None)
+		if peer is not None and owner is not None:
+			import struct
+			uid = struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, peer, struct.calcsize('3i')))[1]
+			if uid != owner:
+				sock.close()
+				raise _ServeUnreachable('the process behind {} runs as uid {}, not as the owner of the pointer '
+										'file'.format(path, uid))
+		return sock
+
 	def request(self, line, bulk=None):
 		"""Send one request, followed by ``bulk`` record lines and ``#`` when given; return the parsed response."""
 		text = line + '\n'
 		if bulk is not None:
 			text += ''.join(record + '\n' for record in bulk) + '#\n'
-		try:
-			self.sock.sendall(text.encode('utf-8', 'replace'))
-			lines = []
-			while True:
-				raw = self.rfile.readline()
-				if not raw.endswith(b'\n'):
-					raise _ServeLost('the handler closed the connection')
-				line = raw[:-1].decode('utf-8', 'replace')
-				lines.append(line)
-				if line.startswith('#') and not line.startswith('#!'):
-					return _serveParseResponse(lines)
-		except OSError as e:
-			raise _ServeLost(str(e))
+		with self.lock:
+			try:
+				self.sock.sendall(text.encode('utf-8', 'replace'))
+				lines = []
+				while True:
+					raw = self.rfile.readline()
+					if not raw.endswith(b'\n'):
+						raise _ServeLost('the handler closed the connection')
+					line = raw[:-1].decode('utf-8', 'replace')
+					lines.append(line)
+					if line.startswith('#') and not line.startswith('#!'):
+						return _serveParseResponse(lines)
+			except OSError as e:
+				raise _ServeLost(str(e))
 
 	def close(self):
 		for thing in (self.rfile, self.sock):
@@ -5275,11 +5415,13 @@ def _serveClasses():
 		class TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 			daemon_threads = True
 			allow_reuse_address = True
+			request_queue_size = 128
 
 		_SERVE_CLASSES.update(handler=Handler, tcp=TCPServer)
 		if hasattr(socketserver, 'UnixStreamServer'):
 			class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 				daemon_threads = True
+				request_queue_size = 128
 
 			_SERVE_CLASSES['unix'] = UnixServer
 	return _SERVE_CLASSES
@@ -5334,12 +5476,61 @@ class _ServeHandle(object):
 		self.stopping = threading.Event()
 
 	def lock(self):
-		"""Take the pointer file's lock (spec §21.2); raise ``_ServeBusy`` when another handler has it."""
-		f = os.fdopen(os.open(self.pointer, os.O_RDWR | os.O_CREAT, 0o644), 'r+b')
-		if not _tryLockFile(f):
+		"""Take over the pointer file (spec §21.2.3); raise ``_ServeBusy`` when another handler has it.
+
+		An existing pointer file must be a regular file. When no handler holds
+		its lock it is stale and is removed, never written into: the handler
+		then creates its own with O_EXCL, without following symbolic links.
+		Errors other than "busy" (a file system without locks) raise OSError.
+		"""
+		import stat
+		try:
+			fd = os.open(self.pointer, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+		except FileNotFoundError:
+			fd = None
+		except OSError as e:
+			raise OSError('{} is not a regular file ({}); remove it'.format(self.pointer, e.strerror or e))
+		old = None
+		if fd is not None:
+			old = os.fdopen(fd, 'rb')
+			try:
+				if not stat.S_ISREG(os.fstat(old.fileno()).st_mode):
+					raise OSError('{} is not a regular file; remove it'.format(self.pointer))
+				if not _tryLockFile(old):
+					raise _ServeBusy(_serveReadPointer(self.pointer)[0] or {})
+				if self._isPointer(old):
+					os.unlink(self.pointer)  # stale: replace it rather than write into it
+			except BaseException:
+				old.close()
+				raise
+		try:
+			fd = os.open(self.pointer, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+		except FileExistsError:
+			raise _ServeBusy(_serveReadPointer(self.pointer)[0] or {})
+		finally:
+			if old is not None:
+				old.close()
+		f = os.fdopen(fd, 'r+b')
+		try:
+			locked = _tryLockFile(f)
+		except OSError:
 			f.close()
-			raise _ServeBusy(_serveFind(self.storePath) or {})
+			try:
+				os.unlink(self.pointer)
+			except OSError:
+				pass
+			raise
+		if not locked or not self._isPointer(f):
+			f.close()
+			raise _ServeBusy(_serveReadPointer(self.pointer)[0] or {})
 		self.pointerFile = f
+
+	def _isPointer(self, f):
+		"""True while the pointer path still names the open file ``f``."""
+		try:
+			return os.lstat(self.pointer).st_ino == os.fstat(f.fileno()).st_ino
+		except OSError:
+			return False
 
 	def start(self, store):
 		"""Bind the socket for ``store`` and write the pointer file."""
@@ -5349,14 +5540,15 @@ class _ServeHandle(object):
 		classes = _serveClasses()
 		gid = _serveGroup(self.group)
 		mode = self.mode if self.mode is not None else (0o660 if gid is not None else 0o600)
+		shared = self.group is not None or self.mode is not None
 		if self.tcp or 'unix' not in classes:
 			self.server = classes['tcp'](('127.0.0.1', 0), classes['handler'])
 			self.address = 'tcp:127.0.0.1:{}'.format(self.server.server_address[1])
 			self.token = ''.join('%02x' % b for b in os.urandom(16))
 		else:
 			base = os.environ.get('XDG_RUNTIME_DIR', '')
-			if not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
-				base = tempfile.gettempdir()
+			if shared or not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
+				base = tempfile.gettempdir()  # others cannot enter a private runtime directory
 			self.socketDir = tempfile.mkdtemp(prefix='tsvz-', dir=base)
 			path = os.path.join(self.socketDir, 's')
 			self.server = classes['unix'](path, classes['handler'])
@@ -5373,11 +5565,13 @@ class _ServeHandle(object):
 			lines.append('token\t' + self.token)
 		if not store.spec:
 			lines.append('x-delimiter\t' + _serveEncode(store.delimiter))
-		try:
-			os.chmod(self.pointer, mode if self.token else 0o644)
-		except OSError:
-			pass
 		f = self.pointerFile
+		if hasattr(os, 'fchmod'):  # before the token is written; never writable by others
+			if self.token and gid is not None:
+				os.fchown(f.fileno(), -1, gid)
+				os.fchmod(f.fileno(), 0o640)
+			else:
+				os.fchmod(f.fileno(), 0o600 if self.token else 0o644)
 		f.seek(0)
 		f.truncate()
 		f.write(''.join(line + '\n' for line in lines).encode('utf-8'))
@@ -5418,7 +5612,7 @@ class _ServeHandle(object):
 			shutil.rmtree(self.socketDir, ignore_errors=True)
 		if self.pointerFile is not None:
 			try:
-				if os.stat(self.pointer).st_ino == os.fstat(self.pointerFile.fileno()).st_ino:
+				if self._isPointer(self.pointerFile):
 					os.unlink(self.pointer)
 			except OSError:
 				pass
@@ -5443,18 +5637,23 @@ class _ServeHandle(object):
 				self.sockets.add(sock)
 		try:
 			authed = self.token is None
+			if not authed and sock is not None:
+				sock.settimeout(_SERVE_AUTH_SECONDS)
 			while True:
-				line = self._readLine(rfile)
+				line = self._readLine(rfile, _SERVE_LINE_LIMIT if authed else _SERVE_AUTH_LIMIT)
 				if line is None:
 					return
 				fields = line.split('\t')
 				if fields[0] == 'auth':
 					import hmac
-					ok = len(fields) == 2 and (self.token is None or hmac.compare_digest(fields[1], self.token))
+					ok = len(fields) == 2 and (self.token is None or hmac.compare_digest(
+						fields[1].encode('utf-8', 'replace'), self.token.encode('ascii')))
 					self._send(wfile, ['#0'] if ok else ['#1\tauthentication failed'])
 					if not ok:
 						return
 					authed = True
+					if sock is not None:
+						sock.settimeout(None)
 					continue
 				if not authed:
 					self._send(wfile, ['#1\tauthentication required'])
@@ -5483,9 +5682,9 @@ class _ServeHandle(object):
 				self.sockets.discard(sock)
 				self.lastActivity = time.monotonic()
 
-	def _readLine(self, rfile):
+	def _readLine(self, rfile, limit=None):
 		"""One request line without its terminator; None at the end of the connection or past the limit."""
-		raw = rfile.readline(_SERVE_LINE_LIMIT + 1)
+		raw = rfile.readline((_SERVE_LINE_LIMIT if limit is None else limit) + 1)
 		if not raw.endswith(b'\n'):
 			return None
 		text = raw[:-1].decode('utf-8', 'replace')
@@ -5497,15 +5696,35 @@ class _ServeHandle(object):
 
 
 def _serveSignals():
-	"""Make SIGTERM stop ``serve`` as SIGINT does; return a function that restores the old handler."""
+	"""Make SIGTERM and SIGHUP stop ``serve`` as SIGINT does; return a function that restores them.
+
+	A signal that is ignored (``nohup``) stays ignored.
+	"""
 	import signal
-	if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'SIGTERM'):
+	if threading.current_thread() is not threading.main_thread():
 		return lambda: None
 
 	def handler(signum, frame):
 		raise _ServeSignal()
-	old = signal.signal(signal.SIGTERM, handler)
-	return lambda: signal.signal(signal.SIGTERM, old)
+	saved = []
+	for name in ('SIGTERM', 'SIGHUP'):
+		number = getattr(signal, name, None)
+		if number is not None and signal.getsignal(number) is not signal.SIG_IGN:
+			saved.append((number, signal.signal(number, handler)))
+	return lambda: [signal.signal(number, old) for number, old in saved]
+
+
+def _serveHoldSignals():
+	"""Ignore SIGINT, SIGTERM and SIGHUP while the handler closes; return a function that restores them."""
+	import signal
+	if threading.current_thread() is not threading.main_thread():
+		return lambda: None
+	saved = []
+	for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+		number = getattr(signal, name, None)
+		if number is not None:
+			saved.append((number, signal.signal(number, signal.SIG_IGN)))
+	return lambda: [signal.signal(number, old) for number, old in saved]
 
 
 class TSVZClient(MutableMapping):
@@ -5538,11 +5757,12 @@ class TSVZClient(MutableMapping):
 		else:
 			self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
+		self._lock = threading.RLock()
 		self._connect()
 
 	def _connect(self):
-		info = _serveFind(self._fileName)
-		reason = 'no handler is running'
+		info, problem = _serveLookup(self._fileName)
+		reason = problem or 'no handler is running'
 		if info is not None:
 			try:
 				self._backend = _ServeConnection(info, self._timeout)
@@ -5555,16 +5775,18 @@ class TSVZClient(MutableMapping):
 
 	def _request(self, fields, write=False, bulk=None, retry=True):
 		"""Send a request; return ``(lines, status, message)``. Usage errors raise ``ValueError``."""
-		line = '\t'.join((['--sync'] if write and self._sync else []) + fields)
-		try:
-			lines, diagnostics, status, message = self._backend.request(line, bulk)
-		except _ServeLost as e:
-			self._backend.close()
-			self._connect()
-			if not retry:
-				raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been applied'
-									  .format(self._fileName, e, fields[0]))
-			lines, diagnostics, status, message = self._backend.request(line, bulk)
+		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
+		line = '\t'.join(options + fields)
+		with self._lock:  # one request at a time on the shared connection
+			try:
+				lines, diagnostics, status, message = self._backend.request(line, bulk)
+			except _ServeLost as e:
+				self._backend.close()
+				self._connect()
+				if not retry:
+					raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
+										  'applied'.format(self._fileName, e, fields[0]))
+				lines, diagnostics, status, message = self._backend.request(line, bulk)
 		for text in diagnostics:
 			_warn(text, self.teeLogger)
 		if status == 2:
@@ -5693,9 +5915,16 @@ class TSVZClient(MutableMapping):
 	mapToFile = hardMapToFile = rewrite
 
 	def close(self):
-		if self._backend is not None:
-			self._backend.close()
-			self._backend = None
+		with self._lock:
+			if self._backend is not None:
+				self._backend.close()
+				self._backend = None
+
+	def __del__(self):
+		try:
+			self.close()
+		except Exception:
+			pass
 
 	def __enter__(self):
 		return self
@@ -6345,6 +6574,10 @@ def _cliServe(args, delimiter, logger, stdin, stdout):
 		logger.teelog('tsvz: {}: already served by pid {} on host {}'.format(
 			args.store, info.get('pid', '?'), info.get('host', '?')), 'error')
 		return 1
+	except OSError as e:
+		logger.teelog('tsvz: {}: cannot lock the pointer file {}: {}'.format(
+			args.store, handle.pointer, e), 'error')
+		return 1
 	restore = _serveSignals()  # before the pointer file announces this handler
 	try:
 		store = _ServeStore(args.store, delimiter=delimiter, header=args.header, createDefaults=args.defaults,
@@ -6355,17 +6588,21 @@ def _cliServe(args, delimiter, logger, stdin, stdout):
 	except (KeyboardInterrupt, _ServeSignal):
 		pass
 	finally:
-		restore()
-		handle.close()
+		held = _serveHoldSignals()  # a second signal must not cut the final writes short
+		try:
+			handle.close()
+		finally:
+			held()
+			restore()
 	logger.teelog('tsvz: stopped serving {}'.format(args.store))
 	return 0
 
 
 def _cliStop(args, delimiter, logger, stdin, stdout):
 	"""``stop STORE`` (spec §21.13): ask the handler of STORE to stop, and wait until it has."""
-	info = _serveFind(args.store)
+	info, problem = _serveLookup(args.store)
 	if info is None:
-		logger.teelog('tsvz: {}: no handler is running'.format(args.store), 'error')
+		logger.teelog('tsvz: {}: {}'.format(args.store, problem or 'no handler is running'), 'error')
 		return 1
 	try:
 		connection = _ServeConnection(info)
@@ -6398,9 +6635,13 @@ def _cliHandler(args, delimiter, logger):
 	files are used; another host's handler, or one this user may not
 	connect to, is skipped quietly.
 	"""
-	if args.operation in ('serve', 'stop') or args.direct or args.header or args.defaults or args.strict:
-		return None
-	info = _serveFind(args.store)
+	if args.operation in ('serve', 'stop', 'parts', 'verify') or args.direct or args.header or args.defaults \
+			or args.strict:
+		return None  # parts and verify read the files themselves, so they gain nothing from a handler
+	info, problem = _serveLookup(args.store)
+	if problem:
+		logger.teelog('TSVZ warning: {}: ignoring the pointer file: {}; using the files directly'.format(
+			args.store, problem), 'warning')
 	if info is None:
 		return None
 	if not _isSpecPath(args.store) and info.get('x-delimiter', delimiter) != delimiter:
@@ -6426,7 +6667,8 @@ def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 			source.flush()
 		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
 	try:
-		response = connection.request(_cliRequestLine(args), bulk)
+		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
+		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	except _ServeLost as e:
 		if args.operation in _CLI_READ_ONLY:
 			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
