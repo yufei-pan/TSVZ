@@ -3060,5 +3060,235 @@ def test_cli_has_len_keys_pop_popitem_setdefault(tmp_path):
 			TSVZ._cliParseArgs(argv)
 
 
+# ==========================================================================
+# Write handler (spec §21): the server
+# ==========================================================================
+@pytest.fixture
+def served():
+	"""Start in-thread handlers: ``served(path, **handleOptions)`` returns the ``_ServeHandle``."""
+	running = []
+
+	def start(path, **options):
+		handle = TSVZ._ServeHandle(path, **options)
+		handle.lock()
+		handle.start(TSVZ._ServeStore(path, create=True))
+		thread = threading.Thread(target=handle.serve)
+		thread.start()
+		handle.thread = thread
+		running.append((handle, thread))
+		return handle
+	yield start
+	for handle, thread in running:
+		handle.stop()
+		thread.join(10)
+		handle.close()
+
+
+def _raw(address, data):
+	"""Send raw bytes to a handler and return everything it answers until it closes or goes quiet."""
+	import socket
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	sock.settimeout(2)
+	sock.connect(address[len('unix:'):])
+	try:
+		sock.sendall(data)
+		sock.shutdown(socket.SHUT_WR)
+		chunks = []
+		while True:
+			chunk = sock.recv(65536)
+			if not chunk:
+				return b''.join(chunks)
+			chunks.append(chunk)
+	finally:
+		sock.close()
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_over_a_unix_socket(tmp_path, served):
+	p = str(tmp_path / 's.tsvz')
+	handle = served(p)
+	info = TSVZ._serveFind(p)
+	assert info['address'] == handle.address and info['address'].startswith('unix:')
+	assert info['pid'] == str(os.getpid()) and info['host'] == __import__('socket').gethostname()
+	connection = TSVZ._ServeConnection(info)
+	try:
+		assert connection.request('set\talice\tAlice') == ([], [], 0, '')
+		assert connection.request('set\t-', ['bob\tBob', 'carol']) == ([], [], 0, '')
+		assert connection.request('read') == (['alice\tAlice', 'bob\tBob'], [], 0, '')
+		assert connection.request('frob')[2:] == (2, 'unknown operation frob')
+		assert connection.request('get\tbob') == (['bob\tBob'], [], 0, '')  # still usable after #2
+	finally:
+		connection.close()
+	assert _raw(handle.address, b'len\nkeys\nbogus\n') == b'2\n#0\nalice\nbob\n#0\n#2\tunknown operation bogus\n'
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_closes_a_connection_with_an_overlong_line(tmp_path, served, monkeypatch):
+	monkeypatch.setattr(TSVZ, '_SERVE_LINE_LIMIT', 100)
+	handle = served(str(tmp_path / 'l.tsvz'))
+	assert _raw(handle.address, b'get\t' + b'k' * 200 + b'\nlen\n') == b''
+	assert _raw(handle.address, b'len\n') == b'0\n#0\n'
+
+
+def test_serve_over_tcp_requires_the_token(tmp_path, served):
+	p = str(tmp_path / 't.tsvz')
+	handle = served(p, tcp=True)
+	info = TSVZ._serveFind(p)
+	assert info['address'].startswith('tcp:127.0.0.1:') and len(info['token']) == 32
+	assert os.stat(p + '.serve').st_mode & 0o777 == 0o600  # the token is in it
+	connection = TSVZ._ServeConnection(info)
+	try:
+		assert connection.request('set\tk\tv')[2] == 0 and connection.request('get\tk')[0] == ['k\tv']
+	finally:
+		connection.close()
+	import socket
+	host, port = info['address'][4:].rsplit(':', 1)
+	for first in (b'read\n', b'auth\twrong\n'):
+		sock = socket.create_connection((host, int(port)), 2)
+		try:
+			sock.sendall(first)
+			assert sock.makefile('rb').read().startswith(b'#1\t')
+		finally:
+			sock.close()
+	with pytest.raises(TSVZ._ServeUnreachable):
+		TSVZ._ServeConnection(dict(info, token='0' * 32))
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX permissions')
+def test_serve_socket_permissions(tmp_path, served):
+	def modes(handle):
+		path = handle.address[len('unix:'):]
+		return os.stat(path).st_mode & 0o777, os.stat(os.path.dirname(path)).st_mode & 0o777
+	assert modes(served(str(tmp_path / 'a.tsvz'))) == (0o600, 0o700)
+	assert os.stat(str(tmp_path / 'a.tsvz.serve')).st_mode & 0o777 == 0o644
+	assert modes(served(str(tmp_path / 'b.tsvz'), group=str(os.getgid()))) == (0o660, 0o710)
+	assert modes(served(str(tmp_path / 'c.tsvz'), mode=0o666)) == (0o666, 0o711)
+
+
+def test_serve_refuses_a_second_handler_for_the_same_store(tmp_path, served):
+	p = str(tmp_path / 'b.tsvz')
+	served(p)
+	second = TSVZ._ServeHandle(p)
+	with pytest.raises(TSVZ._ServeBusy) as busy:
+		second.lock()
+	assert busy.value.args[0]['pid'] == str(os.getpid())
+
+
+def _serve_process(store, *options):
+	"""Start ``tsvz serve STORE`` in the background; return the Popen once its pointer file is written."""
+	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'serve', store] + list(options),
+							stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	deadline = time.time() + 10
+	while TSVZ._serveFind(store) is None:
+		if proc.poll() is not None or time.time() > deadline:
+			proc.kill()
+			raise AssertionError(proc.communicate()[1])
+		time.sleep(0.02)
+	return proc
+
+
+def test_tsvz_serve_and_stop(tmp_path):
+	p = str(tmp_path / 'p.tsvz')
+	proc = _serve_process(p, '--x-header', 'id\\tval')
+	try:
+		address = TSVZ._serveFind(p)['address']
+		r = _cli('serve', p)
+		assert r.returncode == 1 and 'already served by pid {}'.format(proc.pid) in r.stderr
+		connection = TSVZ._ServeConnection(TSVZ._serveFind(p))
+		assert connection.request('set\tk\tv')[2] == 0
+		connection.close()
+		r = _cli('stop', p)
+		assert (r.returncode, r.stdout) == (0, '')
+		out, err = proc.communicate(timeout=10)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+	assert proc.returncode == 0 and out == b'' and b'serving' in err and b'stopped serving' in err
+	assert open(p, 'rb').read() == b'#id\tval\nk\tv\n'  # the header of a store serve created; the write
+	assert not os.path.exists(p + '.serve') and not os.path.exists(os.path.dirname(address[len('unix:'):]))
+	r = _cli('stop', p)
+	assert r.returncode == 1 and 'no handler is running' in r.stderr
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='signals')
+def test_tsvz_serve_stops_on_sigterm_and_when_idle(tmp_path):
+	import signal
+	p = str(tmp_path / 'g.tsvz')
+	proc = _serve_process(p)
+	proc.send_signal(signal.SIGTERM)
+	assert proc.wait(10) == 0 and not os.path.exists(p + '.serve')
+	proc = _serve_process(p, '--x-idle-timeout', '0.3')
+	assert proc.wait(10) == 0 and b'idle for 0.3 s' in proc.stderr.read()
+	assert not os.path.exists(p + '.serve')
+
+
+def test_tsvz_serve_usage_errors(tmp_path):
+	p = str(tmp_path / 'u.tsvz')
+	for options in (['--x-idle-timeout', 'soon'], ['--x-mode', '9x']):
+		r = _cli('serve', p, *options)
+		assert r.returncode == 2 and 'serve: bad' in r.stderr and 'usage: tsvz' in r.stderr
+	assert _cli('serve', p, 'extra').returncode == 2
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_close_ends_open_connections(tmp_path, served):
+	p = str(tmp_path / 'e.tsvz')
+	handle = served(p)
+	connection = TSVZ._ServeConnection(TSVZ._serveFind(p))
+	try:
+		assert connection.request('len')[2] == 0
+		handle.stop()
+		handle.thread.join(10)
+		handle.close()
+		with pytest.raises(TSVZ._ServeLost):
+			connection.request('len')
+	finally:
+		connection.close()
+	assert TSVZ._serveFind(p) is None
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_many_concurrent_clients(tmp_path, served):
+	"""Review focus 1: interleaved requests from many connections all land, each answered on its own."""
+	p = str(tmp_path / 'c.tsvz')
+	served(p)
+	errors = []
+
+	def client(n):
+		connection = TSVZ._ServeConnection(TSVZ._serveFind(p))
+		try:
+			for i in range(50):
+				key = 'c{}k{}'.format(n, i)
+				if connection.request('set\t{}\t{}'.format(key, i))[2] != 0 or \
+						connection.request('get\t' + key)[0] != ['{}\t{}'.format(key, i)]:
+					errors.append(key)
+		finally:
+			connection.close()
+	threads = [threading.Thread(target=client, args=(n,)) for n in range(8)]
+	for t in threads:
+		t.start()
+	for t in threads:
+		t.join()
+	assert errors == []
+	assert len(_view(p)) == 400
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_ignores_bulk_input_cut_off_before_its_end(tmp_path, served):
+	"""Review focus 2: a client that disconnects before the closing '#' writes nothing."""
+	p = str(tmp_path / 'b.tsvz')
+	handle = served(p)
+	assert _raw(handle.address, b'set\t-\nk\tv\nj\tw\n') == b''
+	assert _raw(handle.address, b'len\n') == b'0\n#0\n' and open(p, 'rb').read() == b''
+
+
+def test_serve_takes_over_a_stale_pointer(tmp_path, served):
+	"""Review focus 3: the pointer file of a crashed handler is replaced by the next one."""
+	import socket
+	p = str(tmp_path / 's.tsvz')
+	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:/gone\nhost\t{}\npid\t1\n'.format(socket.gethostname()).encode())
+	assert _run('get', p, 'k')[0] == 1  # no store yet; the stale pointer is reported and skipped
+	handle = served(p)
+	assert TSVZ._serveFind(p)['address'] == handle.address
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

@@ -5146,10 +5146,373 @@ class _ServeLocal(object):
 
 
 # ===========================================================================
+# Write handler (tsvz-spec-v1 §21): pointer files, connections and the server
+# ===========================================================================
+class _ServeBusy(Exception):
+	"""Another handler holds the store's pointer file (spec §21.2); ``args[0]`` is its pointer, as a dict."""
+
+
+class _ServeUnreachable(Exception):
+	"""A pointer file whose handler cannot be used; ``quiet`` when that is expected (other host, no permission)."""
+
+	def __init__(self, message, quiet=False):
+		Exception.__init__(self, message)
+		self.quiet = quiet
+
+
+class _ServeSignal(Exception):
+	"""SIGTERM arrived while ``tsvz serve`` was serving."""
+
+
+def _servePointerPath(store):
+	"""The pointer file of a store (spec §21.2): the store path plus ``.serve``."""
+	return store + '.serve'
+
+
+def _serveFind(store):
+	"""Read the pointer file of ``store`` (spec §21.2); return its fields as a dict, or None.
+
+	None when there is no pointer file, or it does not parse even after one
+	short retry (a handler may be writing it).
+	"""
+	path = _servePointerPath(store)
+	for attempt in range(2):
+		if attempt:
+			time.sleep(0.05)
+		try:
+			with open(path, 'rb') as f:
+				lines = f.read().decode('utf-8', 'replace').split('\n')
+		except OSError:
+			return None
+		if lines[0] != 'tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION):
+			continue
+		info = {}
+		for line in lines[1:]:
+			name, tab, value = line.partition('\t')
+			if tab:
+				info[name] = _specDecodeField(value, '\t')
+		if 'address' in info and 'host' in info:
+			return info
+	return None
+
+
+class _ServeConnection(object):
+	"""A connection to the handler a pointer file names (spec §21.3–§21.6, §21.11)."""
+
+	def __init__(self, info, timeout=None):
+		import errno
+		import socket
+		if info.get('host') != socket.gethostname():
+			raise _ServeUnreachable('it runs on host {}'.format(info.get('host')), quiet=True)
+		address = info.get('address', '')
+		try:
+			if address.startswith('unix:') and hasattr(socket, 'AF_UNIX'):
+				sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+				try:
+					sock.settimeout(0.5)
+					sock.connect(address[5:])
+				except Exception:
+					sock.close()
+					raise
+			elif address.startswith('tcp:'):
+				host, _, port = address[4:].rpartition(':')
+				sock = socket.create_connection((host.strip('[]'), int(port)), 0.5)
+			else:
+				raise _ServeUnreachable('unusable address {!r}'.format(address), quiet=True)
+		except (OSError, ValueError) as e:
+			raise _ServeUnreachable(str(e), quiet=getattr(e, 'errno', None) in (errno.EACCES, errno.EPERM))
+		sock.settimeout(timeout)
+		self.sock = sock
+		self.rfile = sock.makefile('rb')
+		if info.get('token'):
+			try:
+				status = self.request('auth\t' + info['token'])[2]
+			except _ServeLost:
+				status = 1
+			if status != 0:
+				self.close()
+				raise _ServeUnreachable('the handler refused the token')
+
+	def request(self, line, bulk=None):
+		"""Send one request, followed by ``bulk`` record lines and ``#`` when given; return the parsed response."""
+		text = line + '\n'
+		if bulk is not None:
+			text += ''.join(record + '\n' for record in bulk) + '#\n'
+		try:
+			self.sock.sendall(text.encode('utf-8', 'replace'))
+			lines = []
+			while True:
+				raw = self.rfile.readline()
+				if not raw.endswith(b'\n'):
+					raise _ServeLost('the handler closed the connection')
+				line = raw[:-1].decode('utf-8', 'replace')
+				lines.append(line)
+				if line.startswith('#') and not line.startswith('#!'):
+					return _serveParseResponse(lines)
+		except OSError as e:
+			raise _ServeLost(str(e))
+
+	def close(self):
+		for thing in (self.rfile, self.sock):
+			try:
+				thing.close()
+			except Exception:
+				pass
+
+
+_SERVE_CLASSES = {}
+
+
+def _serveClasses():
+	"""The socketserver classes of the handler; ``socketserver`` is imported on first use."""
+	if not _SERVE_CLASSES:
+		import socketserver
+
+		class Handler(socketserver.StreamRequestHandler):
+			def handle(self):
+				self.server.serving.connection(self.rfile, self.wfile, self.request)
+
+		class TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+			daemon_threads = True
+			allow_reuse_address = True
+
+		_SERVE_CLASSES.update(handler=Handler, tcp=TCPServer)
+		if hasattr(socketserver, 'UnixStreamServer'):
+			class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+				daemon_threads = True
+
+			_SERVE_CLASSES['unix'] = UnixServer
+	return _SERVE_CLASSES
+
+
+def _serveGroup(group):
+	"""A group name or number as a gid (None stays None)."""
+	if group is None or group == '':
+		return None
+	if _ASCII_DIGITS_RE.match(str(group)):
+		return int(group)
+	import grp
+	return grp.getgrnam(group).gr_gid
+
+
+def _serveIsStop(line):
+	"""True when ``line`` is a well-formed ``stop`` request."""
+	try:
+		options, operation, args, _ = _serveParseRequest(line)
+	except _ServeUsage:
+		return False
+	return operation == 'stop' and not args and all(option == '--sync' for option in options)
+
+
+class _ServeHandle(object):
+	"""A running write handler for one store (spec §21; design §3).
+
+	``lock()`` takes the pointer file, ``start(store)`` binds the socket and
+	writes the pointer, ``serve()`` answers requests until ``stop()`` (or an
+	exception in the serving thread), ``close()`` writes everything and
+	removes the socket and the pointer file.
+	"""
+
+	def __init__(self, storePath, logger=None, group=None, mode=None, tcp=False, idleTimeout=0):
+		self.storePath = storePath
+		self.logger = logger
+		self.group = group
+		self.mode = mode
+		self.tcp = tcp
+		self.idleTimeout = idleTimeout
+		self.pointer = _servePointerPath(storePath)
+		self.pointerFile = None
+		self.store = None
+		self.server = None
+		self.socketDir = None
+		self.address = None
+		self.token = None
+		self.guard = threading.Lock()
+		self.active = 0
+		self.sockets = set()
+		self.lastActivity = time.monotonic()
+		self.stopping = threading.Event()
+
+	def lock(self):
+		"""Take the pointer file's lock (spec §21.2); raise ``_ServeBusy`` when another handler has it."""
+		f = os.fdopen(os.open(self.pointer, os.O_RDWR | os.O_CREAT, 0o644), 'r+b')
+		if not _tryLockFile(f):
+			f.close()
+			raise _ServeBusy(_serveFind(self.storePath) or {})
+		self.pointerFile = f
+
+	def start(self, store):
+		"""Bind the socket for ``store`` and write the pointer file."""
+		import socket
+		import tempfile
+		self.store = store
+		classes = _serveClasses()
+		gid = _serveGroup(self.group)
+		mode = self.mode if self.mode is not None else (0o660 if gid is not None else 0o600)
+		if self.tcp or 'unix' not in classes:
+			self.server = classes['tcp'](('127.0.0.1', 0), classes['handler'])
+			self.address = 'tcp:127.0.0.1:{}'.format(self.server.server_address[1])
+			self.token = ''.join('%02x' % b for b in os.urandom(16))
+		else:
+			base = os.environ.get('XDG_RUNTIME_DIR', '')
+			if not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
+				base = tempfile.gettempdir()
+			self.socketDir = tempfile.mkdtemp(prefix='tsvz-', dir=base)
+			path = os.path.join(self.socketDir, 's')
+			self.server = classes['unix'](path, classes['handler'])
+			if gid is not None:
+				os.chown(self.socketDir, -1, gid)
+				os.chown(path, -1, gid)
+			os.chmod(path, mode)
+			os.chmod(self.socketDir, 0o700 | (0o010 if mode & 0o070 else 0) | (0o001 if mode & 0o007 else 0))
+			self.address = 'unix:' + path
+		self.server.serving = self
+		lines = ['tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION), 'address\t' + _serveEncode(self.address),
+				 'host\t' + _serveEncode(socket.gethostname()), 'pid\t{}'.format(os.getpid())]
+		if self.token:
+			lines.append('token\t' + self.token)
+		if not store.spec:
+			lines.append('x-delimiter\t' + _serveEncode(store.delimiter))
+		try:
+			os.chmod(self.pointer, mode if self.token else 0o644)
+		except OSError:
+			pass
+		f = self.pointerFile
+		f.seek(0)
+		f.truncate()
+		f.write(''.join(line + '\n' for line in lines).encode('utf-8'))
+		f.flush()
+		os.fsync(f.fileno())
+
+	def serve(self):
+		"""Answer requests in this thread until ``stop()`` or the idle timeout."""
+		if self.idleTimeout:
+			watcher = threading.Thread(target=self._watchIdle, name='tsvz-idle')
+			watcher.daemon = True
+			watcher.start()
+		self.server.serve_forever(poll_interval=0.2)
+
+	def stop(self):
+		"""Make ``serve()`` return (from any other thread)."""
+		self.stopping.set()
+		if self.server is not None:
+			stopper = threading.Thread(target=self.server.shutdown, name='tsvz-stop')
+			stopper.daemon = True
+			stopper.start()
+
+	def close(self):
+		"""Stop listening, end open connections, write and fsync everything, remove the socket and the pointer."""
+		import socket
+		if self.server is not None:
+			self.server.server_close()
+		with self.guard:
+			sockets = list(self.sockets)
+		for sock in sockets:
+			try:
+				sock.shutdown(socket.SHUT_RDWR)
+			except OSError:
+				pass
+		if self.store is not None:
+			self.store.close()
+		if self.socketDir is not None:
+			shutil.rmtree(self.socketDir, ignore_errors=True)
+		if self.pointerFile is not None:
+			try:
+				if os.stat(self.pointer).st_ino == os.fstat(self.pointerFile.fileno()).st_ino:
+					os.unlink(self.pointer)
+			except OSError:
+				pass
+			self.pointerFile.close()
+			self.pointerFile = None
+
+	def _watchIdle(self):
+		while not self.stopping.wait(min(1.0, self.idleTimeout / 4.0)):
+			with self.guard:
+				idle = not self.active and time.monotonic() - self.lastActivity >= self.idleTimeout
+			if idle:
+				if self.logger is not None:
+					self.logger.teelog('tsvz: {}: idle for {:g} s; stopping'.format(self.storePath, self.idleTimeout))
+				self.stop()
+				return
+
+	def connection(self, rfile, wfile, sock=None):
+		"""Answer the requests of one connection (spec §21.3–§21.11)."""
+		with self.guard:
+			self.active += 1
+			if sock is not None:
+				self.sockets.add(sock)
+		try:
+			authed = self.token is None
+			while True:
+				line = self._readLine(rfile)
+				if line is None:
+					return
+				fields = line.split('\t')
+				if fields[0] == 'auth':
+					import hmac
+					ok = len(fields) == 2 and (self.token is None or hmac.compare_digest(fields[1], self.token))
+					self._send(wfile, ['#0'] if ok else ['#1\tauthentication failed'])
+					if not ok:
+						return
+					authed = True
+					continue
+				if not authed:
+					self._send(wfile, ['#1\tauthentication required'])
+					return
+				bulk = None
+				if _serveNeedsBulk(line):
+					bulk = []
+					while True:
+						record = self._readLine(rfile)
+						if record is None:
+							return
+						if record == '#':
+							break
+						bulk.append(record)
+				if _serveIsStop(line):
+					self.store.flush()
+					self._send(wfile, ['#0'])
+					self.stop()
+					return
+				self._send(wfile, _serveRespond(self.store, line, bulk, self.logger))
+		except OSError:
+			return  # the client went away
+		finally:
+			with self.guard:
+				self.active -= 1
+				self.sockets.discard(sock)
+				self.lastActivity = time.monotonic()
+
+	def _readLine(self, rfile):
+		"""One request line without its terminator; None at the end of the connection or past the limit."""
+		raw = rfile.readline(_SERVE_LINE_LIMIT + 1)
+		if not raw.endswith(b'\n'):
+			return None
+		text = raw[:-1].decode('utf-8', 'replace')
+		return text[:-1] if text.endswith('\r') else text
+
+	def _send(self, wfile, lines):
+		wfile.write(''.join(line + '\n' for line in lines).encode('utf-8', 'replace'))
+		wfile.flush()
+
+
+def _serveSignals():
+	"""Make SIGTERM stop ``serve`` as SIGINT does; return a function that restores the old handler."""
+	import signal
+	if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'SIGTERM'):
+		return lambda: None
+
+	def handler(signum, frame):
+		raise _ServeSignal()
+	old = signal.signal(signal.SIGTERM, handler)
+	return lambda: signal.signal(signal.SIGTERM, old)
+
+
+# ===========================================================================
 # Command-line interface (tsvz-spec-v1 §20)
 # ===========================================================================
 _CLI_OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts',
-				   'has', 'len', 'keys', 'pop', 'popitem', 'setdefault')
+				   'has', 'len', 'keys', 'pop', 'popitem', 'setdefault', 'serve', 'stop')
 #: option -> (destination, takes a value). The 3.39 spellings -c/--header,
 #: --defaults, -s/--strict and -f/--force are undocumented aliases of the
 #: --x- extensions (spec §20.7.4).
@@ -5164,6 +5527,8 @@ _CLI_OPTIONS = {
 	'--x-defaults': ('defaults', True), '--defaults': ('defaults', True),
 	'--x-strict': ('strict', False), '-s': ('strict', False), '--strict': ('strict', False),
 	'--x-force': ('force', False), '-f': ('force', False), '--force': ('force', False),
+	'--x-direct': ('direct', False), '--x-idle-timeout': ('idleTimeout', True),
+	'--x-group': ('group', True), '--x-mode': ('mode', True), '--x-tcp': ('tcp', False),
 }
 _CLI_NEGATIVE_NUMBER_RE = re.compile(r'^-[0-9.]')
 _CLI_USAGE = 'usage: tsvz [OPTION ...] OPERATION STORE [ARG ...]   (tsvz -h for help)'
@@ -5190,6 +5555,8 @@ operations:
   popitem STORE [first|last]   pop the first or last live key (default: last)
   setdefault STORE KEY VALUE [VALUE ...]
                                print the row of KEY, setting it to the VALUEs if missing
+  serve STORE                  keep STORE loaded and answer requests on a local socket
+  stop STORE                   stop the server of STORE
 
 options:
   -h, --help                   show this help
@@ -5201,6 +5568,10 @@ options:
   --x-header H                 header to check, or to create a new file with
   --x-defaults D               defaults row KEY D1 D2 ... joined by the delimiter (KEY is ignored)
   --x-strict, --x-force        turn the 3.39 column and header checks on or off (default: off)
+  --x-direct                   work on the files even when a server runs
+  --x-idle-timeout S           serve: stop after S seconds without connections
+  --x-group G, --x-mode M      serve: let group G connect / set the socket's octal mode
+  --x-tcp                      serve: listen on 127.0.0.1 instead of a Unix socket
   --                           every argument after this is positional
   (--x-header and --x-defaults decode backslash escapes such as \\t)
 
@@ -5225,6 +5596,11 @@ class _CliArgs(object):
 		self.header = ''
 		self.defaults = None
 		self.strict = False
+		self.direct = False
+		self.idleTimeout = None
+		self.group = None
+		self.mode = None
+		self.tcp = False
 		self.operation = None
 		self.store = None
 		self.args = []
@@ -5317,7 +5693,7 @@ def _cliParseArgs(argv):
 		else:
 			raise _CliUsageError('unknown operation: neither {!r} nor {!r} is one of {}'.format(
 				positionals[0], positionals[1], ', '.join(_CLI_OPERATIONS)))
-	if args.operation in ('read', 'clear', 'scrub', 'verify', 'parts', 'len', 'keys') and args.args:
+	if args.operation in ('read', 'clear', 'scrub', 'verify', 'parts', 'len', 'keys', 'serve', 'stop') and args.args:
 		raise _CliUsageError('{} takes no arguments after STORE'.format(args.operation))
 	if args.operation == 'popitem' and args.args not in ([], ['first'], ['last']):
 		raise _CliUsageError('popitem takes first or last')
@@ -5753,10 +6129,66 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 	return status
 
 
+def _cliServe(args, delimiter, logger, stdin, stdout):
+	"""``serve STORE`` (spec §21.13): run a write handler for STORE in the foreground until it is stopped."""
+	try:
+		idle = float(args.idleTimeout) if args.idleTimeout else 0.0
+		mode = int(args.mode, 8) if args.mode else None
+		_serveGroup(args.group)
+	except (ValueError, KeyError) as e:
+		raise _CliUsageError('serve: bad --x-idle-timeout, --x-mode or --x-group ({})'.format(e))
+	handle = _ServeHandle(args.store, logger=logger, group=args.group, mode=mode, tcp=args.tcp, idleTimeout=idle)
+	try:
+		handle.lock()
+	except _ServeBusy as e:
+		info = e.args[0]
+		logger.teelog('tsvz: {}: already served by pid {} on host {}'.format(
+			args.store, info.get('pid', '?'), info.get('host', '?')), 'error')
+		return 1
+	restore = _serveSignals()  # before the pointer file announces this handler
+	try:
+		store = _ServeStore(args.store, delimiter=delimiter, header=args.header, createDefaults=args.defaults,
+							teeLogger=logger, verbose=args.verbose, create=True)
+		handle.start(store)
+		logger.teelog('tsvz: serving {} at {} (pid {})'.format(args.store, handle.address, os.getpid()))
+		handle.serve()
+	except (KeyboardInterrupt, _ServeSignal):
+		pass
+	finally:
+		restore()
+		handle.close()
+	logger.teelog('tsvz: stopped serving {}'.format(args.store))
+	return 0
+
+
+def _cliStop(args, delimiter, logger, stdin, stdout):
+	"""``stop STORE`` (spec §21.13): ask the handler of STORE to stop, and wait until it has."""
+	info = _serveFind(args.store)
+	if info is None:
+		logger.teelog('tsvz: {}: no handler is running'.format(args.store), 'error')
+		return 1
+	try:
+		connection = _ServeConnection(info)
+	except _ServeUnreachable as e:
+		logger.teelog('tsvz: {}: the handler does not answer ({})'.format(args.store, e), 'error')
+		return 1
+	try:
+		status = connection.request('stop')[2]
+	except _ServeLost as e:
+		logger.teelog('tsvz: {}: {}'.format(args.store, e), 'error')
+		return 1
+	finally:
+		connection.close()
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline and (_serveFind(args.store) or {}).get('pid') == info.get('pid'):
+		time.sleep(0.05)
+	return 0 if status == 0 else 1
+
+
 _CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
 				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts,
 				 'has': _cliEngineOp, 'len': _cliEngineOp, 'keys': _cliEngineOp, 'pop': _cliEngineOp,
-				 'popitem': _cliEngineOp, 'setdefault': _cliEngineOp}
+				 'popitem': _cliEngineOp, 'setdefault': _cliEngineOp, 'serve': _cliServe, 'stop': _cliStop}
 
 
 def _cliMain(argv, stdin=None, stdout=None, stderr=None):
