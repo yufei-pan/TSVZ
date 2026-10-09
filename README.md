@@ -44,11 +44,16 @@ t.close()
 ```
 
 ```bash
-tsvz people.tsvz                        # read and pretty-print
-tsvz people.tsvz append carol Carol 5   # add or update a row
-tsvz people.tsvz delete carol           # tombstone
-tsvz people.tsvz clear                  # empty it, keeping the header and markers
-tsvz people.tsvz scrub                  # compact it (for .tsvz: archival maintenance)
+tsvz set people.tsvz carol Carol 5        # add or update a row (append is the same)
+tsvz get people.tsvz carol                # one row; exit 3 if carol is missing
+tsvz read people.tsvz                     # every row: a table on a terminal, records in a pipe
+tsvz delete people.tsvz carol             # tombstone
+tsvz read people.tsvz | tsvz set copy.tsvz -   # copy every row
+tsvz clear people.tsvz                    # empty it, keeping the header and markers
+tsvz scrub people.tsvz                    # compact it (for .tsvz: archival maintenance)
+tsvz verify people.tsvz                   # check #_checksum_*_# segments; exit 4 on a mismatch
+tsvz parts events.tsvz                    # list the parts of a multi-part store
+tsvz people.tsvz append carol Carol 5     # the 3.39 form still works
 tsvz -V
 ```
 
@@ -63,7 +68,7 @@ tsvz -V
 - **Writes** one file: the named file, or the highest-numbered part of a
   multi-part store. Rows are written as given (no padding); a lone key is a
   tombstone; a row of empty cells (`k\t\t`) is a live row.
-- **Compaction is manual.** `scrubTabularFile` / `tsvz f.tsvz scrub` rewrites a
+- **Compaction is manual.** `scrubTabularFile` / `tsvz scrub f.tsvz` rewrites a
   single-part store in place (same inode). If another writer commits while it
   runs, it reads the store again; after three tries it writes nothing, with a
   warning (`clearTabularFile` does the same). The automatic rewrite options of
@@ -75,6 +80,34 @@ tsvz -V
 - **`#` keys** are stored (`<#>key`). Keys of the form `#_name_#` are marker
   writes: `t['#_defaults_#'] = [...]` sets the defaults, and so does
   `setDefaults([...])` once the object is constructed.
+
+## Command line
+
+`tsvz` follows [tsvz-spec-v1 §20](tsvz-spec-v1.md#20-command-line-interface):
+`tsvz [OPTION ...] OPERATION STORE [ARG ...]`, with options anywhere before a
+lone `--`. The 3.39 form `tsvz STORE [OPERATION] [ARG ...]` works too; a store
+named like an operation then needs a path prefix (`./read`).
+
+- **stdout carries only rows.** It gets a table on a terminal and records
+  otherwise; `--format table|records` overrides. Records use the store's
+  delimiter and escaping, so `tsvz read A | tsvz set B -` copies a store of
+  the same variant.
+- **stderr carries every message.** `-q` prints errors only; `-v` adds detail.
+- **Exit status:**
+  - 0: done.
+  - 1: failed or refused. Also a missing store for `read`, `get`, `scrub`, `verify` and `parts`.
+  - 2: usage error.
+  - 3: `get` found a missing key.
+  - 4: `verify` found a checksum mismatch.
+- **Arguments are literal.** `tsvz set s.tsvz k 'a<b'` stores `a<b`. Values may
+  begin with `-` (`-5`); after `--` every argument is positional. `set KEY`
+  alone deletes KEY, as in 3.39; `set KEY ''` stores an empty cell.
+- **Bulk input.** `set STORE -` and `delete STORE -` read records or keys from
+  stdin and append them in one write. An unterminated last line is ignored,
+  with a warning.
+- **TSVZ extensions:**
+  - `--x-header H` and `--x-defaults KEY<d>D1<d>...` decode backslash escapes such as `\t`;
+  - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
 
 ## Fault tolerance
 
@@ -121,6 +154,21 @@ part, and a delimiter or encoding argument that conflicts with the extension.
 | S10 | Files named `x.tsvz.<hex>` beside `x.tsvz` are read as parts of the store. |
 | S11 | `lastLineOnly` reads forward (slower on large files). |
 
+### The `tsvz` command
+
+Every 3.39 command line still parses, except the ones C5 lists.
+
+| # | Change |
+|---|---|
+| C1 | `read` into a pipe or a file prints records instead of the table; `--format table` gives the table. |
+| C2 | Every message goes to stderr: "Created …", "File not found", header mismatches, warnings. |
+| C3 | `read` and `scrub` of a missing store exit 1 with a message (3.39: exit 0, and `read` printed "File not found" on stdout). |
+| C4 | `delete` deletes every KEY it is given (3.39: only the first). |
+| C5 | `append` or `delete` without a KEY, or with an empty KEY, is a usage error with exit 2 (3.39 wrote an empty line). |
+| C6 | A `clear` or `scrub` that writes nothing (one part of a multi-part store, a store that kept changing) exits 1. |
+| C7 | `-c/--header`, `--defaults`, `-s/--strict` and `-f/--force` are undocumented aliases of the `--x-` options. `--x-header` and `--x-defaults` keep non-ASCII text. |
+| C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
+
 ## Spec deviations and interpretations
 
 - §19.2.3c: scrub keeps the header comment (3.39 header verification needs it).
@@ -133,6 +181,10 @@ part, and a delimiter or encoding argument that conflicts with the extension.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - Invalid UTF-8 is replaced with U+FFFD (and reported).
 - v1 has no `<CR>` token, so a value whose last cell ends in `\r` loses it; values set through `TSVZed` are right-stripped, so this only affects rows passed raw to the append helpers.
+- §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
+- §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
+- §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
+- §20.3: a bulk input line with an empty key is skipped, with a warning.
 
 ## Tests
 
