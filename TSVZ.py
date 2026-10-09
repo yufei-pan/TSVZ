@@ -2199,8 +2199,6 @@ def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header=
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
-		if not _specEnsureStore(fileName, createIfNotExist, header, [DEFAULTS_INDICATOR_KEY], strict, teeLogger, delimiter):
-			return
 		records = []
 		for line in linesToAppend:
 			if isinstance(linesToAppend, dict):
@@ -2217,18 +2215,34 @@ def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header=
 			if not line:
 				continue
 			records.append(_specFormatRecord(line, delimiter, marker=bool(_MARKER_RE.match(line[0]))))
-		if not records:
-			if verbose:
-				__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
-			return
-		if any(header) and verifyHeader:
-			_specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger)
-		_, active = _storeParts(fileName, reporter)
-		_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter)
-		if verbose:
-			__teePrintOrNot(f"Appended {len(records)} lines to {fileName}",teeLogger=teeLogger)
+		_specAppendRecords(fileName, records, reporter, teeLogger=teeLogger, header=header,
+						   createIfNotExist=createIfNotExist, verifyHeader=verifyHeader, verbose=verbose,
+						   strict=strict, delimiter=delimiter)
 	finally:
 		reporter.flush()
+
+
+def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), createIfNotExist=False,
+					   verifyHeader=True, verbose=False, strict=True, delimiter='\t'):
+	"""Append formatted records (each without its '\\n') to the store in one write (spec §18.2).
+
+	The store is created first when ``createIfNotExist`` allows it (see
+	``_specEnsureStore``); ``header`` is a formatted header list. Returns False
+	when the store is missing and may not be created.
+	"""
+	if not _specEnsureStore(fileName, createIfNotExist, header, [DEFAULTS_INDICATOR_KEY], strict, teeLogger, delimiter):
+		return False
+	if not records:
+		if verbose:
+			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
+		return True
+	if any(header) and verifyHeader:
+		_specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger)
+	_, active = _storeParts(fileName, reporter)
+	_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter)
+	if verbose:
+		__teePrintOrNot(f"Appended {len(records)} lines to {fileName}",teeLogger=teeLogger)
+	return True
 
 
 def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
@@ -4614,15 +4628,95 @@ def _cliGet(args, delimiter, logger, stdin, stdout):
 	return 3 if missing else 0
 
 
+def _cliStdinLines(stdin, reporter):
+	"""The committed lines of ``stdin`` (spec §4.3, §20.3), decoded as UTF-8, without terminators.
+
+	An unterminated last line is dropped and reported; a leading byte order
+	mark is dropped.
+	"""
+	source = getattr(stdin, 'buffer', stdin)
+	data = source.read()
+	if isinstance(data, str):
+		data = data.encode('utf-8', 'surrogateescape')
+	lines = data.split(b'\n')
+	tail = lines.pop()
+	if tail:
+		reporter.note('stdin-tail', None, 'ignored an unterminated last line on standard input: {!r}'.format(tail[:80]))
+	if lines and lines[0].startswith(b'\xef\xbb\xbf'):
+		lines[0] = lines[0][3:]
+	return [_decodeLine(raw, reporter, 'line {}'.format(lineNo)) for lineNo, raw in enumerate(lines, 1)]
+
+
+def _cliStdinBatch(args, delimiter, logger, stdin, keysOnly):
+	"""Turn standard input into one batch for ``set STORE -`` / ``delete STORE -`` (spec §20.3).
+
+	A spec store gets formatted records: a data line's fields are decoded
+	(§13) and written again as ``set`` writes them, and a line whose first
+	field matches the reserved pattern is a marker line, written as given. A
+	loose file gets 3.39 rows. Comment lines and empty lines are skipped, and
+	so is a line with an empty key (reported). ``keysOnly`` keeps the first
+	field only: a tombstone, or a marker reset.
+	"""
+	spec = _isSpecPath(args.store)
+	source = _Reporter('<stdin>', logger)
+	batch = []
+	try:
+		for lineNo, text in enumerate(_cliStdinLines(stdin, source), 1):
+			fields = text.split(delimiter)
+			if keysOnly:
+				fields = fields[:1]
+			first = fields[0]
+			if _MARKER_RE.match(first):
+				batch.append(delimiter.join(fields) if spec else _unsanitize(fields, delimiter))
+				continue
+			if first.startswith('#') or not text:
+				continue
+			cells = [_specDecodeField(field, delimiter) for field in fields] if spec else _unsanitize(fields, delimiter)
+			if not cells[0]:
+				source.note('empty-key', 'line {}'.format(lineNo), 'skipped a line with an empty key')
+				continue
+			batch.append(_specFormatRecord(cells, delimiter) if spec else cells)
+	finally:
+		source.flush()
+	return batch
+
+
+def _cliAppendBatch(args, delimiter, logger, batch):
+	"""Append ``batch`` from ``_cliStdinBatch`` to STORE in one write, creating STORE if needed."""
+	if not _isSpecPath(args.store):
+		appendLinesTabularFile(args.store, batch, teeLogger=logger, header=args.header, createIfNotExist=True,
+							   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
+		return
+	reporter = _Reporter(args.store, logger)
+	try:
+		_specAppendRecords(args.store, batch, reporter, teeLogger=logger,
+						   header=_formatHeader(args.header, delimiter=delimiter), createIfNotExist=True,
+						   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
+	finally:
+		reporter.flush()
+
+
 def _cliSet(args, delimiter, logger, stdin, stdout):
-	"""``set`` / ``append STORE KEY [VALUE ...]`` (spec §20.2): one record; a lone KEY is a tombstone."""
+	"""``set`` / ``append STORE KEY [VALUE ...]`` (spec §20.2): one record; a lone KEY is a tombstone.
+
+	``set STORE -`` appends every record on standard input in one write (§20.3).
+	"""
+	if args.args == ['-']:
+		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=False))
+		return 0
 	appendTabularFile(args.store, args.args, teeLogger=logger, header=args.header, createIfNotExist=True,
 					  verbose=args.verbose, strict=args.strict, delimiter=delimiter)
 	return 0
 
 
 def _cliDelete(args, delimiter, logger, stdin, stdout):
-	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended as one write."""
+	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended in one write.
+
+	``delete STORE -`` deletes the first field of every line on standard input (§20.3).
+	"""
+	if args.args == ['-']:
+		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
+		return 0
 	appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
 						   createIfNotExist=True, verbose=args.verbose, strict=args.strict, delimiter=delimiter)
 	return 0

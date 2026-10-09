@@ -2462,5 +2462,73 @@ def test_cli_non_ascii_under_the_c_locale(tmp_path):
 	assert r.returncode == 0 and '中'.encode('utf-8') in r.stdout and b'Traceback' not in r.stderr
 
 
+# ==========================================================================
+# CLI (spec §20.3): bulk input
+# ==========================================================================
+def test_cli_bulk_set_and_delete(tmp_path):
+	p = str(tmp_path / 'b.tsvz')
+	data = ('# a comment\n'
+			'\n'
+			'alice\tAlice\t30\n'
+			'<#>_x_#\tdata, not a marker\n'
+			'#_defaults_#\t\tNA\n'
+			'bob\n'
+			'carol\ta<sep>b\tx<lt>y\n'
+			'\tno key\n'
+			'dave\tunterminated')
+	status, out, err = _run('set', p, '-', stdin=data)
+	assert (status, out) == (0, '')
+	assert open(p, 'rb').read() == (b'alice\tAlice\t30\n<#>_x_#\tdata, not a marker\n#_defaults_#\t\tNA\nbob\n'
+									b'carol\ta<sep>b\tx<lt>y\n')
+	assert 'unterminated' in err and 'empty key' in err
+	status, out, err = _run('delete', p, '-', stdin='alice\tignored\n# comment\n<#>_x_#\n#_defaults_#\n')
+	assert (status, out, err) == (0, '', '')
+	assert open(p, 'rb').read().endswith(b'carol\ta<sep>b\tx<lt>y\nalice\n<#>_x_#\n#_defaults_#\n')
+	assert _run('read', p) == (0, 'carol\ta<sep>b\tx<lt>y\n', '')
+	q = str(tmp_path / 'b.csv')
+	assert _run('set', q, '-', stdin='k,a<sep>b\n# c\nj,x\n')[0] == 0
+	assert open(q, 'rb').read() == b'\nk,a<sep>b\nj,x\n'  # 3.39 starts a header-less file with '\n'
+	assert _run('delete', q, '-', stdin='k,whatever\n')[0] == 0
+	assert _run('read', q) == (0, 'j,x\n', '')
+	fresh = str(tmp_path / 'fresh.tsvz')
+	assert _run('set', fresh, '-', stdin='')[0] == 0 and open(fresh, 'rb').read() == b''
+
+
+def test_cli_bulk_set_is_one_batch(tmp_path, monkeypatch):
+	"""Review focus 4: 10 000 records on stdin reach the store in one append (spec §18.2, §20.3)."""
+	p = str(tmp_path / 'big.tsvz')
+	payloads = []
+	real = TSVZ._specAppendPayload
+
+	def spy(path, payload, reporter, **kwargs):
+		payloads.append(payload)
+		return real(path, payload, reporter, **kwargs)
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', spy)
+	data = ''.join('k{}\tv{}\n'.format(i, i) for i in range(10000))
+	assert _run('set', p, '-', stdin=data)[0] == 0
+	assert len(payloads) == 1 and payloads[0] == data.encode()
+	assert open(p, 'rb').read() == data.encode()
+	assert _run('delete', p, '-', stdin=data)[0] == 0
+	assert len(payloads) == 2 and _run('read', p) == (0, '', '')
+
+
+@pytest.mark.parametrize('ext', ['tsvz', 'csvz', 'nsvz', 'psvz'])
+def test_cli_read_piped_into_set_copies_the_store(tmp_path, ext):
+	"""Spec §20.3.2: `tsvz read A | tsvz set B -` copies every live row of a same-variant store."""
+	src = str(tmp_path / ('a.' + ext))
+	dst = str(tmp_path / ('b.' + ext))
+	rows = [['alice', 'A, l|i\tce', '30'], ['#hash', '<sep>', 'multi\nline'], ['k', '', 'x<y'],
+			['nul', 'a\0b', 'é 中 \U0001F600'], ['#_x_#', 'a key, not a marker', '']]
+	TSVZ.appendLinesTabularFile(src, rows[:4], createIfNotExist=True)
+	with open(src, 'ab') as f:  # a '#_x_#' data key can only be written in its encoded form
+		f.write(TSVZ._specFormatRecord(rows[4], TSVZ._EXTENSION_DELIMITERS[ext]).encode('utf-8') + b'\n')
+	status, out, _ = _run('read', src)
+	assert status == 0
+	assert _run('set', dst, '-', stdin=out)[0] == 0
+	expected = list(TSVZ.readTabularFile(src, verifyHeader=False).items())
+	assert '#_x_#' in dict(expected)
+	assert list(TSVZ.readTabularFile(dst, verifyHeader=False).items()) == expected
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
