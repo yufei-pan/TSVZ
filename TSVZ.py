@@ -15,6 +15,7 @@ API: ``TSVZed``, ``TSVZedLite``, ``readTabularFile`` and friends.
 import atexit
 import bisect
 import codecs
+import contextlib
 import functools
 import hashlib
 import io
@@ -2329,17 +2330,27 @@ def _specRoundTrips(cells, state):
 def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
 						  verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=False,
 						  delimiter=..., defaults=..., correctColumnNum=-1):
-	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7).
-
-	The store is read without a lock and rewritten in place only if no other
-	writer changed it since the read (else it is read again, up to
-	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
-	never compacted away.
-	"""
+	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7)."""
 	if lastLineOnly:
 		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									lastLineOnly=True, verifyHeader=verifyHeader, verbose=verbose, encoding=encoding,
 									strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum)
+	return _specScrub(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
+					  verifyHeader=verifyHeader, verbose=verbose, taskDic=taskDic, encoding=encoding,
+					  strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum)[0]
+
+
+def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, verifyHeader=True, verbose=False,
+			   taskDic=None, encoding='utf8', strict=False, delimiter=..., defaults=..., correctColumnNum=-1):
+	"""Compact a single-part store in place; return ``(taskDic, done)``.
+
+	The store is read without a lock and rewritten in place only if no other
+	writer changed it since the read (else it is read again, up to
+	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
+	never compacted away. ``done`` is False when nothing was written because
+	the store is missing, has several parts (or the path names one part), or
+	kept changing.
+	"""
 	if taskDic is None:
 		taskDic = {}
 	reporter = _Reporter(fileName, teeLogger)
@@ -2349,7 +2360,7 @@ def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		initial = _normalizeDefaults(defaults, delimiter)
 		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
-			return taskDic
+			return taskDic, False
 		name = _parsePartName(fileName)
 		given = list(taskDic.items()) if taskDic else []
 		for tries in range(_SPEC_REWRITE_ATTEMPTS):
@@ -2364,7 +2375,7 @@ def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
 				attempt.note('multipart', None, 'scrub skipped: 4.1 does not compact multi-part stores or single parts of them; nothing was written')
-				return taskDic
+				return taskDic, False
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
 			state = load.state
@@ -2383,13 +2394,13 @@ def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=
 				continue  # another writer committed after the read
 			if verbose:
 				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
-			return taskDic
+			return taskDic, True
 		attempt.note('changing', None, 'scrub skipped: the store kept changing while it was being compacted; nothing was written')
 	finally:
 		reporter.flush()
 		if attempt is not None:
 			attempt.flush()
-	return taskDic
+	return taskDic, False
 
 
 def getListView(tsvzDic,header = [],delimiter = ...):
@@ -4515,59 +4526,220 @@ def _cliEmitFields(rows, header, args, stdout):
 	_cliWrite(stdout, ''.join('\t'.join(_specEncodeField(str(field), '\t') for field in row) + '\n' for row in rows))
 
 
-def __main__():
-	import argparse
-	parser = argparse.ArgumentParser(description='TSVZ: a TSV / CSV / NSV / PSV key-value file manager (.tsvz / .csvz / .nsvz / .psvz follow tsvz-spec-v1)')
-	parser.add_argument('filename', type=str, help='The file to read')
-	parser.add_argument('operation', type=str,nargs='?', choices=['read','append','delete','clear','scrub'], help='The operation to perform. Note: scrub will also remove all comments. Default: read', default='read')
-	parser.add_argument('line', type=str, nargs='*', help='The line to append to the Tabular file. it follows as : {key} {value1} {value2} ... if a key without value be inserted, the value will get deleted.')
-	parser.add_argument('-d', '--delimiter', type=str, help='The delimiter of the Tabular file. Default: Infer from last part of filename, or tab if cannot determine. Note: accept unicode escaped char, raw char, or string "comma,tab,null" will refer to their characters. ', default=...)
-	parser.add_argument('-c', '--header', type=str, help='Perform checks with this header of the Tabular file. seperate using --delimiter.')
-	parser.add_argument('--defaults', type=str, help='Default values to fill in the missing columns. seperate using --delimiter. Ex. if -d = comma, --defaults="key,value1,value2..." Note: Please specify the key. But it will not be used as a key need to be unique in data.')
-	strictMode = parser.add_mutually_exclusive_group()
-	strictMode.add_argument('-s', '--strict', dest = 'strict',action='store_true', help='Strict mode. Do not parse values that seems malformed, check for column numbers / headers')
-	strictMode.add_argument('-f', '--force', dest = 'strict',action='store_false', help='Force the operation. Ignore checks for column numbers / headers')
-	parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
-	parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by {author}')
-	try:
-		import argcomplete
-		argcomplete.autocomplete(parser,always_complete_options='long')
-	except ImportError:
-		pass
-	args = parser.parse_args()
-	args.delimiter = get_delimiter(delimiter=args.delimiter,file_name=args.filename)
-	if args.header and args.header.endswith('\\'):
-		args.header += '\\'
-	try:
-		header = args.header.encode().decode('unicode_escape') if args.header else ''
-	except Exception:
-		print(f"Failed to decode header: {args.header}")
-		header = ''
-	defaults = []
-	if args.defaults:
-		try:
-			defaults = args.defaults.encode().decode('unicode_escape').split(args.delimiter)
-		except Exception:
-			print(f"Failed to decode defaults: {args.defaults}")
-			defaults = []
+class _CliStoreMissing(Exception):
+	"""An operation that reads a store found none at STORE (spec §20.2.2, exit status 1)."""
 
-	if args.operation == 'read':
-		# check if the file exist (a .tsvz store may consist of numbered parts only)
-		if not (_storeParts(args.filename)[0] if _isSpecPath(args.filename) else os.path.isfile(args.filename)):
-			print(f"File not found: {args.filename}")
-			return
-		# read the file
-		data = readTabularFile(args.filename, verifyHeader = False, verbose=args.verbose,strict= args.strict, delimiter=args.delimiter, defaults=defaults)
-		print(pretty_format_table(data.values(),delimiter=args.delimiter))
-	elif args.operation == 'append':
-		appendTabularFile(args.filename, args.line,createIfNotExist = True, header=header, verbose=args.verbose, strict= args.strict, delimiter=args.delimiter)
-	elif args.operation == 'delete':
-		appendTabularFile(args.filename, args.line[:1],createIfNotExist = True, header=header, verbose=args.verbose, strict= args.strict, delimiter=args.delimiter)
-	elif args.operation == 'clear':
-		clearTabularFile(args.filename, header=header, verbose=args.verbose, verifyHeader=args.strict, delimiter=args.delimiter)
-	elif args.operation == 'scrub':
-		scrubTabularFile(args.filename, verifyHeader = False, verbose=args.verbose,strict= args.strict, delimiter=args.delimiter, defaults=defaults)
+
+def _cliDecodeEscapes(text, label, logger):
+	"""Decode backslash escapes in an extension option's value as 3.39 did (``-c 'id\\tval'``).
+
+	Unlike 3.39, non-ASCII text survives. A value that does not decode is
+	reported and ignored ('' is returned), as in 3.39.
+	"""
+	if text.endswith('\\'):
+		text += '\\'
+	try:
+		return codecs.decode(text.encode('latin-1', 'backslashreplace'), 'unicode_escape')
+	except Exception:
+		logger.teelog('tsvz: failed to decode {} {!r}; ignored'.format(label, text), 'warning')
+		return ''
+
+
+def _cliDelimiter(args, logger):
+	"""STORE's delimiter: a strict extension's own (spec §5.1, §20.7), else ``-d``, else inferred from the name."""
+	if _isSpecPath(args.store):
+		expected = _EXTENSION_DELIMITERS[_parsePartName(args.store).ext]
+		if args.delimiter is not ... and args.delimiter and get_delimiter(args.delimiter) != expected:
+			logger.teelog('TSVZ warning: {}: -d {!r} conflicts with the file extension; using {!r} (spec §5.1)'.format(
+				args.store, args.delimiter, expected), 'warning')
+		return expected
+	return get_delimiter(args.delimiter, file_name=args.store)
+
+
+def _cliStoreExists(store):
+	"""True when STORE exists; a spec store may consist of numbered parts only (spec §17.1)."""
+	if _isSpecPath(store):
+		return bool(_storeParts(store)[0])
+	return os.path.isfile(store)
+
+
+def _cliRead(args, delimiter, logger, stdin, stdout):
+	"""``read STORE`` (spec §20.2): every live row, in first-appearance order."""
+	if not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
+						   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
+	_cliEmitRows(list(data.values()), args, stdout, _isSpecPath(args.store), delimiter)
+	return 0
+
+
+def _cliGet(args, delimiter, logger, stdin, stdout):
+	"""``get STORE KEY ...`` (spec §20.2): each KEY's row in argument order; exit 3 when one is missing.
+
+	Keys resolve as a reader resolves them (§7.7). For a missing key of a
+	spec store this prints what ``TSVZed`` returns for it (§14.5): the key and
+	the active defaults while ``#_return_defaults_when_missing_#`` is true,
+	else nothing. A missing key of a loose file prints nothing.
+	"""
+	if not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	spec = _isSpecPath(args.store)
+	if spec:
+		reporter = _Reporter(args.store, logger)
+		try:
+			load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
+							 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
+		finally:
+			reporter.flush()
+		data, state = load.data, load.state
 	else:
-		print("Invalid operation")    
+		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
+							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
+	rows = []
+	missing = False
+	for key in args.args:
+		if spec:
+			key = key.rstrip(' \t') if state.strip else key
+		else:
+			key = key.rstrip()
+		row = data.get(key)
+		if row is None:
+			missing = True
+			if not (spec and state.returnDefaults):
+				continue
+			row = [key] + list(state.defaults[1:])
+			row += [''] * (load.correctColumnNum - len(row))
+		rows.append(row)
+	_cliEmitRows(rows, args, stdout, spec, delimiter)
+	return 3 if missing else 0
+
+
+def _cliSet(args, delimiter, logger, stdin, stdout):
+	"""``set`` / ``append STORE KEY [VALUE ...]`` (spec §20.2): one record; a lone KEY is a tombstone."""
+	appendTabularFile(args.store, args.args, teeLogger=logger, header=args.header, createIfNotExist=True,
+					  verbose=args.verbose, strict=args.strict, delimiter=delimiter)
+	return 0
+
+
+def _cliDelete(args, delimiter, logger, stdin, stdout):
+	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended as one write."""
+	appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
+						   createIfNotExist=True, verbose=args.verbose, strict=args.strict, delimiter=delimiter)
+	return 0
+
+
+def _cliClear(args, delimiter, logger, stdin, stdout):
+	"""``clear STORE`` (spec §20.2); exit 1 when it was refused and nothing was written."""
+	if not _isSpecPath(args.store):
+		clearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
+						 verbose=args.verbose, delimiter=delimiter)
+		return 0
+	if _specClearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
+							 verbose=args.verbose, delimiter=delimiter):
+		return 0
+	logger.teelog('tsvz: {}: clear refused; nothing was written'.format(args.store), 'error')
+	return 1
+
+
+def _cliScrub(args, delimiter, logger, stdin, stdout):
+	"""``scrub STORE`` (spec §20.2): compact a single-part store in place; exit 1 when refused."""
+	if not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	if not _isSpecPath(args.store):
+		scrubTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
+						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
+		return 0
+	_, done = _specScrub(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
+						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
+	if done:
+		return 0
+	logger.teelog('tsvz: {}: scrub refused; nothing was written'.format(args.store), 'error')
+	return 1
+
+
+_CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
+				 'clear': _cliClear, 'scrub': _cliScrub}
+
+
+def _cliMain(argv, stdin=None, stdout=None, stderr=None):
+	"""Run one ``tsvz`` command line (spec §20) and return its exit status (§20.6).
+
+	The streams default to ``sys.stdin`` / ``sys.stdout`` / ``sys.stderr``.
+	Library messages printed to stdout for 3.39 compatibility go to stderr.
+	"""
+	stdin = sys.stdin if stdin is None else stdin
+	stdout = sys.stdout if stdout is None else stdout
+	stderr = sys.stderr if stderr is None else stderr
+	try:
+		args = _cliParseArgs(_cliDecodeArgv(argv))
+	except _CliUsageError as e:
+		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
+		return 2
+	if args.help:
+		_cliWrite(stdout, _CLI_HELP.format(version=version))
+		return 0
+	if args.version:
+		prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else 'tsvz'
+		_cliWrite(stdout, '{} {} @ {} by {}\n'.format(prog, version, COMMIT_DATE, author))
+		return 0
+	logger = _CliLogger(stderr, quiet=args.quiet)
+	try:
+		with contextlib.redirect_stdout(stderr):
+			delimiter = _cliDelimiter(args, logger)
+			args.header = _cliDecodeEscapes(args.header, '--x-header', logger) if args.header else ''
+			if args.defaults:
+				# 3.39's --defaults names the key column first; it is never used.
+				values = _cliDecodeEscapes(args.defaults, '--x-defaults', logger).split(delimiter)
+				args.defaults = [DEFAULTS_INDICATOR_KEY] + values[1:]
+			else:
+				args.defaults = []
+			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+	except _CliStoreMissing:
+		logger.teelog('tsvz: {}: no such store'.format(args.store), 'error')
+	except BrokenPipeError:
+		# The reader went away (``tsvz read big | head -1``). Point stdout at
+		# devnull so the interpreter's final flush cannot raise again.
+		try:
+			os.dup2(os.open(os.devnull, os.O_WRONLY), stdout.fileno())
+		except Exception:
+			pass
+	except KeyboardInterrupt:
+		return 130
+	except Exception as e:
+		logger.teelog('tsvz: {}: {}'.format(args.store, str(e) or type(e).__name__), 'error')
+		if args.verbose:
+			import traceback
+			logger.teelog(traceback.format_exc().rstrip(), 'error')
+	return 1
+
+
+def _cliComplete():
+	"""Shell completion through argcomplete when it is installed and driving this process (as in 3.39)."""
+	if '_ARGCOMPLETE' not in os.environ:
+		return
+	try:
+		import argparse
+		import argcomplete
+	except ImportError:
+		return
+	parser = argparse.ArgumentParser(prog='tsvz')
+	parser.add_argument('operation', choices=_CLI_OPERATIONS)
+	parser.add_argument('store')
+	parser.add_argument('args', nargs='*')
+	parser.add_argument('-V', '--version', action='store_true')
+	parser.add_argument('--format', choices=('table', 'records'))
+	parser.add_argument('-q', '--quiet', action='store_true')
+	parser.add_argument('-v', '--verbose', action='store_true')
+	parser.add_argument('-d', '--delimiter')
+	parser.add_argument('--x-header')
+	parser.add_argument('--x-defaults')
+	parser.add_argument('--x-strict', action='store_true')
+	parser.add_argument('--x-force', action='store_true')
+	argcomplete.autocomplete(parser, always_complete_options='long')
+
+
+def __main__():
+	_cliComplete()
+	sys.exit(_cliMain(sys.argv[1:]))
 if __name__ == '__main__':
 	__main__()

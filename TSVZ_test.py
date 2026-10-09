@@ -1845,16 +1845,30 @@ def test_cli_reads_a_store_made_of_numbered_parts_only(tmp_path):
 
 
 def test_cli_legacy_matches_339(tmp_path):
+	"""3.39 file-first command lines leave 3.39's bytes and print 3.39's text (spec §20.1.5).
+
+	Two listed CLI changes apply: 4.1 prints diagnostics on stderr, and prints
+	records into a pipe (``--format table`` asks for 3.39's table). Options
+	follow the positionals: 3.39's argparse rejects ``STORE -c H append ...``
+	on Python 3.6 and 3.7.
+	"""
+	steps = (['append', 'k', 'v', '-c', 'id\\tval'], ['append', 'j', 'w'], ['delete', 'k'], ['read'],
+			 ['scrub'], ['read'], ['clear', '-c', 'id\\tval'])
 	results = []
 	for script in ('TSVZ.py', 'TSVZ_old.py'):
 		d = tmp_path / script.split('.')[0]
 		d.mkdir()
 		p = str(d / 'c.tsv')
 		outputs = []
-		for args in (['-c', 'id\\tval', 'append', 'k', 'v'], ['append', 'j', 'w'], ['delete', 'k'], ['read'],
-					 ['scrub'], ['read'], ['clear', '-c', 'id\\tval']):
-			r = _cli(p, *args, script=script)
-			outputs.append((r.returncode, r.stdout.replace(str(d), 'D')))
+		for args in steps:
+			if script == 'TSVZ.py':
+				r = _cli(p, *(args + ['--format', 'table']), script=script)
+				assert 'Created' not in r.stdout
+				text = r.stdout + r.stderr
+			else:
+				r = _cli(p, *args, script=script)
+				text = r.stdout
+			outputs.append((r.returncode, text.replace(str(d), 'D')))
 		results.append((outputs, open(p, 'rb').read()))
 	assert results[0] == results[1]
 
@@ -2258,6 +2272,194 @@ def test_cli_logger_and_writers():
 	TSVZ._cliEmitRows([['k', 'v']], args, out, True, '\t')
 	assert out.getvalue() == 'k | v\n--+--\n\n'
 	assert TSVZ._cliFormat(TSVZ._CliArgs(), io.StringIO()) == 'records'
+
+
+# ==========================================================================
+# CLI (spec §20): operations
+# ==========================================================================
+def _run(*argv, stdin=''):
+	"""Run the CLI in-process; return (exit status, stdout, stderr)."""
+	out, err = io.StringIO(), io.StringIO()
+	status = TSVZ._cliMain(list(argv), stdin=io.StringIO(stdin), stdout=out, stderr=err)
+	return status, out.getvalue(), err.getvalue()
+
+
+def test_cli_read_and_get_a_spec_store(tmp_path):
+	p = str(tmp_path / 'g.tsvz')
+	_touch(p, b'#_defaults_#\t\tNA\nalice\tAlice\t30\nbob\tBob\n<#>tag\ta<sep>b\n')
+	assert _run('read', p) == (0, 'alice\tAlice\t30\nbob\tBob\tNA\n<#>tag\ta<sep>b\tNA\n', '')
+	assert _run(p) == _run('read', p)  # file-first form; read is the default
+	assert _run('get', p, 'bob', 'alice  ', '#tag') == (0, 'bob\tBob\tNA\nalice\tAlice\t30\n<#>tag\ta<sep>b\tNA\n', '')
+	# Spec §14.5: a missing key prints the key and the active defaults; exit 3.
+	assert _run('get', p, 'carol', 'alice') == (3, 'carol\t\tNA\nalice\tAlice\t30\n', '')
+	with open(p, 'ab') as f:
+		f.write(b'#_return_defaults_when_missing_#\tfalse\n')
+	assert _run('get', p, 'carol') == (3, '', '')
+	q = str(tmp_path / 'd.tsvz')
+	_touch(q, b'a\tx\n')
+	assert _run('read', q, '--x-defaults', 'key\\tD1\\tD2') == (0, 'a\tx\tD2\n', '')
+	assert _run('read', q, '--defaults', 'key\\tD1\\tD2') == (0, 'a\tx\tD2\n', '')
+
+
+def test_cli_read_and_get_a_loose_file_and_missing_stores(tmp_path):
+	q = str(tmp_path / 'g.csv')
+	_touch(q, b'alice,Alice,30\nbob,B<sep>ob,\n')
+	assert _run('read', q) == (0, 'alice,Alice,30\nbob,B<sep>ob,\n', '')
+	assert _run('get', q, 'bob ', 'nobody') == (3, 'bob,B<sep>ob,\n', '')
+	for argv in (['read', 'none.tsvz'], ['get', 'none.tsvz', 'k'], ['scrub', 'none.tsvz'],
+				 ['read', 'none.tsv'], ['get', 'none.tsv', 'k'], ['scrub', 'none.tsv']):
+		argv[1] = str(tmp_path / argv[1])
+		status, out, err = _run(*argv)
+		assert (status, out) == (1, '') and 'no such store' in err
+	assert sorted(os.listdir(str(tmp_path))) == ['g.csv']
+
+
+def test_cli_set_append_and_delete(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	for argv in (['set', p, 'alice', 'Alice', '30'], ['append', p, 'bob', ''], ['set', p, '#_defaults_#', '', 'NA'],
+				 ['set', p, '#tag', 'a\tb', 'x<y'], ['set', p, 'carol', '-5'], ['set', p, 'dave'],
+				 ['delete', p, 'alice', 'nobody']):
+		status, out, _ = _run(*argv)
+		assert (status, out) == (0, '')
+	assert open(p, 'rb').read() == (b'alice\tAlice\t30\nbob\t\n#_defaults_#\t\tNA\n<#>tag\ta<sep>b\tx<lt>y\n'
+									b'carol\t-5\ndave\nalice\nnobody\n')
+	assert _run('read', p) == (0, 'bob\t\t\n<#>tag\ta<sep>b\tx<lt>y\ncarol\t-5\tNA\n', '')
+	fresh = str(tmp_path / 'fresh.tsvz')
+	assert _run('delete', fresh, 'k')[0] == 0  # delete creates a missing store (spec §20.2.2)
+	assert open(fresh, 'rb').read() == b'k\n'
+	q = str(tmp_path / 's.tsv')
+	assert _run(q, 'append', 'k', 'v', '-c', 'id\\tval')[0] == 0  # 3.39 file-first form and -c
+	assert _run(q, 'delete', 'k', '-c', 'id\\tval')[0] == 0
+	assert open(q, 'rb').read() == b'id\tval\nk\tv\nk\t\n'
+
+
+def test_cli_store_paths_and_values_that_look_like_options(tmp_path, monkeypatch):
+	"""Review focus 2 and 3: values after '--', paths with spaces, a store named like an operation."""
+	monkeypatch.chdir(str(tmp_path))
+	assert _run('set', 'my store.tsvz', 'k', 'v')[0] == 0
+	assert _run('set', 'my store.tsvz', '--', 'e', '-v', '--x')[0] == 0
+	assert _run('read', 'my store.tsvz') == (0, 'k\tv\ne\t-v\t--x\n', '')
+	assert _run('set', './read', 'k', 'v')[0] == 0
+	# [:2]: 3.39 warns on stderr that the name does not end with .tsv
+	assert _run('./read')[:2] == (0, 'k\tv\n')
+	assert _run('read', './read')[:2] == (0, 'k\tv\n')
+
+
+def test_cli_clear_and_scrub(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, b'#id\tval\n#_strip_trailing_whites_#\tfalse\na\t1\nb\t2\na\n')
+	assert _run('scrub', p) == (0, '', '')
+	assert open(p, 'rb').read() == b'#id\tval\n#_version_#\t1\n#_strip_trailing_whites_#\tfalse\nb\t2\n'
+	assert _run('clear', p) == (0, '', '')
+	assert open(p, 'rb').read() == b'#id\tval\n#_strip_trailing_whites_#\tfalse\n'
+	fresh = str(tmp_path / 'fresh.tsvz')
+	assert _run('clear', fresh)[0] == 0 and open(fresh, 'rb').read() == b''
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'a\t1\n')
+	_touch(m + '.1', b'b\t2\n')
+	status, out, err = _run('scrub', m)  # 4.1 refuses to compact a multi-part store
+	assert (status, out) == (1, '') and 'scrub skipped' in err and 'scrub refused' in err
+	assert open(m, 'rb').read() == b'a\t1\n' and open(m + '.1', 'rb').read() == b'b\t2\n'
+	assert _run('-q', 'scrub', m) == (1, '', 'tsvz: {}: scrub refused; nothing was written\n'.format(m))
+	status, _, err = _run('clear', m + '.1')  # one part of a multi-part store
+	assert status == 1 and 'clear skipped' in err
+	assert _run('clear', m)[0] == 0  # multi-part: a tombstone for every live key, appended
+	assert open(m + '.1', 'rb').read() == b'b\t2\na\nb\n'
+
+
+def test_cli_usage_errors_help_and_version(tmp_path):
+	p = str(tmp_path / 'u.tsvz')
+	for argv in (['frob', p], ['x-export', p], ['read', p, '--x-bogus'], ['--format', 'json', 'read', p],
+				 ['get', p], ['set', p, '', 'v']):
+		r = _cli(*argv)
+		assert (r.returncode, r.stdout) == (2, '') and 'usage: tsvz' in r.stderr
+	assert not os.path.exists(p)
+	r = _cli('-h')
+	assert (r.returncode, r.stderr) == (0, '') and r.stdout.startswith('usage: tsvz')
+	r = _cli('read', p, '--version')
+	assert r.returncode == 0 and '4.1' in r.stdout
+
+
+def test_cli_streams_and_verbosity(tmp_path):
+	p = str(tmp_path / 'o.tsvz')
+	r = _cli('set', p, 'k', 'v')
+	assert (r.returncode, r.stdout) == (0, '') and 'Created' in r.stderr
+	r = _cli('-q', 'set', p, 'j', 'w')
+	assert (r.returncode, r.stdout, r.stderr) == (0, '', '')
+	r = _cli('-v', 'set', p, 'i', 'x')
+	assert (r.returncode, r.stdout) == (0, '') and 'Appended 1 lines' in r.stderr
+	with open(p, 'ab') as f:
+		f.write(b'torn')
+	r = _cli('read', p)
+	assert (r.returncode, r.stdout) == (0, 'k\tv\nj\tw\ni\tx\n') and 'TSVZ warning' in r.stderr and 'torn' in r.stderr
+	r = _cli('-q', 'read', p)
+	assert (r.returncode, r.stdout, r.stderr) == (0, 'k\tv\nj\tw\ni\tx\n', '')
+	status, out, err = _run('read', p, '-d', 'comma')  # in-process: the warning text is not ASCII
+	assert (status, out) == (0, 'k\tv\nj\tw\ni\tx\n') and 'conflicts with the file extension' in err
+
+
+def test_cli_output_into_a_closed_pipe(tmp_path):
+	"""Review focus 5: a reader that closes the pipe early gets no traceback; the status is 1."""
+	p = str(tmp_path / 'big.tsvz')
+	_touch(p, b''.join(b'k%d\tv%d\n' % (i, i) for i in range(200000)))
+	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'read', p],
+							stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	first = proc.stdout.readline()
+	proc.stdout.close()
+	err = proc.stderr.read()
+	proc.wait()
+	assert first == b'k0\tv0\n'
+	assert proc.returncode == 1 and b'Traceback' not in err and b'Exception ignored' not in err
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='needs a pseudo-terminal')
+def test_cli_prints_a_table_on_a_terminal(tmp_path):
+	"""Spec §20.4.3: without --format, a terminal gets the table and a pipe gets records."""
+	import pty
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'alice\tAlice\t30\n')
+	master, slave = pty.openpty()
+	try:
+		proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'read', p],
+								stdout=slave, stderr=subprocess.DEVNULL)
+		os.close(slave)
+		out = b''
+		while True:
+			try:
+				chunk = os.read(master, 4096)
+			except OSError:  # EIO: the child closed the terminal
+				break
+			if not chunk:
+				break
+			out += chunk
+		proc.wait()
+	finally:
+		os.close(master)
+	assert proc.returncode == 0
+	assert b'Alice' in out and b'|' in out and b'\t' not in out
+	assert _cli('read', p).stdout == 'alice\tAlice\t30\n'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locales')
+def test_cli_non_ascii_under_the_c_locale(tmp_path):
+	"""Review focus 1: UTF-8 arguments, files and output survive LANG=C (ASCII argv and stdio on Python 3.6).
+
+	PYTHONUTF8=0 and PYTHONCOERCECLOCALE=0 give Python 3.7+ the 3.6 behaviour.
+	"""
+	env = dict(os.environ, LANG='C', LC_ALL='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+	env.pop('PYTHONIOENCODING', None)
+	p = str(tmp_path / 'u.tsvz')
+
+	def run(*args):
+		argv = [sys.executable, os.path.join(HERE, 'TSVZ.py')] + [a.encode('utf-8') for a in args]
+		return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+	r = run('set', p, 'é', '中', '\U0001F600')
+	assert r.returncode == 0 and b'Traceback' not in r.stderr
+	assert open(p, 'rb').read() == 'é\t中\t\U0001F600\n'.encode('utf-8')
+	r = run('get', p, 'é')
+	assert (r.returncode, r.stdout) == (0, 'é\t中\t\U0001F600\n'.encode('utf-8'))
+	r = run('read', p, '--format', 'table')
+	assert r.returncode == 0 and '中'.encode('utf-8') in r.stdout and b'Traceback' not in r.stderr
 
 
 if __name__ == '__main__':
