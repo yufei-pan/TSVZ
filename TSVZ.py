@@ -4951,9 +4951,205 @@ class _ServeStore(object):
 
 
 # ===========================================================================
+# Write handler (tsvz-spec-v1 §21): the protocol
+# ===========================================================================
+_SERVE_PROTOCOL_VERSION = 1
+#: A request or bulk line longer than this closes the connection (spec §21.10).
+_SERVE_LINE_LIMIT = 64 << 20
+#: operation -> (minimum, maximum) number of arguments (None: no maximum).
+_SERVE_ARITY = {
+	'read': (0, 0), 'len': (0, 0), 'keys': (0, 0), 'clear': (0, 0), 'scrub': (0, 0), 'verify': (0, 0),
+	'parts': (0, 0), 'stop': (0, 0), 'get': (1, None), 'set': (1, None), 'append': (1, None),
+	'delete': (1, None), 'has': (1, 1), 'pop': (1, 1), 'popitem': (0, 1), 'setdefault': (2, None),
+}
+_SERVE_UNREADABLE = 'could not read every part of the store'
+
+
+class _ServeUsage(Exception):
+	"""A request that does not follow spec §21.5 / §21.7 (status 2)."""
+
+
+def _serveEncode(value):
+	"""A protocol field (spec §21.4): §13 with TAB, a leading '#' left as written."""
+	return _specEncodeField(value, '\t')
+
+
+def _serveRecordLine(cells, marker):
+	"""A record as a protocol line: a marker key as written, a data key with ``<#>`` (spec §21.4)."""
+	if marker:
+		return '\t'.join([cells[0]] + [_serveEncode(cell) for cell in cells[1:]])
+	return _specFormatRecord(cells, '\t')
+
+
+def _serveFieldsLine(fields):
+	"""An output line of plain fields (``verify``, ``parts``): §13 with TAB, a leading '#' as ``<#>``."""
+	return '\t'.join([_specEncodeField(str(fields[0]), '\t', isKey=True)] + [_serveEncode(str(field)) for field in fields[1:]])
+
+
+def _serveDecodeLine(line):
+	"""The fields of a protocol record line, decoded per §13."""
+	return [_specDecodeField(field, '\t') for field in line.split('\t')]
+
+
+def _serveParseRequest(line):
+	"""Split a request line (spec §21.5) into ``(options, operation, args, rawArgs)``."""
+	raw = line.split('\t')
+	i = 0
+	while i < len(raw) and raw[i].startswith('--'):
+		i += 1
+	if i >= len(raw) or not raw[i]:
+		raise _ServeUsage('missing operation')
+	return raw[:i], raw[i], [_specDecodeField(field, '\t') for field in raw[i + 1:]], raw[i + 1:]
+
+
+def _serveNeedsBulk(line):
+	"""True when ``line`` is ``set -`` / ``append -`` / ``delete -``: record lines up to ``#`` follow."""
+	try:
+		_, operation, _, raw = _serveParseRequest(line)
+	except _ServeUsage:
+		return False
+	return operation in ('set', 'append', 'delete') and raw == ['-']
+
+
+class _ServeLog(object):
+	"""Per-request teeLogger: warnings and errors become ``#!`` lines and also go to ``logger``."""
+
+	def __init__(self, logger=None):
+		self.logger = logger
+		self.lines = []
+
+	def teelog(self, message, level='info', callerStackDepth=None):
+		if level in ('warning', 'error', 'critical'):
+			self.lines.append(str(message))
+		if self.logger is not None:
+			self.logger.teelog(message, level)
+
+
+def _serveDispatch(store, line, bulk, log):
+	"""Run one request against ``store`` (spec §21.7); return ``(status, lines, message)``."""
+	options, operation, args, raw = _serveParseRequest(line)
+	for option in options:
+		if option != '--sync':
+			raise _ServeUsage('unknown option {}'.format(option))
+	sync = '--sync' in options
+	if operation not in _SERVE_ARITY:
+		raise _ServeUsage('unknown operation {}'.format(operation))
+	low, high = _SERVE_ARITY[operation]
+	if len(args) < low or (high is not None and len(args) > high):
+		raise _ServeUsage('wrong number of arguments for {}'.format(operation))
+	isBulk = operation in ('set', 'append', 'delete') and raw == ['-']
+	keys = args if operation in ('get', 'delete', 'has', 'pop') else args[:1]
+	if operation not in ('read', 'len', 'keys', 'clear', 'scrub', 'verify', 'parts', 'stop', 'popitem') \
+			and not isBulk and '' in keys:
+		raise _ServeUsage('a KEY must not be empty')
+	unreadable = (1, _SERVE_UNREADABLE)
+	if operation == 'read':
+		rows = store.read(log)
+		status = unreadable if store.unreadable else (0, '')
+		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
+	if operation == 'get':
+		rows, missing = store.get(args, log)
+		status = unreadable if store.unreadable else (3 if missing else 0, '')
+		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
+	if operation == 'has':
+		found = store.has(args[0], log)
+		return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
+	if operation == 'len':
+		return 0, [str(store.length(log))], ''
+	if operation == 'keys':
+		return 0, [_specEncodeField(key, '\t', isKey=True) for key in store.keys(log)], ''
+	if operation in ('set', 'append', 'delete'):
+		keysOnly = operation == 'delete'
+		if isBulk:
+			reporter = _Reporter('<request>', log)
+			try:
+				rows = _parseRecordLines(bulk or [], '\t', True, keysOnly, reporter)
+			finally:
+				reporter.flush()
+		elif keysOnly:
+			rows = [([key], bool(_MARKER_RE.match(field))) for key, field in zip(args, raw)]
+		else:
+			rows = [(args, bool(_MARKER_RE.match(raw[0])))]
+		store.write(rows, sync, log)
+		return 0, [], ''
+	if operation in ('pop', 'popitem'):
+		if operation == 'pop':
+			row = store.pop(args[0], sync, log)
+		else:
+			if args and args[0] not in ('first', 'last'):
+				raise _ServeUsage('popitem takes first or last')
+			row = store.popitem(not args or args[0] == 'last', sync, log)
+		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+	if operation == 'setdefault':
+		if _MARKER_RE.match(raw[0]):
+			raise _ServeUsage('setdefault takes a data KEY, not a marker')
+		row = store.setdefault(args, sync, log)
+		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+	if operation in ('clear', 'scrub'):
+		done = store.clear(log) if operation == 'clear' else store.scrub(log)
+		return (0, [], '') if done else (1, [], '{} refused; nothing was written'.format(operation))
+	if operation == 'verify':
+		mismatches, readable = store.verify(log)
+		lines = [_serveFieldsLine(entry) for entry in mismatches]
+		return (1 if not readable else 4 if lines else 0), lines, '' if readable else _SERVE_UNREADABLE
+	if operation == 'parts':
+		return 0, [_serveFieldsLine(row) for row in store.partRows(log)], ''
+	return 1, [], 'not served by a handler'  # stop, sent to an in-process store
+
+
+def _serveRespond(store, line, bulk=None, logger=None):
+	"""The response to one request (spec §21.6), as lines without their '\\n'."""
+	log = _ServeLog(logger)
+	try:
+		status, lines, message = _serveDispatch(store, line, bulk, log)
+	except _ServeUsage as e:
+		status, lines, message = 2, [], str(e)
+	except Exception as e:
+		status, lines, message = 1, [], str(e) or type(e).__name__
+		if logger is not None:
+			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
+	response = ['#!\t' + _serveEncode(text) for text in log.lines] + list(lines)
+	response.append('#{}\t{}'.format(status, _serveEncode(message)) if message else '#{}'.format(status))
+	return response
+
+
+def _serveParseResponse(lines):
+	"""``(lines, diagnostics, status, message)`` from a response's lines (spec §21.6)."""
+	out, diagnostics = [], []
+	for line in lines:
+		if line.startswith('#!'):
+			diagnostics.append(_specDecodeField(line[3:], '\t'))
+		elif line.startswith('#'):
+			head, _, message = line[1:].partition('\t')
+			status = int(head) if _ASCII_DIGITS_RE.match(head) else 1
+			return out, diagnostics, status, _specDecodeField(message, '\t')
+		else:
+			out.append(line)
+	raise _ServeLost('the response ended without a status line')
+
+
+class _ServeLost(Exception):
+	"""The connection to a handler broke during a request; whether it was applied is unknown."""
+
+
+class _ServeLocal(object):
+	"""The in-process stand-in for a handler connection: the same engine and requests, no socket."""
+
+	def __init__(self, store):
+		self.store = store
+
+	def request(self, line, bulk=None):
+		return _serveParseResponse(_serveRespond(self.store, line, bulk))
+
+	def close(self):
+		self.store.close()
+
+
+# ===========================================================================
 # Command-line interface (tsvz-spec-v1 §20)
 # ===========================================================================
-_CLI_OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts')
+_CLI_OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts',
+				   'has', 'len', 'keys', 'pop', 'popitem', 'setdefault')
 #: option -> (destination, takes a value). The 3.39 spellings -c/--header,
 #: --defaults, -s/--strict and -f/--force are undocumented aliases of the
 #: --x- extensions (spec §20.7.4).
@@ -4987,6 +5183,13 @@ operations:
   scrub STORE                  compact the store in place (archival maintenance)
   verify STORE                 check #_checksum_*_# segments (exit 4 on a mismatch)
   parts STORE                  list the parts of a multi-part store
+  has STORE KEY                exit 0 if KEY is live, 3 if not
+  len STORE                    print the number of live keys
+  keys STORE                   print the live keys
+  pop STORE KEY                print the row of KEY and delete it (exit 3 if missing)
+  popitem STORE [first|last]   pop the first or last live key (default: last)
+  setdefault STORE KEY VALUE [VALUE ...]
+                               print the row of KEY, setting it to the VALUEs if missing
 
 options:
   -h, --help                   show this help
@@ -5114,9 +5317,15 @@ def _cliParseArgs(argv):
 		else:
 			raise _CliUsageError('unknown operation: neither {!r} nor {!r} is one of {}'.format(
 				positionals[0], positionals[1], ', '.join(_CLI_OPERATIONS)))
-	if args.operation in ('read', 'clear', 'scrub', 'verify', 'parts') and args.args:
+	if args.operation in ('read', 'clear', 'scrub', 'verify', 'parts', 'len', 'keys') and args.args:
 		raise _CliUsageError('{} takes no arguments after STORE'.format(args.operation))
-	if args.operation in ('get', 'set', 'append', 'delete'):
+	if args.operation == 'popitem' and args.args not in ([], ['first'], ['last']):
+		raise _CliUsageError('popitem takes first or last')
+	if args.operation in ('has', 'pop') and len(args.args) > 1:
+		raise _CliUsageError('{} takes one KEY'.format(args.operation))
+	if args.operation == 'setdefault' and len(args.args) == 1:
+		raise _CliUsageError('setdefault needs a KEY and a VALUE')
+	if args.operation in ('get', 'set', 'append', 'delete', 'has', 'pop', 'setdefault'):
 		if not args.args:
 			raise _CliUsageError('{} needs a KEY'.format(args.operation))
 		keys = args.args if args.operation in ('get', 'delete') else args.args[:1]
@@ -5494,8 +5703,60 @@ def _cliParts(args, delimiter, logger, stdin, stdout):
 	return 0
 
 
+def _cliRequestLine(args):
+	"""The protocol request (spec §21.5) for a parsed command line: its arguments are literal."""
+	return '\t'.join([args.operation] + [_serveEncode(arg) for arg in args.args])
+
+
+def _cliEmitServed(args, delimiter, logger, stdout, response):
+	"""Print a response (spec §21.6) as the operation prints on the files (§20.8); return the exit status."""
+	lines, diagnostics, status, message = response
+	for text in diagnostics:
+		logger.teelog(text, 'warning')
+	spec = _isSpecPath(args.store)
+	operation = args.operation
+	if operation in ('read', 'get', 'pop', 'popitem', 'setdefault'):
+		_cliEmitRows([_serveDecodeLine(line) for line in lines], args, stdout, spec, delimiter)
+	elif operation == 'keys':
+		_cliEmitRows([[_specDecodeField(line, '\t')] for line in lines], args, stdout, spec, delimiter)
+	elif operation == 'len':
+		_cliWrite(stdout, ''.join(line + '\n' for line in lines))
+	elif operation == 'verify':
+		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['path', 'line', 'algorithm', 'expected', 'computed'],
+					   args, stdout)
+	elif operation == 'parts':
+		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['index', 'ordinal', 'path', 'flags'], args, stdout)
+	if message and status in (1, 2):
+		logger.teelog('tsvz: {}: {}'.format(args.store, message), 'error')
+	return status
+
+
+def _cliEngineOp(args, delimiter, logger, stdin, stdout):
+	"""``has``, ``len``, ``keys``, ``pop``, ``popitem``, ``setdefault`` (spec §20.2) on the files.
+
+	They run through an in-process write-handler engine, so they behave as
+	they do through a handler, except that ``pop``, ``popitem`` and
+	``setdefault`` are not atomic against other writers.
+	"""
+	create = args.operation == 'setdefault'
+	if not create and not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	store = _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
+						strict=args.strict, teeLogger=logger, verbose=args.verbose, create=create)
+	try:
+		response = _ServeLocal(store).request(_cliRequestLine(args))
+	finally:
+		store.close()
+	status = _cliEmitServed(args, delimiter, logger, stdout, response)
+	if store.writer.failures:
+		return 1  # the write was not made; the writer reported why
+	return status
+
+
 _CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
-				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts}
+				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts,
+				 'has': _cliEngineOp, 'len': _cliEngineOp, 'keys': _cliEngineOp, 'pop': _cliEngineOp,
+				 'popitem': _cliEngineOp, 'setdefault': _cliEngineOp}
 
 
 def _cliMain(argv, stdin=None, stdout=None, stderr=None):

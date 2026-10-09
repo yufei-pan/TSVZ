@@ -2970,5 +2970,95 @@ def test_engine_survives_the_store_being_deleted(tmp_path, engines):
 	assert store.read(None) == _view(p) == [['b', '2']] and open(p, 'rb').read() == b'b\t2\n'
 
 
+# ==========================================================================
+# Write handler (spec §21): requests and responses
+# ==========================================================================
+def test_serve_responses(tmp_path, engines):
+	p = str(tmp_path / 'r.tsvz')
+	_touch(p, b'#_defaults_#\t\tNA\nalice\tAlice\t30\n<#>tag\ta<sep>b\tx\n')
+	store = engines(p)
+	R = lambda line, bulk=None: TSVZ._serveRespond(store, line, bulk)
+	assert R('read') == ['alice\tAlice\t30', '<#>tag\ta<sep>b\tx', '#0']
+	assert R('get\talice\tcarol') == ['alice\tAlice\t30', 'carol\t\tNA', '#3']
+	assert R('get\t#tag') == ['<#>tag\ta<sep>b\tx', '#0'] == R('get\t<#>tag')
+	assert R('has\talice') == ['#0'] and R('has\tnobody') == ['#3']
+	assert R('len') == ['2', '#0'] and R('keys') == ['alice', '<#>tag', '#0']
+	assert R('set\tbob\tB<lt>b\tline<LF>two') == ['#0']
+	assert R('get\tbob') == ['bob\tB<lt>b\tline<LF>two', '#0']
+	assert R('setdefault\tbob\tother') == ['bob\tB<lt>b\tline<LF>two', '#0']
+	assert R('pop\tbob') == ['bob\tB<lt>b\tline<LF>two', '#0'] and R('pop\tbob') == ['#3']
+	assert R('popitem\tfirst') == ['alice\tAlice\t30', '#0']
+	assert R('set\t-', ['# comment', 'k\tv', '<#>_x_#\tdata', '#_defaults_#\t\tD']) == ['#0']
+	# rows bind the defaults active where they are written: the marker comes after them
+	assert R('get\t<#>_x_#\tk') == ['<#>_x_#\tdata\tNA', 'k\tv\tNA', '#0']
+	assert R('delete\t-', ['k\tignored', '<#>_x_#']) == ['#0'] and R('has\tk') == ['#3']
+	assert R('--sync\tset\tz\t1') == ['#0']
+	assert open(p, 'rb').read().endswith(b'k\tv\n<#>_x_#\tdata\n#_defaults_#\t\tD\nk\n<#>_x_#\nz\t1\n')
+
+
+def test_serve_usage_errors_keep_the_connection_usable(tmp_path, engines):
+	store = engines(str(tmp_path / 'u.tsvz'), create=True)
+	for line in ('', 'frob', 'x-export', '--bogus\tread', 'read\textra', 'get', 'has\ta\tb', 'set\t\tv',
+				 'setdefault\tk', 'setdefault\t#_defaults_#\tx', 'popitem\tmiddle', 'stop'):
+		response = TSVZ._serveRespond(store, line)
+		assert response[-1].startswith('#2\t') or (line == 'stop' and response[-1].startswith('#1\t')), line
+	assert TSVZ._serveRespond(store, 'read') == ['#0']
+
+
+def test_serve_responses_carry_diagnostics_and_failures(tmp_path, engines, monkeypatch):
+	p = str(tmp_path / 'd.tsvz')
+	_touch(p, b'a\t1\n')
+	store = engines(p)
+	with open(p, 'ab') as f:
+		f.write(b'torn')
+	response = TSVZ._serveRespond(store, 'read')
+	assert response[0].startswith('#!\tTSVZ warning: ') and 'torn' in response[0]
+	assert response[1:] == ['a\t1', '#0']
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'a\t1\n')
+	_touch(m + '.1', b'b\t2\n')
+	store = engines(m)
+	assert TSVZ._serveRespond(store, 'scrub')[-1] == '#1\tscrub refused; nothing was written'
+	monkeypatch.chdir(str(tmp_path))
+	_touch('#h.tsvz', b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t0\n')  # a path starting with '#'
+	store = engines('#h.tsvz')
+	lines, _, status, _ = TSVZ._serveParseResponse(TSVZ._serveRespond(store, 'verify'))
+	assert status == 4 and lines[0].startswith('<#>h.tsvz\t3\tcrc32\t0\t')
+
+
+def test_serve_parse_response():
+	assert TSVZ._serveParseResponse(['#!\tw<LF>x', 'k\tv', '#1\tbad<sep>thing']) == (['k\tv'], ['w\nx'], 1, 'bad\tthing')
+	with pytest.raises(TSVZ._ServeLost):
+		TSVZ._serveParseResponse(['k\tv'])
+
+
+def test_cli_has_len_keys_pop_popitem_setdefault(tmp_path):
+	p = str(tmp_path / 'o.tsvz')
+	_touch(p, b'a\t1\n<#>h\t2\nb\t3\n')
+	assert _run('has', p, 'a') == (0, '', '') and _run('has', p, 'z') == (3, '', '')
+	assert _run('len', p) == (0, '3\n', '') and _run('keys', p) == (0, 'a\n<#>h\nb\n', '')
+	assert _run('pop', p, 'a') == (0, 'a\t1\n', '') and _run('pop', p, 'a') == (3, '', '')
+	assert _run('popitem', p) == (0, 'b\t3\n', '') and _run('popitem', p, 'first') == (0, '<#>h\t2\n', '')
+	assert _run('popitem', p) == (3, '', '')
+	assert _run('setdefault', p, 'k', 'v', '-5') == (0, 'k\tv\t-5\n', '')
+	assert _run('setdefault', p, 'k', 'other') == (0, 'k\tv\t-5\n', '')
+	assert open(p, 'rb').read() == b'a\t1\n<#>h\t2\nb\t3\na\nb\n<#>h\nk\tv\t-5\n'
+	fresh = str(tmp_path / 'fresh.tsvz')
+	status, out, err = _run('setdefault', fresh, 'k', 'v')
+	assert (status, out) == (0, 'k\tv\n') and open(fresh, 'rb').read() == b'k\tv\n'
+	q = str(tmp_path / 'o.csv')
+	_touch(q, b'a,x<sep>y\nb,2\n')
+	assert _run('keys', q) == (0, 'a\nb\n', '') and _run('pop', q, 'a') == (0, 'a,x<sep>y\n', '')
+	for argv in (['has', 'none.tsvz', 'k'], ['len', 'none.tsvz'], ['keys', 'none.tsv'], ['pop', 'none.tsvz', 'k'],
+				 ['popitem', 'none.tsvz']):
+		argv[1] = str(tmp_path / argv[1])
+		status, out, err = _run(*argv)
+		assert (status, out) == (1, '') and 'no such store' in err
+	for argv in (['has', p], ['has', p, 'a', 'b'], ['len', p, 'x'], ['popitem', p, 'middle'], ['setdefault', p, 'k'],
+				 ['pop', p, '']):
+		with pytest.raises(TSVZ._CliUsageError):
+			TSVZ._cliParseArgs(argv)
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
