@@ -3290,5 +3290,121 @@ def test_serve_takes_over_a_stale_pointer(tmp_path, served):
 	assert TSVZ._serveFind(p)['address'] == handle.address
 
 
+# ==========================================================================
+# CLI through a handler (spec §20.8)
+# ==========================================================================
+_ROUTED_STEPS = (
+	(['read'], ''), (['get', 'alice', 'nobody'], ''), (['has', 'alice'], ''), (['len'], ''), (['keys'], ''),
+	(['set', 'bob', 'B<b', 'two words'], ''), (['set', '#tag', 'v'], ''), (['set', '#_defaults_#', '', 'NA'], ''),
+	(['get', 'carol', 'bob'], ''), (['delete', 'alice', 'nobody'], ''),
+	(['set', '-'], 'k1\tv1\n# comment\nk2\tv<sep>2\n'), (['delete', '-'], 'k1\tignored\n'),
+	(['pop', 'bob'], ''), (['pop', 'bob'], ''), (['popitem', 'first'], ''), (['setdefault', 'k', 'v', '-5'], ''),
+	(['setdefault', 'k', 'other'], ''), (['read', '--format', 'table'], ''), (['verify'], ''),
+	(['scrub'], ''), (['read'], ''), (['clear'], ''), (['read'], ''), (['popitem'], ''),
+)
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+@pytest.mark.parametrize('name', ['d.tsvz', 'd.tsv'])
+def test_cli_gives_the_same_results_through_a_handler(tmp_path, served, name):
+	"""Spec §20.8: every operation prints the same and exits the same with or without a handler."""
+	direct, routed = str(tmp_path / ('direct-' + name)), str(tmp_path / ('routed-' + name))
+	start = b'alice\tAlice\t30\n<#>h\tx\ty\n' if name.endswith('z') else b'alice\tAlice\t30\nh\tx\ty\n'
+	for path in (direct, routed):
+		_touch(path, start)
+	served(routed)
+	for argv, stdin in _ROUTED_STEPS:
+		first = _run(argv[0], direct, *argv[1:], stdin=stdin)
+		second = _run(argv[0], routed, *argv[1:], stdin=stdin)
+		assert first[:2] == second[:2], argv
+	assert open(direct, 'rb').read() == open(routed, 'rb').read()
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_cli_routes_only_what_the_handler_can_answer(tmp_path, served, monkeypatch):
+	p = str(tmp_path / 'v.tsvz')
+	_touch(p, b'a\t1\n')
+	served(p)
+	requests = []
+	real = TSVZ._serveRespond
+
+	def spy(store, line, bulk=None, logger=None):
+		requests.append(line)
+		return real(store, line, bulk, logger)
+	monkeypatch.setattr(TSVZ, '_serveRespond', spy)
+	assert _run('get', p, 'a') == (0, 'a\t1\n', '')
+	assert _run('--x-direct', 'get', p, 'a') == (0, 'a\t1\n', '')
+	assert _run('get', p, 'a', '--x-defaults', 'k\\tD') == (0, 'a\t1\n', '')  # an option the handler lacks
+	q = str(tmp_path / 'v.txt')
+	_touch(q, b'a|1\n')
+	served(q)  # a loose file served with the delimiter its name implies (tab)
+	assert _run('get', q, 'a', '-d', 'pipe')[:2] == (0, 'a|1\n')  # 3.39 warns about the name on stderr
+	assert requests == ['get\ta']
+
+
+def test_cli_falls_back_to_the_files_when_the_handler_is_gone(tmp_path):
+	import socket
+	p = str(tmp_path / 'f.tsvz')
+	_touch(p, b'a\t1\n')
+	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
+		str(tmp_path / 'gone.sock'), socket.gethostname()).encode())
+	status, out, err = _run('get', p, 'a')
+	assert (status, out) == (0, 'a\t1\n') and 'does not answer' in err
+	_touch(p + '.serve', b'tsvz-handler\t1\naddress\tunix:/nowhere\nhost\tsome-other-host\npid\t1\n')
+	assert _run('get', p, 'a') == (0, 'a\t1\n', '')  # another host's handler: skipped quietly
+	assert _run('stop', p)[0] == 1
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_cli_when_the_handler_drops_the_connection(tmp_path):
+	"""A read falls back to the files; a write reports that its outcome is unknown."""
+	import socket
+	path = str(tmp_path / 'drop.sock')
+	listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	listener.bind(path)
+	listener.listen(8)
+
+	def drop():
+		while True:
+			try:
+				conn, _ = listener.accept()
+			except OSError:
+				return
+			conn.recv(1024)
+			conn.close()
+	thread = threading.Thread(target=drop)
+	thread.daemon = True
+	thread.start()
+	p = str(tmp_path / 'd.tsvz')
+	_touch(p, b'a\t1\n')
+	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
+		path, socket.gethostname()).encode())
+	try:
+		status, out, err = _run('read', p)
+		assert (status, out) == (0, 'a\t1\n') and 'lost the handler' in err
+		status, out, err = _run('set', p, 'b', '2')
+		assert (status, out) == (1, '') and 'may or may not have been applied' in err
+	finally:
+		listener.close()
+
+
+def test_tsvz_commands_through_tsvz_serve(tmp_path):
+	p = str(tmp_path / 'e.tsvz')
+	proc = _serve_process(p)
+	try:
+		assert _cli('set', p, 'k', 'v').returncode == 0
+		r = _cli('get', p, 'k')
+		assert (r.returncode, r.stdout) == (0, 'k\tv\n')
+		r = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'set', p, '-'], input='j\tw\n',
+						   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+		assert r.returncode == 0 and _cli('read', p).stdout == 'k\tv\nj\tw\n'
+		assert _cli('stop', p).returncode == 0
+		assert proc.wait(10) == 0
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+	assert open(p, 'rb').read() == b'k\tv\nj\tw\n'
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

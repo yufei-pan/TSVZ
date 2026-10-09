@@ -6185,6 +6185,59 @@ def _cliStop(args, delimiter, logger, stdin, stdout):
 	return 0 if status == 0 else 1
 
 
+_CLI_READ_ONLY = ('read', 'get', 'has', 'len', 'keys', 'verify', 'parts')
+
+
+def _cliHandler(args, delimiter, logger):
+	"""A connection to STORE's handler when this command line may go through it (spec §20.8), else None.
+
+	TSVZ routes a command line only when its result does not depend on
+	options the handler does not share: no --x-direct, --x-header,
+	--x-defaults or --x-strict, and for a loose file the handler's own
+	delimiter. A pointer whose handler does not answer is reported and the
+	files are used; another host's handler, or one this user may not
+	connect to, is skipped quietly.
+	"""
+	if args.operation in ('serve', 'stop') or args.direct or args.header or args.defaults or args.strict:
+		return None
+	info = _serveFind(args.store)
+	if info is None:
+		return None
+	if not _isSpecPath(args.store) and info.get('x-delimiter', delimiter) != delimiter:
+		return None
+	try:
+		return _ServeConnection(info)
+	except _ServeUnreachable as e:
+		if not e.quiet:
+			logger.teelog('TSVZ warning: {}: the handler in {} does not answer ({}); using the files directly'.format(
+				args.store, _servePointerPath(args.store), e), 'warning')
+		return None
+
+
+def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
+	"""Run a command line through STORE's handler; print the response as the files would give it (§20.8)."""
+	bulk = None
+	if args.operation in ('set', 'append', 'delete') and args.args == ['-']:
+		source = _Reporter('<stdin>', logger)
+		try:
+			rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store),
+									 args.operation == 'delete', source)
+		finally:
+			source.flush()
+		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
+	try:
+		response = connection.request(_cliRequestLine(args), bulk)
+	except _ServeLost as e:
+		if args.operation in _CLI_READ_ONLY:
+			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
+						  'warning')
+			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+		logger.teelog('tsvz: {}: lost the handler ({}); the {} may or may not have been applied'.format(
+			args.store, e, args.operation), 'error')
+		return 1
+	return _cliEmitServed(args, delimiter, logger, stdout, response)
+
+
 _CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
 				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts,
 				 'has': _cliEngineOp, 'len': _cliEngineOp, 'keys': _cliEngineOp, 'pop': _cliEngineOp,
@@ -6227,6 +6280,12 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 				args.defaults = [DEFAULTS_INDICATOR_KEY] + values[1:]
 			else:
 				args.defaults = []
+			connection = _cliHandler(args, delimiter, logger)
+			if connection is not None:
+				try:
+					return _cliRouted(connection, args, delimiter, logger, stdin, stdout)
+				finally:
+					connection.close()
 			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
 	except _CliUsageError as e:
 		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
