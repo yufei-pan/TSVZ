@@ -23,8 +23,8 @@ fallback with no semantic guarantees.
 
 This document specifies the file encoding, the reading procedure, the deletion and
 defaulting model, the reserved marker namespace, field escaping, optional
-integrity checking, compression, multi-part stores, and the snapshot (compaction)
-procedure.
+integrity checking, compression, multi-part stores, the snapshot (compaction)
+procedure, and a command-line interface for tools (§20).
 
 ---
 
@@ -39,6 +39,11 @@ A **conformant reader** is software that reconstructs store state from a TSVZ fi
 in accordance with §6–§15. A **conformant writer** is software that produces TSVZ
 files in accordance with this document. Some requirements apply only to one role
 and are marked accordingly.
+
+A **conformant command-line tool** is software that implements §20. It MUST also
+be a conformant reader and a conformant writer for the strict variants. A reader
+or writer is conformant without providing a command-line tool, and §20 does not
+change how files are read or written.
 
 ### 2.2 Definitions
 
@@ -850,6 +855,159 @@ would be ordered before the snapshot and lost to it.
 
 ---
 
+## 20. Command-line interface
+
+This section defines a command-line interface for tools that expose TSVZ stores to
+shells and scripts. It is a separate conformance class (§2.1). The operation names
+and the record encoding defined here are also the vocabulary of the dedicated
+write handler of §18.3.
+
+### 20.1 Invocation
+
+20.1.1 The canonical form of a command line is:
+
+```
+tsvz [OPTION ...] OPERATION STORE [ARG ...]
+```
+
+The program name `tsvz` is used for illustration; it is not normative.
+
+20.1.2 Options (§20.7) MAY appear anywhere among the arguments before an argument
+consisting of exactly `--`; every argument after `--` is positional. An argument
+consisting of exactly `-`, or of `-` followed by a digit or `.` (a negative
+number), is positional, not an option.
+
+20.1.3 `STORE` names a store as in §17.1: the path of the unnumbered file, whether
+or not that file exists alongside numbered parts. The behaviour when `STORE` names
+a single numbered or rotated part is implementation-defined.
+
+20.1.4 `ARG` values are literal strings. A tool MUST NOT interpret escape tokens
+(§13) in command-line arguments; it applies §13 encoding when it writes them.
+
+20.1.5 **File-first form.** A tool MAY additionally accept
+
+```
+tsvz [OPTION ...] STORE [OPERATION] [ARG ...]
+```
+
+A tool that accepts it MUST choose the form by the first positional argument: if
+it is the name of an operation defined in §20.2, the canonical form applies;
+otherwise the file-first form applies, and an omitted `OPERATION` means `read`. A
+store whose path equals an operation name must then be given with a path prefix,
+for example `./read`.
+
+### 20.2 Operations
+
+20.2.1 A conformant tool MUST implement every operation below with the stated
+effect and exit status (§20.6).
+
+| Operation | Arguments | Effect |
+|---|---|---|
+| `read` | `STORE` | Print every live key's resolved row (§7, §14) in first-appearance order (§3.4). |
+| `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. A tool SHOULD resolve a requested key as §7.7 resolves a key (trailing space and tab removed while stripping is in force) before looking it up. |
+| `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key. `-` reads records from standard input (§20.3). |
+| `append` | as `set` | Alias of `set`, with identical behaviour. |
+| `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`. It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
+| `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). |
+| `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store; it then writes nothing and exits with status 1. |
+| `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: part path, line number, algorithm, expected digest, computed digest. |
+| `parts` | `STORE` | Print the parts of the store in replay order (§17.3), one per line: index (from 0), ordinal in hexadecimal (empty for the unnumbered part 0), path, and flags (`active` for the part appends go to, and the compression codec if any, separated by commas). Parts carrying `.rotated` are not listed. |
+
+20.2.2 `set`, `append`, `delete` and `clear` MUST create a missing store as a part
+at the `STORE` path. `read`, `get`, `scrub`, `verify` and `parts` on a missing
+store MUST NOT create it and MUST exit with status 1.
+
+20.2.3 `verify` of a store that contains no `#_checksum_<algo>_#` markers succeeds.
+
+20.2.4 **Loose variants.** Every operation is available for the loose extensions
+(§5.2); their data semantics are implementation-defined. On a loose file, `verify`
+has nothing to check and `parts` lists the file itself.
+
+### 20.3 Bulk input
+
+20.3.1 When the only `ARG` of `set` or `delete` is `-`, the tool reads standard
+input as a TSVZ stream in the target store's variant:
+
+- Only committed lines count (§4.3). An unterminated final line is ignored, and the
+  tool SHOULD warn about it.
+- Lines are framed and split as in §7.1–§7.2, and fields are decoded per §13.
+- For `set`, each data line is handled exactly as `set` with those fields (a lone
+  key is a tombstone). A line whose first field matches the reserved pattern
+  (§12.2) is a marker write. Comment lines and empty lines are skipped.
+- For `delete`, the first field of each non-empty line is one key. A line whose
+  first field matches the reserved pattern resets that marker. Comment lines are
+  skipped.
+- All records of one invocation MUST be appended as a single batch (§18.2).
+
+20.3.2 Because `read` prints records in the store's own variant (§20.4),
+`tsvz read A | tsvz set B -` copies every live row of `A` into `B` when both use
+the same variant. Conversion between variants is out of scope.
+
+### 20.4 Output formats
+
+20.4.1 `--format records` is the machine format. It has one record per line, each
+terminated by `\n`, using the store's delimiter and §13 escaping (a key beginning
+with `#` is written `<#>…`). Rows are the resolved rows a reader returns. No header,
+comments or markers are printed. The lines printed by `verify` and `parts` are
+their fields joined by TAB, each field encoded per §13 for TSVZ.
+
+20.4.2 `--format table` is a human-readable layout. Its form is
+implementation-defined; it MAY truncate and MUST NOT be relied on for parsing.
+
+20.4.3 Without `--format`, a tool MUST use `table` when standard output is a
+terminal and `records` otherwise.
+
+20.4.4 For loose variants, records use the file's own escaping, which is
+implementation-defined.
+
+### 20.5 Output streams
+
+20.5.1 Standard output carries only the operation's output (§20.2, §20.4).
+
+20.5.2 Every diagnostic (tolerance warnings, errors, informational messages) goes
+to standard error. The text of diagnostics is implementation-defined.
+
+20.5.3 A `get` that exits with status 3 still prints its rows to standard output.
+
+### 20.6 Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | The operation completed. Tolerance warnings may have been printed. |
+| 1 | The operation failed or was refused. When `clear` or `scrub` is refused, nothing was written. |
+| 2 | Usage error: invalid arguments, unknown operation, unknown option. |
+| 3 | `get`: at least one requested key is missing. |
+| 4 | `verify`: at least one checksum mismatch. |
+| 5–63 | Reserved for future versions of this specification. |
+| 64–125 | Available to extensions (§20.7). |
+
+### 20.7 Options and extensions
+
+20.7.1 A conformant tool MUST accept:
+
+| Option | Meaning |
+|---|---|
+| `-h`, `--help` | Print usage to standard output and exit with status 0. |
+| `-V`, `--version` | Print the tool's name and version to standard output and exit with status 0. |
+| `--format table\|records` | Select the output format (§20.4). |
+| `-q`, `--quiet` | Suppress tolerance warnings; errors are still reported. |
+| `-v`, `--verbose` | Report informational messages on standard error. |
+| `-d`, `--delimiter D` | For loose variants only: the field delimiter, as one character or one of `tab`, `comma`, `pipe`, `null`. For a strict variant the extension determines the delimiter (§5.1); a conflicting `-d` is overridden and SHOULD produce a warning. |
+
+A long option's value MAY also be given as `--option=VALUE`.
+
+20.7.2 **Extension namespace.** This specification will never define an operation
+whose name begins with `x-`, nor a long option whose name begins with `--x-`.
+Implementations MUST put their own operations and long options in that namespace.
+
+20.7.3 An unknown operation or option MUST produce exit status 2.
+
+20.7.4 A tool MAY keep pre-existing spellings outside the namespace as
+undocumented aliases. This specification gives such aliases no protection from
+future definitions.
+
+---
+
 ## Appendix A. Filename grammar (ABNF)
 
 ```abnf
@@ -983,3 +1141,39 @@ Final reads (iteration order alice, carol; bob is missing):
 - `bob`   → missing; with `#_return_defaults_when_missing_#` at its default
   (`true`), returns the active defaults `["guest", "0"]`. (A deletion here is thus
   observationally a reset to the defaults.)
+
+---
+
+## Appendix D. Command-line examples (informative)
+
+```
+$ tsvz set people.tsvz alice Alice 30
+$ tsvz set people.tsvz bob Bob
+$ tsvz get people.tsvz alice | cat        # piped: records
+alice	Alice	30
+$ tsvz read people.tsvz                   # on a terminal: a table
+$ tsvz delete people.tsvz bob
+$ tsvz get people.tsvz bob > /dev/null; echo $?
+3
+$ tsvz set people.tsvz -- carol -5        # values may begin with '-'
+$ tsvz read people.tsvz | tsvz set copy.tsvz -
+$ tsvz verify people.tsvz; echo $?
+0
+$ tsvz parts events.tsvz --format records
+0		events.tsvz	
+1	0190c3a1	events.tsvz.0190c3a1	active
+$ tsvz people.tsvz append dave Dave 41     # file-first form, if supported
+```
+
+Using the exit status in a script:
+
+```sh
+if row=$(tsvz get --format records config.tsvz timeout); then
+    echo "timeout: $row"
+elif [ $? -eq 3 ]; then
+    echo "timeout not set; the defaults row is: $row"
+else
+    echo "tsvz failed" >&2
+    exit 1
+fi
+```

@@ -70,6 +70,8 @@ turns them into spec prose; the wording may change, the requirements may not.
   not normative.
 - Options MAY appear anywhere among the arguments before a lone `--`. Every
   argument after `--` is positional.
+- An argument consisting of exactly `-`, or of `-` followed by a digit or `.`
+  (a negative number), is positional, not an option.
 - `STORE` names a store as in §17.1: the path of the unnumbered file, whether or
   not that file exists alongside numbered parts. The behaviour when `STORE` names
   a single numbered or rotated part is implementation-defined.
@@ -95,7 +97,7 @@ and exit status (§20.6).
 | Operation | Arguments | Effect |
 |---|---|---|
 | `read` | `STORE` | Print every live key's resolved row (§7, §14) in first-appearance order (§3.4). |
-| `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. |
+| `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. A tool SHOULD resolve a requested key as §7.7 resolves a key (trailing space and tab removed while stripping is in force) before looking it up. |
 | `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key. `-` reads records from stdin (§20.3). |
 | `append` | as `set` | Alias of `set`; identical behaviour. |
 | `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`. MUST NOT fail because a key is absent (idempotent). `-` reads keys from stdin (§20.3). |
@@ -123,7 +125,9 @@ stream in the target store's variant:
 - For `set`: each data line is handled exactly as `set` with those fields (a
   lone key is a tombstone). A line whose first field matches the reserved
   pattern is a marker write. Comment lines and empty lines are skipped.
-- For `delete`: each non-empty line is one key, decoded per §13.
+- For `delete`: the first field of each non-empty line is one key, decoded per
+  §13; a line whose first field matches the reserved pattern resets that marker;
+  comment lines are skipped.
 - All records from one invocation MUST be appended as a single batch (§18.2).
 
 Because `read` prints records in the store's own variant (§20.4),
