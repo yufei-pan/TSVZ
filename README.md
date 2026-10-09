@@ -53,6 +53,10 @@ tsvz clear people.tsvz                    # empty it, keeping the header and mar
 tsvz scrub people.tsvz                    # compact it (for .tsvz: archival maintenance)
 tsvz verify people.tsvz                   # check #_checksum_*_# segments; exit 4 on a mismatch
 tsvz parts events.tsvz                    # list the parts of a multi-part store
+tsvz has people.tsvz carol                # exit 0 if carol is live, 3 if not
+tsvz pop people.tsvz carol                # print carol's row and delete it
+tsvz serve people.tsvz &                  # keep the store loaded; tsvz commands then use it
+tsvz stop people.tsvz
 tsvz people.tsvz append carol Carol 5     # the 3.39 form still works
 tsvz -V
 ```
@@ -111,6 +115,43 @@ named like an operation then needs a path prefix (`./read`).
 - **TSVZ extensions:**
   - `--x-header H` and `--x-defaults KEY<d>D1<d>...` decode backslash escapes such as `\t`;
   - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
+
+## Serving a store
+
+`tsvz serve STORE` keeps a store loaded in one process and answers requests on a
+local socket ([tsvz-spec-v1 §21](tsvz-spec-v1.md#21-write-handler-protocol)).
+`tsvz` commands and `TSVZ.TSVZClient` find it through the pointer file
+`STORE.serve` and use it instead of re-reading the store. Their output and exit
+status stay the same.
+
+- **One appender.** The server batches the writes it receives into single appends.
+  Other writers may still append to the files; the server reads what they add
+  before it answers.
+- **Acknowledgement.** A write is acknowledged once it is queued (`#_write_ack_#`
+  `memory`, the default), or after `fsync` (`#_write_ack_#` `disk`, or
+  `TSVZClient(..., sync=True)`). Reads always see acknowledged writes.
+- **Access.** Only the user who started the server can connect (socket mode 0600).
+  `--x-group G` or `--x-mode 0660` opens it on purpose. `--x-tcp` listens on
+  127.0.0.1 with a token in the pointer file instead.
+- **Lifetime.** It runs in the foreground until `tsvz stop STORE`, SIGINT or
+  SIGTERM, or `--x-idle-timeout S` seconds without connections. It then writes
+  and `fsync`s everything and removes `STORE.serve`.
+- **Bypassing it.** `--x-direct` makes a `tsvz` command use the files. Command
+  lines with `--x-header`, `--x-defaults` or `--x-strict`, or another delimiter
+  than the server's, use the files too.
+
+```python
+import TSVZ
+
+with TSVZ.TSVZClient('people.tsvz') as people:  # served, or in this process when no server runs
+    people['dave'] = ['dave', 'Dave', '41']
+    print(people['dave'], len(people), 'alice' in people)
+    print(people.pop('dave'))
+```
+
+`TSVZClient` has `TSVZed`'s semantics for reading and setting keys, `del`, `in`,
+`len`, iteration, `pop`, `popitem`, `setdefault`, `update`, `clear` and
+`setDefaults`. Without a server it warns once and works on the files in-process.
 
 ## Fault tolerance
 
@@ -191,6 +232,10 @@ and `-d=,`, except the ones C5 and C9 list.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
 - §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, exit 1 with an error that `-q` keeps.
+- §21: a served `.tsv` file with a header line shows that line as a row, as `tsvz read` does (`TSVZed` hides it when given the header).
+- §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, but a rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
+- §17.7: the server appends to the store's current part; it does not start a new part when it starts.
+- §21.3: where Python has no Unix sockets (Windows), the server uses loopback TCP with a token. The test suite exercises the TCP transport on Linux only.
 - §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.
 
 ## Tests
