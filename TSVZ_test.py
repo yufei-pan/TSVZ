@@ -2588,5 +2588,84 @@ def test_cli_parts(tmp_path):
 	assert (status, out) == (1, '') and 'no such store' in err
 
 
+# ==========================================================================
+# CLI: final-review fixes
+# ==========================================================================
+def test_cli_write_that_cannot_create_the_store_fails(tmp_path):
+	"""I1: a write whose store cannot be created exits 1 with an error that -q keeps (spec §20.6)."""
+	(tmp_path / 'd.tsv').mkdir()
+	for store in (str(tmp_path / 'nodir' / 's.tsvz'), str(tmp_path / 'nodir' / 's.tsv'), str(tmp_path / 'd.tsv')):
+		for argv, stdin in ((['set', store, 'k', 'v'], ''), (['append', store, 'k'], ''), (['delete', store, 'k'], ''),
+							(['set', store, '-'], 'k\tv\n'), (['delete', store, '-'], 'k\n')):
+			status, out, err = _run('-q', *argv, stdin=stdin)
+			assert (status, out) == (1, '') and 'could not be created' in err, (store, argv)
+	assert not os.path.exists(str(tmp_path / 'nodir'))
+
+
+def test_cli_unreadable_part_fails(tmp_path, monkeypatch):
+	"""I2: read, get and verify exit 1 when a part cannot be read; the other parts' rows are still printed."""
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'a\t1\n')
+	os.mkdir(m + '.1')  # a numbered part that cannot be opened, even by root
+	for argv, rows in ((['read', m], 'a\t1\n'), (['get', m, 'a'], 'a\t1\n'), (['verify', m], '')):
+		status, out, err = _run('-q', *argv)
+		assert (status, out) == (1, rows) and 'could not read' in err, argv
+	p = str(tmp_path / 'p.tsvz')
+	_touch(p, b'a\t1\n')
+	real = open
+
+	def deny(path, *args, **kwargs):
+		if path == p:
+			raise PermissionError(13, 'Permission denied', path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, 'open', deny, raising=False)
+	status, out, err = _run('read', p)
+	assert (status, out) == (1, '') and 'Permission denied' in err and 'could not read' in err
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locales')
+def test_cli_non_ascii_store_name_under_the_c_locale(tmp_path):
+	"""I3: a non-ASCII STORE path keeps working where the locale is ASCII (Python 3.6 under LANG=C)."""
+	env = dict(os.environ, LANG='C', LC_ALL='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+	env.pop('PYTHONIOENCODING', None)
+	store = os.path.join(str(tmp_path), 'stör.tsvz')
+
+	def run(*args):
+		argv = [sys.executable, os.path.join(HERE, 'TSVZ.py')] + [a.encode('utf-8') for a in args]
+		return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+	r = run('set', store, 'k', 'é')
+	assert r.returncode == 0 and b'Traceback' not in r.stderr
+	assert os.path.exists(store.encode('utf-8'))
+	r = run('get', store, 'k')
+	assert (r.returncode, r.stdout) == (0, 'k\té\n'.encode('utf-8'))
+	r = run('parts', store)
+	assert (r.returncode, r.stdout) == (0, b'0\t\t' + store.encode('utf-8') + b'\tactive\n')
+
+
+def test_cli_parse_short_option_equals_and_long_prefixes():
+	"""I4, I5: 3.39's argparse spellings -d=, and unique long-option prefixes still parse."""
+	P = TSVZ._cliParseArgs
+	assert P(['-d=,', 'read', 'x.csv']).delimiter == ','
+	assert P(['read', 'x.tsv', '-c=id']).header == 'id'
+	a = P(['--verb', '--delim', 'comma', '--head=id', '--form', 'records', 'read', 'x.csv'])
+	assert a.verbose and a.delimiter == 'comma' and a.header == 'id' and a.format == 'records'
+	assert P(['--x-s', 'read', 'x.tsv']).strict is True
+	for argv in (['--he', 'read', 'x.tsv'], ['--ver', 'read', 'x.tsv'], ['--de', ',', 'read', 'x.tsv'],
+				 ['--x-', 'read', 'x.tsv'], ['--bogus', 'read', 'x.tsv']):
+		with pytest.raises(TSVZ._CliUsageError):
+			P(argv)
+
+
+def test_cli_delimiter_option_is_checked(tmp_path):
+	"""I4: -d=, writes commas; a long -d is warned about; an undecodable -d is a usage error."""
+	y = str(tmp_path / 'y.txt')
+	assert _run('-d=,', y, 'append', 'a', 'b')[0] == 0
+	assert open(y, 'rb').read().endswith(b'a,b\n')
+	status, out, err = _run('read', y, '-d', '::')
+	assert status == 0 and 'one character' in err
+	status, out, err = _run('read', y, '-d', '\\')
+	assert (status, out) == (2, '') and 'usage: tsvz' in err
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

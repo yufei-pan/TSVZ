@@ -535,6 +535,10 @@ class _Reporter(object):
 		"""Forget the events of ``kind`` (for a caller that reports them another way)."""
 		self._events.pop(kind, None)
 
+	def has(self, kind):
+		"""True when an event of ``kind`` was noted and not yet flushed."""
+		return kind in self._events
+
 	def flush(self):
 		for count, where, detail in self._events.values():
 			message = 'TSVZ warning: {}: {}'.format(self.path, detail)
@@ -4428,11 +4432,16 @@ class _CliArgs(object):
 		self.args = []
 
 
+_CLI_UNDECODED_RE = re.compile('[\udc80-\udcff]')
+
+
 def _cliDecodeArgv(argv):
-	"""Re-decode arguments as UTF-8 where Python decoded them as ASCII (Python 3.6 under LANG=C)."""
-	if os.name != 'posix' or codecs.lookup(sys.getfilesystemencoding()).name == 'utf-8':
-		return list(argv)
-	return [os.fsencode(arg).decode('utf-8', 'replace') for arg in argv]
+	"""Re-decode as UTF-8 the arguments holding bytes the locale could not decode (Python 3.6 under LANG=C).
+
+	Only data arguments go through here: a STORE path stays as the OS decoded
+	it, so that ``open()`` encodes it back to the same bytes.
+	"""
+	return [os.fsencode(arg).decode('utf-8', 'replace') if _CLI_UNDECODED_RE.search(arg) else arg for arg in argv]
 
 
 def _cliParseArgs(argv):
@@ -4461,12 +4470,20 @@ def _cliParseArgs(argv):
 		if arg.startswith('--'):
 			name, eq, value = arg.partition('=')
 		elif len(arg) > 2 and _CLI_OPTIONS.get(arg[:2], (None, False))[1]:
-			name, eq, value = arg[:2], '=', arg[2:]  # -dcomma
+			value = arg[2:]
+			name, eq, value = arg[:2], '=', value[1:] if value.startswith('=') else value  # -dcomma, -d=,
 		elif len(arg) > 2:
 			name, eq, value = arg[:2], '', ''
 			argv.insert(i, '-' + arg[2:])  # -qv: take one flag at a time
 		else:
 			name, eq, value = arg, '', ''
+		if name not in _CLI_OPTIONS and name.startswith('--'):
+			# A unique prefix of a long option, as 3.39's argparse accepted (--verb, --delim).
+			matches = sorted(option for option in _CLI_OPTIONS if option.startswith(name) and option.startswith('--'))
+			if len(set(_CLI_OPTIONS[option] for option in matches)) > 1:
+				raise _CliUsageError('ambiguous option {}: {}'.format(name, ', '.join(matches)))
+			if matches:
+				name = matches[0]
 		if name not in _CLI_OPTIONS:
 			raise _CliUsageError('unknown option {}'.format(name))
 		dest, takesValue = _CLI_OPTIONS[name]
@@ -4520,7 +4537,11 @@ def _cliWrite(stream, text):
 		stream.write(text)
 	else:
 		stream.flush()  # keep the order of text already written through the text layer
-		buffer.write(text.encode('utf-8', 'replace'))
+		try:
+			data = text.encode('utf-8', 'surrogateescape')  # a STORE path the locale could not decode
+		except UnicodeEncodeError:
+			data = text.encode('utf-8', 'replace')
+		buffer.write(data)
 	stream.flush()
 
 
@@ -4588,14 +4609,29 @@ def _cliDecodeEscapes(text, label, logger):
 
 
 def _cliDelimiter(args, logger):
-	"""STORE's delimiter: a strict extension's own (spec §5.1, §20.7), else ``-d``, else inferred from the name."""
+	"""STORE's delimiter: a strict extension's own (spec §5.1, §20.7), else ``-d``, else inferred from the name.
+
+	A ``-d`` that does not decode is a usage error; one longer than a
+	character is used, as 3.39 did, with a warning.
+	"""
+	given = None
+	if args.delimiter is not ... and args.delimiter:
+		try:
+			given = get_delimiter(args.delimiter)
+		except Exception:
+			raise _CliUsageError('-d {!r} is not a delimiter'.format(args.delimiter))
 	if _isSpecPath(args.store):
 		expected = _EXTENSION_DELIMITERS[_parsePartName(args.store).ext]
-		if args.delimiter is not ... and args.delimiter and get_delimiter(args.delimiter) != expected:
+		if given is not None and given != expected:
 			logger.teelog('TSVZ warning: {}: -d {!r} conflicts with the file extension; using {!r} (spec §5.1)'.format(
 				args.store, args.delimiter, expected), 'warning')
 		return expected
-	return get_delimiter(args.delimiter, file_name=args.store)
+	if given is None:
+		return get_delimiter(args.delimiter, file_name=args.store)
+	if len(given) != 1:
+		logger.teelog('TSVZ warning: {}: -d {!r} is {} characters long; a delimiter should be one character'.format(
+			args.store, args.delimiter, len(given)), 'warning')
+	return given
 
 
 def _cliStoreExists(store):
@@ -4605,14 +4641,51 @@ def _cliStoreExists(store):
 	return os.path.isfile(store)
 
 
+def _cliWritten(args, logger):
+	"""Exit status after a write: 1, with an error, when STORE still does not exist (it could not be created)."""
+	if _cliStoreExists(args.store):
+		return 0
+	logger.teelog('tsvz: {}: the store could not be created; nothing was written'.format(args.store), 'error')
+	return 1
+
+
+def _cliSpecLoad(args, delimiter, logger):
+	"""Load a spec store for ``read`` / ``get``; return ``(load, readable)``.
+
+	``readable`` is False when a part could not be opened or read to its end;
+	the rows of the other parts are still loaded.
+	"""
+	reporter = _Reporter(args.store, logger)
+	try:
+		load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
+						 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
+		readable = not reporter.has('unreadable')
+	finally:
+		reporter.flush()
+	return load, readable
+
+
+def _cliUnreadable(args, logger):
+	"""Exit status 1, with an error that -q keeps, for a store with a part that could not be read."""
+	logger.teelog('tsvz: {}: could not read every part of the store'.format(args.store), 'error')
+	return 1
+
+
 def _cliRead(args, delimiter, logger, stdin, stdout):
-	"""``read STORE`` (spec §20.2): every live row, in first-appearance order."""
+	"""``read STORE`` (spec §20.2): every live row, in first-appearance order.
+
+	Exit 1 when a part could not be read; the rows of the other parts are printed.
+	"""
 	if not _cliStoreExists(args.store):
 		raise _CliStoreMissing()
-	data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-						   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-	_cliEmitRows(list(data.values()), args, stdout, _isSpecPath(args.store), delimiter)
-	return 0
+	if not _isSpecPath(args.store):
+		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
+							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
+		_cliEmitRows(list(data.values()), args, stdout, False, delimiter)
+		return 0
+	load, readable = _cliSpecLoad(args, delimiter, logger)
+	_cliEmitRows(list(load.data.values()), args, stdout, True, delimiter)
+	return 0 if readable else _cliUnreadable(args, logger)
 
 
 def _cliGet(args, delimiter, logger, stdin, stdout):
@@ -4626,13 +4699,9 @@ def _cliGet(args, delimiter, logger, stdin, stdout):
 	if not _cliStoreExists(args.store):
 		raise _CliStoreMissing()
 	spec = _isSpecPath(args.store)
+	readable = True
 	if spec:
-		reporter = _Reporter(args.store, logger)
-		try:
-			load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
-							 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
-		finally:
-			reporter.flush()
+		load, readable = _cliSpecLoad(args, delimiter, logger)
 		data, state = load.data, load.state
 	else:
 		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
@@ -4653,6 +4722,8 @@ def _cliGet(args, delimiter, logger, stdin, stdout):
 			row += [''] * (load.correctColumnNum - len(row))
 		rows.append(row)
 	_cliEmitRows(rows, args, stdout, spec, delimiter)
+	if not readable:
+		return _cliUnreadable(args, logger)
 	return 3 if missing else 0
 
 
@@ -4731,10 +4802,10 @@ def _cliSet(args, delimiter, logger, stdin, stdout):
 	"""
 	if args.args == ['-']:
 		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=False))
-		return 0
+		return _cliWritten(args, logger)
 	appendTabularFile(args.store, args.args, teeLogger=logger, header=args.header, createIfNotExist=True,
 					  verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	return 0
+	return _cliWritten(args, logger)
 
 
 def _cliDelete(args, delimiter, logger, stdin, stdout):
@@ -4744,10 +4815,10 @@ def _cliDelete(args, delimiter, logger, stdin, stdout):
 	"""
 	if args.args == ['-']:
 		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
-		return 0
+		return _cliWritten(args, logger)
 	appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
 						   createIfNotExist=True, verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	return 0
+	return _cliWritten(args, logger)
 
 
 def _cliClear(args, delimiter, logger, stdin, stdout):
@@ -4788,10 +4859,13 @@ def _cliVerify(args, delimiter, logger, stdin, stdout):
 	reporter = _Reporter(args.store, logger)
 	try:
 		mismatches = _specVerify(args.store, delimiter, reporter)
+		readable = not reporter.has('unreadable')
 	finally:
 		reporter.flush()
 	rows = [[path, str(lineNo), algo, expected, computed] for path, lineNo, algo, expected, computed in mismatches]
 	_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
+	if not readable:
+		return _cliUnreadable(args, logger)  # not every segment could be checked
 	return 4 if rows else 0
 
 
@@ -4836,10 +4910,14 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 	stdout = sys.stdout if stdout is None else stdout
 	stderr = sys.stderr if stderr is None else stderr
 	try:
-		args = _cliParseArgs(_cliDecodeArgv(argv))
+		args = _cliParseArgs(argv)
 	except _CliUsageError as e:
 		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
 		return 2
+	args.args = _cliDecodeArgv(args.args)
+	for name in ('header', 'defaults', 'delimiter'):
+		if isinstance(getattr(args, name), str):
+			setattr(args, name, _cliDecodeArgv([getattr(args, name)])[0])
 	if args.help:
 		_cliWrite(stdout, _CLI_HELP.format(version=version))
 		return 0
@@ -4859,6 +4937,9 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 			else:
 				args.defaults = []
 			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+	except _CliUsageError as e:
+		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
+		return 2
 	except _CliStoreMissing:
 		logger.teelog('tsvz: {}: no such store'.format(args.store), 'error')
 	except BrokenPipeError:

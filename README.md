@@ -95,13 +95,16 @@ named like an operation then needs a path prefix (`./read`).
 - **stderr carries every message.** `-q` prints errors only; `-v` adds detail.
 - **Exit status:**
   - 0: done.
-  - 1: failed or refused. Also a missing store for `read`, `get`, `scrub`, `verify` and `parts`.
+  - 1: failed or refused. Also a missing store for `read`, `get`, `scrub`, `verify` and `parts`,
+    a store that `set`, `append` or `delete` could not create, and a `.tsvz` part that could not
+    be read (the rows of the other parts are still printed).
   - 2: usage error.
   - 3: `get` found a missing key.
   - 4: `verify` found a checksum mismatch.
 - **Arguments are literal.** `tsvz set s.tsvz k 'a<b'` stores `a<b`. Values may
   begin with `-` (`-5`); after `--` every argument is positional. `set KEY`
-  alone deletes KEY, as in 3.39; `set KEY ''` stores an empty cell.
+  alone deletes KEY, as in 3.39. `set KEY ''` stores an empty cell in a `.tsvz`
+  store; in a `.tsv` file it deletes KEY, as in 3.39.
 - **Bulk input.** `set STORE -` and `delete STORE -` read records or keys from
   stdin and append them in one write. An unterminated last line is ignored,
   with a warning.
@@ -156,7 +159,8 @@ part, and a delimiter or encoding argument that conflicts with the extension.
 
 ### The `tsvz` command
 
-Every 3.39 command line still parses, except the ones C5 lists.
+3.39 command lines still parse, including abbreviated long options (`--delim`)
+and `-d=,`, except the ones C5 and C9 list.
 
 | # | Change |
 |---|---|
@@ -168,6 +172,7 @@ Every 3.39 command line still parses, except the ones C5 lists.
 | C6 | A `clear` or `scrub` that writes nothing (one part of a multi-part store, a store that kept changing) exits 1. |
 | C7 | `-c/--header`, `--defaults`, `-s/--strict` and `-f/--force` are undocumented aliases of the `--x-` options. `--x-header` and `--x-defaults` keep non-ASCII text. |
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
+| C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
 
 ## Spec deviations and interpretations
 
@@ -185,6 +190,8 @@ Every 3.39 command line still parses, except the ones C5 lists.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
+- §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, exit 1 with an error that `-q` keeps.
+- §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.
 
 ## Tests
 
