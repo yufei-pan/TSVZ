@@ -1298,8 +1298,9 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	"""
 	if _isSpecPath(fileName):
-		return _specClearTabularFile(fileName, teeLogger=teeLogger, header=header, verifyHeader=verifyHeader,
-									 verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
+		_specClearTabularFile(fileName, teeLogger=teeLogger, header=header, verifyHeader=verifyHeader,
+							  verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
+		return
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
@@ -1494,13 +1495,19 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 	elif keyLower == '#_version_#':
 		if not value:
 			state.version = 1
-		elif not _ASCII_DIGITS_RE.match(value) or int(value) < 1:
-			reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
-			return False
 		else:
-			if int(value) > MAX_SPEC_VERSION:
+			number = 0
+			if _ASCII_DIGITS_RE.match(value):
+				try:
+					number = int(value)
+				except ValueError:  # more digits than int() converts (Python 3.11+ limit)
+					pass
+			if number < 1:
+				reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
+				return False
+			if number > MAX_SPEC_VERSION:
 				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(value, MAX_SPEC_VERSION))
-			state.version = int(value)
+			state.version = number
 	elif keyLower in _BOOL_MARKERS:
 		attr, default = _BOOL_MARKERS[keyLower]
 		if not value:
@@ -2012,8 +2019,10 @@ def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=F
 def _specRepairCompressed(path, reporter):
 	"""Re-encode a damaged compressed part in place, keeping every committed record.
 
-	The original raw bytes are first copied to ``<path>.damaged-<timestamp>``.
-	Returns False when the part turned out to be intact.
+	The original raw bytes are first copied to a new file
+	``<path>.damaged-<timestamp>`` (``.1``, ``.2``, ... appended when that name
+	is taken) and synced to disk. Returns False when the part turned out to be
+	intact.
 	"""
 	info = _PartInfo(path)
 	with _pathLock(path):
@@ -2024,10 +2033,20 @@ def _specRepairCompressed(path, reporter):
 				keep = content[:content.rfind(b'\n') + 1]
 				if not info.damaged and len(keep) == len(content):
 					return False
-				backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
-				f.seek(0)
-				with open(backup, 'wb') as copy:
+				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+				suffix = 0
+				while True:
+					try:
+						copy = open(backup, 'xb')  # never overwrite an earlier backup
+						break
+					except FileExistsError:
+						suffix += 1
+						backup = '{}.{}'.format(first, suffix)
+				with copy:
+					f.seek(0)
 					shutil.copyfileobj(f, copy)
+					copy.flush()
+					os.fsync(copy.fileno())  # the backup is durable before the part is overwritten
 				raw = _compressBytes(info.codec, keep) if keep else b''
 				f.seek(0)
 				f.write(raw)
@@ -2065,11 +2084,34 @@ def _specAppendPayload(path, payload, reporter, repair=False, fsync=False):
 				_unlockFile(f)
 
 
-def _specRewriteInPlace(path, content):
+#: Reads a scrub or clear makes before it gives up on a store that keeps changing.
+_SPEC_REWRITE_ATTEMPTS = 3
+
+
+def _specStamp(st):
+	"""What identifies a part's bytes between a read and a rewrite: (inode, size, mtime)."""
+	return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _specSnapshot(fileName):
+	"""Return ``(parts, stamp)`` before a read: ``stamp`` is the single part's ``_specStamp``, else None."""
+	parts, _ = _storeParts(fileName)
+	if len(parts) != 1:
+		return parts, None
+	try:
+		return parts, _specStamp(os.stat(parts[0]))
+	except OSError:
+		return parts, None
+
+
+def _specRewriteInPlace(path, content, expect=None):
 	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
 
 	``content`` is uncompressed; it is compressed for a compressed part. The
-	file is left alone when its bytes already match. Returns True if written.
+	file is left alone when its bytes already match. Returns True if written,
+	False if unchanged. ``expect`` is a ``_specStamp`` taken before the caller
+	read the part: when the part no longer matches it under the lock, another
+	writer committed in between, so nothing is written and None is returned.
 	"""
 	codec = _parsePartName(path).codec
 	raw = _compressBytes(codec, content) if codec and content else content
@@ -2077,7 +2119,10 @@ def _specRewriteInPlace(path, content):
 		with open(path, 'r+b') as f:
 			_lockFile(f)
 			try:
-				if os.fstat(f.fileno()).st_size == len(raw) and f.read() == raw:
+				st = os.fstat(f.fileno())
+				if expect is not None and _specStamp(st) != expect:
+					return None
+				if st.st_size == len(raw) and f.read() == raw:
 					return False
 				f.seek(0)
 				f.write(raw)
@@ -2176,22 +2221,42 @@ def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header=
 
 def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
 						  encoding='utf8', strict=False, delimiter=...):
-	"""``clearTabularFile`` for spec paths (design §5.5, §5.8)."""
+	"""``clearTabularFile`` for spec paths (design §5.5, §5.8). Returns True when the store was cleared.
+
+	A single file is read without a lock and rewritten in place only if no
+	other writer changed it since the read (else it is read again, up to
+	``_SPEC_REWRITE_ATTEMPTS`` times). A path naming one part of a multi-part
+	store is refused.
+	"""
 	reporter = _Reporter(fileName, teeLogger)
+	attempt = None
+	cleared = False
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		name = _parsePartName(fileName)
+		if name.ordinal is not None or name.rotated:
+			reporter.note('fragment', None, 'clear skipped: {} names one part of a multi-part store; clear the store path instead; nothing was written'.format(fileName))
+			return False
 		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
-		load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
-						 reporter=reporter, teeLogger=teeLogger, verbose=verbose)
-		if len(load.parts) > 1:
-			tombstones = ''.join(_specFormatRecord([key], delimiter) + '\n' for key in load.data)
-			if tombstones:
-				_specAppendPayload(load.active, tombstones.encode('utf-8'), reporter)
-			reporter.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
-		else:
-			if any(header) and verifyHeader and load.headerLine is not None:
+		headerChecked = False
+		for _ in range(_SPEC_REWRITE_ATTEMPTS):
+			attempt = _Reporter(fileName, teeLogger)  # only the last read reports its tolerance events
+			parts, stamp = _specSnapshot(fileName)
+			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
+							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
+			if len(load.parts) > 1:
+				tombstones = ''.join(_specFormatRecord([key], delimiter) + '\n' for key in load.data)
+				if tombstones:
+					_specAppendPayload(load.active, tombstones.encode('utf-8'), attempt)
+				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
+				cleared = True
+				break
+			if stamp is None or load.parts != parts:
+				continue  # the set of parts changed under the read
+			if any(header) and verifyHeader and load.headerLine is not None and not headerChecked:
+				headerChecked = True
 				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 			lines = []
@@ -2199,11 +2264,18 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			if headerLine:
 				lines.append(headerLine)
 			lines += _specPreamble(load.state, delimiter, version=False)
-			_specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'))
+			if _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'), expect=stamp) is not None:
+				cleared = True
+				break
+		else:
+			attempt.note('changing', None, 'clear skipped: the store kept changing while it was being cleared; nothing was written')
 	finally:
 		reporter.flush()
-	if verbose:
+		if attempt is not None:
+			attempt.flush()
+	if verbose and cleared:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
+	return cleared
 
 
 def _specPostamble(state, delimiter):
@@ -2246,7 +2318,13 @@ def _specRoundTrips(cells, state):
 def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
 						  verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=False,
 						  delimiter=..., defaults=..., correctColumnNum=-1):
-	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7)."""
+	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7).
+
+	The store is read without a lock and rewritten in place only if no other
+	writer changed it since the read (else it is read again, up to
+	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
+	never compacted away.
+	"""
 	if lastLineOnly:
 		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									lastLineOnly=True, verifyHeader=verifyHeader, verbose=verbose, encoding=encoding,
@@ -2254,35 +2332,52 @@ def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=
 	if taskDic is None:
 		taskDic = {}
 	reporter = _Reporter(fileName, teeLogger)
+	attempt = None
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		initial = _normalizeDefaults(defaults, delimiter)
 		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
 			return taskDic
-		load = _specLoad(fileName, delimiter, header=header, verifyHeader=verifyHeader, strict=strict,
-						 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
-						 reporter=reporter, teeLogger=teeLogger, verbose=verbose)
 		name = _parsePartName(fileName)
-		if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
-			reporter.note('multipart', None, 'scrub skipped: 4.1 does not compact multi-part stores or single parts of them; nothing was written')
+		given = list(taskDic.items()) if taskDic else []
+		for tries in range(_SPEC_REWRITE_ATTEMPTS):
+			if tries:
+				# Read again into the dict as the caller passed it.
+				taskDic.clear()
+				taskDic.update(given)
+			attempt = _Reporter(fileName, teeLogger)  # only the last read reports its tolerance events
+			parts, stamp = _specSnapshot(fileName)
+			load = _specLoad(fileName, delimiter, header=header, verifyHeader=verifyHeader, strict=strict,
+							 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
+							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
+			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
+				attempt.note('multipart', None, 'scrub skipped: 4.1 does not compact multi-part stores or single parts of them; nothing was written')
+				return taskDic
+			if stamp is None or load.parts != parts:
+				continue  # the set of parts changed under the read
+			state = load.state
+			rows = [_specScrubCells(row, state) for row in taskDic.values()]
+			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
+			lines = []
+			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
+			if headerLine:
+				lines.append(headerLine)
+			lines += _specPreamble(state, delimiter, compensate=compensate)
+			lines += [_specFormatRecord(cells, delimiter) for cells in rows]
+			if compensate:
+				lines += _specPostamble(state, delimiter)
+			written = _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'), expect=stamp)
+			if written is None:
+				continue  # another writer committed after the read
+			if verbose:
+				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
 			return taskDic
-		state = load.state
-		rows = [_specScrubCells(row, state) for row in taskDic.values()]
-		compensate = not all(_specRoundTrips(cells, state) for cells in rows)
-		lines = []
-		headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-		if headerLine:
-			lines.append(headerLine)
-		lines += _specPreamble(state, delimiter, compensate=compensate)
-		lines += [_specFormatRecord(cells, delimiter) for cells in rows]
-		if compensate:
-			lines += _specPostamble(state, delimiter)
-		written = _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'))
-		if verbose:
-			__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
+		attempt.note('changing', None, 'scrub skipped: the store kept changing while it was being compacted; nothing was written')
 	finally:
 		reporter.flush()
+		if attempt is not None:
+			attempt.flush()
 	return taskDic
 
 
@@ -2433,6 +2528,7 @@ class TSVZed(OrderedDict):
 				  rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,
 				  verbose = False,encoding = 'utf8',delimiter = ...,defaults = None,strict = False,correctColumnNum = -1):
 		super().__init__()
+		self._constructed = False  # setDefaults() writes a #_defaults_# marker only once this is True
 		self._spec = _isSpecPath(fileName)
 		self.version = version
 		self.strict = strict
@@ -2493,6 +2589,7 @@ class TSVZed(OrderedDict):
 		self.appendThread.start()
 		self.load()
 		atexit.register(self.stopAppendThread)
+		self._constructed = True
 
 	def setDefaults(self,defaults):
 		if not defaults:
@@ -2511,6 +2608,11 @@ class TSVZed(OrderedDict):
 			defaults = []
 		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
 			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		if self._spec and self._constructed:
+			# Spec rows are written sparse and read back under the file's
+			# #_defaults_#, so new defaults are written as that marker.
+			self._specSetMarker(DEFAULTS_INDICATOR_KEY, defaults)
+			return
 		self.defaults = defaults
 
 	def load(self):
@@ -2908,11 +3010,12 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
-				_specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
-									  verbose=self.verbose, delimiter=self.delimiter)
+				cleared = _specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
+												verbose=self.verbose, delimiter=self.delimiter)
 				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			self.dirty = False
-			self.deSynced = False
+			# A skipped clear (reported) left the store as it was: reload it into memory.
+			self.deSynced = not cleared
 		except Exception as e:
 			self.deSynced = True
 			self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
@@ -3411,7 +3514,7 @@ class TSVZedLite(MutableMapping):
 	- Does not support logging via teeLogger.
 	- Does not support move_to_end method.
 	- Does not support in-memory only mode. ( please just use a dict )
-	- Does not lock the file during operations.
+	- Does not lock the file during operations (a .tsvz write takes the exclusive lock other writers take).
 	- Does not track last update times.
 	
 	However, it may be preferred in scenarios when:
@@ -3497,6 +3600,7 @@ class TSVZedLite(MutableMapping):
 					delimiter = ...,defaults = None,strict = True,correctColumnNum = -1,
 					indexes = ..., fileObj = ...
 					):
+		self._constructed = False  # setDefaults() writes a #_defaults_# marker only once this is True
 		self._spec = _isSpecPath(fileName)
 		self.version = version
 		self.strict = strict
@@ -3539,6 +3643,7 @@ class TSVZedLite(MutableMapping):
 			else:
 				self.fileObj = fileObj
 		atexit.register(self.close)
+		self._constructed = True
 
 	# Implement custom methods just for TSVZedLite
 	def getResourceUsage(self,return_dict = False):
@@ -3715,19 +3820,30 @@ class TSVZedLite(MutableMapping):
 			return None
 		f = self.fileObj
 		with _pathLock(self._activePath):
-			size = f.seek(0, os.SEEK_END)
-			if size:
-				f.seek(size - 1)
-				if f.read(1) != b'\n':
-					keep = _lastNewlineEnd(f, size)
-					f.seek(keep)
-					tail = f.read(size - keep)
-					f.truncate(keep)
-					size = keep
-					_warn(f'TSVZ warning: {self._activePath}: removed uncommitted tail {tail[:80]!r} before appending')
-			f.seek(size)
-			f.write(data)
-			f.flush()
+			# The 3.39 exclusive lockf, as every other writer takes: under it an
+			# unterminated tail really is uncommitted, and the end cannot move.
+			f.seek(0)  # msvcrt locks from the current position: lock and unlock the same range
+			_lockFile(f)
+			try:
+				size = f.seek(0, os.SEEK_END)
+				if size:
+					f.seek(size - 1)
+					if f.read(1) != b'\n':
+						keep = _lastNewlineEnd(f, size)
+						f.seek(keep)
+						tail = f.read(size - keep)
+						f.truncate(keep)
+						size = keep
+						_warn(f'TSVZ warning: {self._activePath}: removed uncommitted tail {tail[:80]!r} before appending')
+				f.seek(size)
+				f.write(data)
+				f.flush()
+			finally:
+				try:
+					f.seek(0)
+				except Exception:
+					pass  # a failed write is already propagating; the lock must still be released
+				_unlockFile(f)
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)
@@ -3750,6 +3866,11 @@ class TSVZedLite(MutableMapping):
 			defaults = []
 		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
 			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		if self._spec and self._constructed:
+			# Spec rows are written sparse and read back under the file's
+			# #_defaults_#, so new defaults are written as that marker.
+			self._specWriteMarker(DEFAULTS_INDICATOR_KEY, defaults)
+			return
 		self.defaults = defaults
 
 	def load(self):

@@ -2,9 +2,10 @@
 """Tests for TSVZ 4.1 (TSVZ.py).
 
 Plain ``test_*`` functions (pytest-style, no class boilerplate), matching the
-repo convention. Runnable with ``python -m pytest test_TSVZ.py`` or directly
-with ``python test_TSVZ.py`` (a tiny runner at the bottom executes every
-``test_*`` function and reports pass/fail).
+repo convention. Run them with ``python3 -m pytest TSVZ_test.py -q``, or with
+``python3 TSVZ_test.py``, which hands its arguments to pytest. The
+differential tests compare the legacy dialect against the frozen 3.39
+reference ``TSVZ_old.py`` (``-k 339`` selects them).
 """
 import os
 import sys
@@ -278,6 +279,7 @@ import gzip
 import io
 import random
 import subprocess
+import threading
 from collections import OrderedDict
 
 import pytest
@@ -1929,6 +1931,217 @@ def test_legacy_roundtrip_fuzz(tmp_path):
 			assert _reload_items(p) == memory, (suffix, seed)
 			TSVZ.scrubTabularFile(p)
 			assert _reload_items(p) == memory, (suffix, seed)
+
+
+# ==========================================================================
+# Final review fixes: concurrent writers during scrub / clear, TSVZedLite
+# locking, setDefaults persistence, part-path clear, huge version, backups
+# ==========================================================================
+def _append_after_loads(monkeypatch, path, records, times):
+	"""Make the first ``times`` calls of ``_specLoad`` commit ``records`` right after they read."""
+	real = TSVZ._specLoad
+	calls = []
+
+	def loadThenAppend(*args, **kwargs):
+		result = real(*args, **kwargs)
+		calls.append(1)
+		if len(calls) <= times:
+			TSVZ.appendLinesTabularFile(path, records)  # another writer commits after the read
+		return result
+	monkeypatch.setattr(TSVZ, '_specLoad', loadThenAppend)
+	return calls
+
+
+def test_spec_scrub_keeps_a_record_committed_while_it_runs(tmp_path, monkeypatch):
+	p = str(tmp_path / 'live.tsvz')
+	_touch(p, b'a\t1\na\t2\nb\t1\n')
+	calls = _append_after_loads(monkeypatch, p, [['c', 'during']], times=1)
+	assert TSVZ.scrubTabularFile(p) == {'a': ['a', '2'], 'b': ['b', '1'], 'c': ['c', 'during']}
+	assert len(calls) == 2  # the first attempt saw the store change and was retried
+	monkeypatch.undo()
+	assert open(p, 'rb').read() == b'#_version_#\t1\na\t2\nb\t1\nc\tduring\n'
+
+
+def test_spec_scrub_skips_when_the_store_keeps_changing(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'busy.tsvz')
+	_touch(p, b'a\t1\na\t2\n')
+	calls = _append_after_loads(monkeypatch, p, [['c', 'x']], times=99)
+	TSVZ.scrubTabularFile(p)
+	monkeypatch.undo()
+	assert len(calls) == 3
+	assert open(p, 'rb').read() == b'a\t1\na\t2\n' + b'c\tx\n' * 3  # nothing was rewritten
+	warnings = _tsvz_warnings(capsys)
+	assert any('scrub skipped: the store kept changing while it was being compacted; nothing was written' in w
+			   for w in warnings)
+
+
+def test_spec_clear_retries_when_the_store_changes_after_its_read(tmp_path, monkeypatch):
+	# The record and the marker committed after the first read are not lost
+	# silently: the clear re-reads, so the record is cleared too and the new
+	# #_defaults_# survives the clear (a stale preamble would have dropped it).
+	p = str(tmp_path / 'live.tsvz')
+	_touch(p, b'#id\tv\na\t1\n')
+	calls = _append_after_loads(monkeypatch, p, [['c', 'during'], ['#_defaults_#', 'NEW']], times=1)
+	TSVZ.clearTabularFile(p)
+	monkeypatch.undo()
+	assert len(calls) == 2
+	assert open(p, 'rb').read() == b'#id\tv\n#_defaults_#\tNEW\n'
+	assert TSVZ.readTabularFile(p) == {}
+
+
+def test_spec_clear_skips_when_the_store_keeps_changing(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'busy.tsvz')
+	_touch(p, b'a\t1\n')
+	calls = _append_after_loads(monkeypatch, p, [['c', 'x']], times=99)
+	TSVZ.clearTabularFile(p)
+	monkeypatch.undo()
+	assert len(calls) == 3
+	assert open(p, 'rb').read() == b'a\t1\n' + b'c\tx\n' * 3
+	assert any('clear skipped: the store kept changing while it was being cleared; nothing was written' in w
+			   for w in _tsvz_warnings(capsys))
+
+
+def test_tsvzed_spec_clear_reloads_when_the_clear_was_skipped(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'busy.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.002)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	_append_after_loads(monkeypatch, p, [['c', 'x']], times=99)
+	t.clear()
+	monkeypatch.undo()
+	assert _wait_for(lambda: 'a' in t and 'c' in t)  # memory follows the store the clear left alone
+	t.close()
+	assert TSVZ.readTabularFile(p) == {'a': ['a', '1'], 'c': ['c', 'x']}
+
+
+def test_lite_spec_and_another_process_append_without_losing_records(tmp_path):
+	p = str(tmp_path / 'race.tsvz')
+	_touch(p, b'seed\tx\n')
+	go = str(tmp_path / 'go')
+	n = 200
+	code = ('import os, sys, time\nsys.path.insert(0, {!r})\nimport TSVZ\n'
+			'deadline = time.time() + 20\n'
+			'while not os.path.exists({!r}) and time.time() < deadline:\n\tpass\n'
+			'for i in range({}):\n\tTSVZ.appendLinesTabularFile({!r}, [["H%d" % i, "v" * 50]])\n').format(HERE, go, n, p)
+	helper = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	written = 0
+	try:
+		lite = TSVZ.TSVZedLite(p, strict=False)
+		_touch(go)  # both writers start now
+		# Keep writing for as long as the helper does, so the two writers overlap.
+		while written < n or (helper.poll() is None and written < 100000):
+			lite['L%d' % written] = ['L%d' % written, 'v' * 50]
+			written += 1
+		lite.close()
+	finally:
+		helper.wait()
+	data = TSVZ.readTabularFile(p, strict=False)
+	missing = [key for key in ['H%d' % i for i in range(n)] + ['L%d' % i for i in range(written)] if key not in data]
+	assert not missing, (len(missing), missing[:10])
+
+
+def test_tsvzed_spec_set_defaults_is_persisted(tmp_path):
+	p = str(tmp_path / 'sd.tsvz')
+	t = TSVZ.TSVZed(p, header='id\tname\tscore')
+	t.setDefaults(['#_defaults_#', 'NONAME', '0'])
+	t['k'] = ['k', 'alice']
+	t['j'] = ['j', '', '']
+	memory = (t['k'], t['j'], list(t.defaults))
+	t.close()
+	assert memory == (['k', 'alice', '0'], ['j', 'NONAME', '0'], ['#_defaults_#', 'NONAME', '0'])
+	assert open(p, 'rb').read() == b'#id\tname\tscore\n#_defaults_#\tNONAME\t0\nk\talice\nj\tNONAME\t0\n'
+	t = TSVZ.TSVZed(p, header='id\tname\tscore')
+	assert (t['k'], t['j'], list(t.defaults)) == memory
+	t.setDefaults(None)  # a reset is written as a lone marker
+	assert t.defaults == ['#_defaults_#'] and t['z'] == ['z', '', '']
+	t.close()
+	t = TSVZ.TSVZed(p, header='id\tname\tscore')
+	assert t.defaults == ['#_defaults_#'] and t['k'] == ['k', 'alice', '0']
+	t.close()
+
+
+def test_lite_spec_set_defaults_is_persisted(tmp_path):
+	p = str(tmp_path / 'sd.tsvz')
+	lite = TSVZ.TSVZedLite(p, header='id\tname\tscore', strict=False)
+	lite.setDefaults(['NONAME', '0'])
+	lite['k'] = ['k', 'alice']
+	lite['j'] = ['j', '', '']
+	memory = (lite['k'], lite['j'], list(lite.defaults))
+	lite.close()
+	assert memory == (['k', 'alice', '0'], ['j', 'NONAME', '0'], ['#_defaults_#', 'NONAME', '0'])
+	lite = TSVZ.TSVZedLite(p, header='id\tname\tscore', strict=False)
+	assert (lite['k'], lite['j'], list(lite.defaults)) == memory
+	lite.close()
+	assert open(p, 'rb').read() == b'#id\tname\tscore\n#_defaults_#\tNONAME\t0\nk\talice\nj\tNONAME\t0\n'
+
+
+def test_set_defaults_during_construction_is_not_written(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, b'#_defaults_#\tF\na\t1\n')
+	t = TSVZ.TSVZed(p, defaults=['X'])  # the file's own #_defaults_# overrides the constructor's
+	t.close()
+	lite = TSVZ.TSVZedLite(p, defaults=['Y'], strict=False)
+	lite.close()
+	assert open(p, 'rb').read() == b'#_defaults_#\tF\na\t1\n'
+
+
+def test_spec_clear_refuses_a_part_path(tmp_path, capsys):
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'k\tv1\n')
+	_touch(base + '.1', b'k\tv2\n')
+	_touch(base + '.rotated', b'k\tv0\n')
+	TSVZ.clearTabularFile(base + '.1')
+	TSVZ.clearTabularFile(base + '.rotated')
+	TSVZ.clearTabularFile(base + '.5')  # a part that does not exist is not created
+	assert open(base + '.1', 'rb').read() == b'k\tv2\n' and open(base + '.rotated', 'rb').read() == b'k\tv0\n'
+	assert not os.path.exists(base + '.5')
+	assert TSVZ.readTabularFile(base) == {'k': ['k', 'v2']}
+	warnings = [w for w in _tsvz_warnings(capsys) if base in w]
+	assert len(warnings) == 3
+	assert all('clear skipped: ' in w and 'names one part of a multi-part store; clear the store path instead; nothing was written' in w
+			   for w in warnings)
+
+
+def test_spec_version_marker_with_too_many_digits_does_not_crash(tmp_path, capsys):
+	p = str(tmp_path / 'v.tsvz')
+	_touch(p, b'#_version_#\t' + b'1' * 5000 + b'\nk\tv\n')
+	assert TSVZ.readTabularFile(p) == {'k': ['k', 'v']}
+	_, state, reporter = _process(['#_version_#\t' + '1' * 5000])
+	reporter.flush()
+	warnings = [w for w in _tsvz_warnings(capsys) if w.startswith(('TSVZ warning: t:', 'TSVZ warning: ' + p))]
+	limit = getattr(sys, 'get_int_max_str_digits', lambda: 0)()
+	if limit and limit < 5000:  # int() refuses it: the marker is ignored and the state kept
+		assert state.version == 1
+		assert len(warnings) == 2 and all('ignored #_version_# with invalid value' in w for w in warnings)
+	else:
+		assert len(warnings) == 2 and all('declares spec version' in w for w in warnings)
+
+
+def test_spec_compressed_repair_never_overwrites_a_backup(tmp_path, monkeypatch, capsys):
+	g = str(tmp_path / 'g.tsvz.gz')
+	monkeypatch.setattr(TSVZ.time, 'strftime', lambda *args: '20261008T120000')
+	synced = []
+	realFsync = os.fsync
+	me = threading.current_thread()
+
+	def fsync(fd):
+		if threading.current_thread() is me:  # not a worker left over from another test
+			synced.append(os.fstat(fd).st_ino)
+		return realFsync(fd)
+	monkeypatch.setattr(TSVZ.os, 'fsync', fsync)
+	first = gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\nbr')[:-6]
+	second = gzip.compress(b'a\t1\n') + gzip.compress(b'c\t3\ncr')[:-6]
+	for damaged in (first, second):
+		_touch(g, damaged)
+		reporter = TSVZ._Reporter(g)
+		assert TSVZ._specRepairCompressed(g, reporter) is True
+		reporter.flush()
+	monkeypatch.undo()
+	backup = g + '.damaged-20261008T120000'
+	assert open(backup, 'rb').read() == first and open(backup + '.1', 'rb').read() == second
+	assert synced == [os.stat(backup).st_ino, os.stat(g).st_ino, os.stat(backup + '.1').st_ino, os.stat(g).st_ino]
+	warnings = [w for w in _tsvz_warnings(capsys) if g in w]
+	assert len(warnings) == 2 and warnings[0].endswith(backup) and warnings[1].endswith(backup + '.1')
 
 
 if __name__ == '__main__':

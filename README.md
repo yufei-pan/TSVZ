@@ -57,21 +57,24 @@ tsvz -V
 - **Reads** everything a conformant writer can produce: markers
   (`#_defaults_#`, `#_strip_trailing_whites_#`, `#_fill_empty_with_default_#`,
   `#_return_defaults_when_missing_#`, ...), escapes (`<sep>`, `<LF>`, `<lt>`,
-  `<#>`), tombstones, `#_checksum_<algo>_#` segments (crc32 and every hashlib
-  algorithm), compressed parts, and **multi-part stores**
+  `<#>`), tombstones, `#_checksum_<algo>_#` segments (crc32 and every
+  fixed-length hashlib algorithm), compressed parts, and **multi-part stores**
   (`store.tsvz.<hex>`, part 0 first, `.rotated` parts skipped).
 - **Writes** one file: the named file, or the highest-numbered part of a
   multi-part store. Rows are written as given (no padding); a lone key is a
   tombstone; a row of empty cells (`k\t\t`) is a live row.
 - **Compaction is manual.** `scrubTabularFile` / `tsvz f.tsvz scrub` rewrites a
-  single-part store in place (same inode). The automatic rewrite options of 3.39
-  (`rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval`, `rewrite()`,
+  single-part store in place (same inode). If another writer commits while it
+  runs, it reads the store again; after three tries it writes nothing, with a
+  warning (`clearTabularFile` does the same). The automatic rewrite options of
+  3.39 (`rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval`, `rewrite()`,
   `mapToFile()`, `hardMapToFile()`) are ignored for `.tsvz`, with a warning.
 - **Missing keys:** `t[key]` returns the defaults row while
   `#_return_defaults_when_missing_#` is true (its default); `in`, `get`,
   `setdefault` and `pop` behave like a dict.
 - **`#` keys** are stored (`<#>key`). Keys of the form `#_name_#` are marker
-  writes: `t['#_defaults_#'] = [...]` sets the defaults.
+  writes: `t['#_defaults_#'] = [...]` sets the defaults, and so does
+  `setDefaults([...])` once the object is constructed.
 
 ## Fault tolerance
 
