@@ -24,7 +24,8 @@ fallback with no semantic guarantees.
 This document specifies the file encoding, the reading procedure, the deletion and
 defaulting model, the reserved marker namespace, field escaping, optional
 integrity checking, compression, multi-part stores, the snapshot (compaction)
-procedure, and a command-line interface for tools (§20).
+procedure, a command-line interface for tools (§20), and a protocol for a
+dedicated write handler (§21).
 
 ---
 
@@ -44,6 +45,9 @@ A **conformant command-line tool** is software that implements §20. It MUST als
 be a conformant reader and a conformant writer for the strict variants. A reader
 or writer is conformant without providing a command-line tool, and §20 does not
 change how files are read or written.
+
+A **conformant handler** is software that implements §21. It MUST also be a
+conformant reader and a conformant writer for the strict variants.
 
 ### 2.2 Definitions
 
@@ -716,7 +720,8 @@ all writes SHOULD be routed through a single dedicated handler process that owns
 the append. Producer threads or processes submit records to the handler over
 in-memory IPC; the handler **batches** them and commits each batch as a single
 append (and a single fsync). This preserves single-writer-per-part while allowing
-many concurrent in-memory producers.
+many concurrent in-memory producers. §21 specifies a protocol for such a handler,
+reached over a local socket.
 
 18.4 **`#_write_ack_#`** controls when the handler acknowledges a submitted record
 back to its producer:
@@ -912,16 +917,30 @@ effect and exit status (§20.6).
 | `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store; it then writes nothing and exits with status 1. |
 | `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: part path, line number, algorithm, expected digest, computed digest. |
 | `parts` | `STORE` | Print the parts of the store in replay order (§17.3), one per line: index (from 0), ordinal in hexadecimal (empty for the unnumbered part 0), path, and flags (`active` for the part appends go to, and the compression codec if any, separated by commas). Parts carrying `.rotated` are not listed. |
+| `has` | `STORE KEY` | Print nothing. Exit with status 0 when KEY is live and 3 when it is not. |
+| `len` | `STORE` | Print the number of live keys. |
+| `keys` | `STORE` | Print each live key on a line of its own, in first-appearance order, encoded as the first field of a record (§13, `<#>` for a leading `#`). |
+| `pop` | `STORE KEY` | Print the resolved row of KEY and append a tombstone for it. When KEY is missing, print nothing, write nothing and exit with status 3. |
+| `popitem` | `STORE [first\|last]` | As `pop`, for the first or the last live key (default `last`). Exit with status 3 when the store has no live key. |
+| `setdefault` | `STORE KEY VALUE [VALUE ...]` | When KEY is live, print its resolved row. Otherwise append the record `KEY VALUE ...` and print the row a reader then returns for KEY. |
 
-20.2.2 `set`, `append`, `delete` and `clear` MUST create a missing store as a part
-at the `STORE` path. `read`, `get`, `scrub`, `verify` and `parts` on a missing
-store MUST NOT create it and MUST exit with status 1.
+20.2.2 `set`, `append`, `delete`, `clear` and `setdefault` MUST create a missing
+store as a part at the `STORE` path. `read`, `get`, `scrub`, `verify`, `parts`,
+`has`, `len`, `keys`, `pop` and `popitem` on a missing store MUST NOT create it and
+MUST exit with status 1.
 
 20.2.3 `verify` of a store that contains no `#_checksum_<algo>_#` markers succeeds.
 
 20.2.4 **Loose variants.** Every operation is available for the loose extensions
 (§5.2); their data semantics are implementation-defined. On a loose file, `verify`
 has nothing to check and `parts` lists the file itself.
+
+20.2.5 `pop`, `popitem` and `setdefault` read and then write. A tool that performs
+them on the files need not make them atomic with respect to other writers; through
+a handler they are atomic (§21.8).
+
+20.2.6 `serve` and `stop` are defined by §21.13. A tool that does not provide a
+handler MUST exit with status 1 and a diagnostic for them.
 
 ### 20.3 Bulk input
 
@@ -1005,6 +1024,194 @@ Implementations MUST put their own operations and long options in that namespace
 20.7.4 A tool MAY keep pre-existing spellings outside the namespace as
 undocumented aliases. This specification gives such aliases no protection from
 future definitions.
+
+### 20.8 Routing through a handler
+
+20.8.1 A tool MAY forward an operation to the handler (§21) that a store's pointer
+file names (§21.2). Standard output and the exit status MUST then be what the
+operation produces on the files without the handler, given the same store
+contents; diagnostics MAY differ.
+
+20.8.2 A tool SHOULD warn and operate on the files when the pointer file is stale
+or its handler does not answer. It SHOULD NOT forward a command line whose result
+depends on options the handler does not share.
+
+---
+
+## 21. Write handler protocol
+
+This section defines how a dedicated write handler (§18.3) is found and talked to
+over a local socket, so that many producers and command-line invocations share one
+loaded store and one appender. It is a separate conformance class (§2.1). Its
+operations, record encoding and exit statuses are those of §20.
+
+### 21.1 Purpose
+
+21.1.1 A **handler** is a process that serves exactly one store: it keeps the
+store's resolved state, answers requests about it, and appends every write it
+receives (§18.3).
+
+21.1.2 A handler is not the only possible writer. Other writers MAY append to the
+store directly, and the handler MUST follow them (§21.8).
+
+### 21.2 Pointer file
+
+21.2.1 The **pointer file** of a store is the store path (§17.1) as given,
+including any compression suffix, followed by `.serve`; for example
+`data.tsvz.serve`. It is not a part: Appendix A does not match it.
+
+21.2.2 Its content is UTF-8 lines of `NAME<TAB>VALUE`, each VALUE encoded per §13
+with TAB as the delimiter. The first line is `tsvz-handler<TAB>1`, naming the
+format and the protocol version. The other lines may come in any order:
+
+| Name | Value |
+|---|---|
+| `address` | `unix:PATH` for a Unix-domain socket, or `tcp:HOST:PORT` with a loopback HOST (`127.0.0.1` or `[::1]`). |
+| `host` | The name of the host the handler runs on. |
+| `pid` | The handler's process id. |
+| `token` | Present with a TCP address: the token of §21.11. |
+
+Readers MUST ignore names they do not know. Names beginning with `x-` belong to
+implementations.
+
+21.2.3 A handler MUST hold an exclusive advisory lock on its pointer file (on
+POSIX, `flock(2)` on the whole file) for as long as it serves, and MUST refuse to
+start while another process holds that lock. It writes the pointer file in place
+under the lock, never by renaming another file over it, and removes it when it
+stops cleanly.
+
+21.2.4 A client MUST NOT use a pointer file whose first line is not
+`tsvz-handler<TAB>1`, that names another host, or whose handler does not accept a
+connection. Such a pointer is stale until a handler obtains the lock and rewrites
+it.
+
+### 21.3 Transport
+
+21.3.1 A handler listens on a stream socket on the local host: a Unix-domain socket
+where the platform has one, else TCP on a loopback address.
+
+21.3.2 A connection carries any number of requests, one at a time: the client sends
+a request and reads its whole response before it sends the next one.
+
+### 21.4 Framing and encoding
+
+21.4.1 Requests and responses are UTF-8 text lines, each ending in `\n`. A handler
+SHOULD remove one `\r` before the `\n` of a request line.
+
+21.4.2 Fields are separated by TAB and encoded per §13 with TAB as the delimiter,
+whatever the store's variant.
+
+21.4.3 Each field of a request is decoded per §13 before use. A key whose written
+form matches the reserved pattern (§12.2) is a marker key, as in §20.2; a key
+written with `<#>` is a data key.
+
+### 21.5 Requests
+
+21.5.1 A request line is `[OPTION ...] OPERATION [ARG ...]`: the form of §20.1
+without `STORE`, which the connection implies.
+
+21.5.2 Fields before the operation that begin with `--` are options. Version 1
+defines one: `--sync`, which makes the handler acknowledge the request's writes
+only after they are on durable storage (§21.9).
+
+### 21.6 Responses
+
+21.6.1 A response is zero or more lines followed by exactly one status line:
+
+- **Output lines** carry the operation's output in the TSVZ variant: rows as
+  `read --format records` prints them (§20.4.1), and the lines §20 defines for
+  `len`, `keys`, `verify` and `parts`. A first field that begins with `#` is
+  written `<#>…`.
+- **Diagnostic lines** are `#!<TAB>TEXT`, with TEXT encoded per §13. A
+  command-line tool copies TEXT to standard error.
+- **The status line** is `#` followed by the exit status of §20.6 in decimal,
+  optionally followed by `<TAB>MESSAGE` encoded per §13. It ends the response.
+
+21.6.2 Output lines never begin with an unencoded `#`, so the first two
+characters of a line decide its kind.
+
+### 21.7 Operations
+
+21.7.1 A handler MUST implement every operation of §20.2 except `serve`, with the
+effect, output and exit status that §20 gives it, and these two:
+
+| Operation | Effect |
+|---|---|
+| `stop` | Make every acknowledged write durable, reply `#0`, then stop serving (§21.13). |
+| `auth TOKEN` | Authenticate the connection (§21.11). |
+
+21.7.2 **Bulk input.** A `set -`, `append -` or `delete -` request is followed by
+record lines in the protocol encoding, handled as §20.3 handles standard input,
+and ended by a line consisting of exactly `#`. They are appended as a single
+batch. Nothing is written when the connection ends before that line.
+
+21.7.3 `setdefault` with a marker key is a usage error (status 2).
+
+### 21.8 Consistency
+
+21.8.1 A response reflects every write the handler acknowledged before it received
+the request, and every record committed to the store's files (§4.3) before it
+received the request, subject to the file system's visibility rules.
+
+21.8.2 `pop`, `popitem` and `setdefault` are atomic: no other request's write is
+applied between their read and their write.
+
+21.8.3 Writes received on one connection are applied in the order received.
+
+21.8.4 The handler appends with whole-record writes (§18.2) to one part of the
+store, the part its appends go to (§17, §17.7), using the same locks as any other
+writer (§18.6).
+
+21.8.5 The handler's state is what a conformant reader returns for the store's
+files at that moment. When a part cannot be read, `read`, `get`, `has` and
+`verify` answer with status 1 and still return what could be read.
+
+### 21.9 Acknowledgement
+
+21.9.1 While `#_write_ack_#` is `memory` (§18.4), the handler acknowledges a write
+once it is in its batch buffer, and SHOULD write the batch without deliberate
+delay.
+
+21.9.2 While `#_write_ack_#` is `disk`, or when the request carries `--sync`, the
+handler acknowledges a write only after its batch is written and `fsync`'d.
+
+21.9.3 `stop` and a clean shutdown make every acknowledged write durable first.
+
+### 21.10 Errors
+
+21.10.1 A request that does not parse, names an unknown operation or option, or
+has the wrong arguments gets status 2, and the connection stays usable.
+
+21.10.2 A handler MAY close a connection whose line exceeds an implementation
+limit; the limit MUST be at least 1 MiB.
+
+21.10.3 Any other failure of a request gets status 1 with a message; the handler
+keeps serving.
+
+### 21.11 Access
+
+21.11.1 A handler SHOULD by default accept connections only from the user it runs
+as, for example through a Unix socket of mode 0600 in a directory only that user
+can enter. Wider access MUST be an explicit choice of whoever starts it.
+
+21.11.2 A handler on TCP MUST require authentication: the first line of a
+connection is `auth<TAB>TOKEN`, with TOKEN from the pointer file, and the handler
+answers `#0`, or answers status 1 and closes the connection. The pointer file's
+permissions then govern who may connect.
+
+### 21.12 Extensions
+
+Operations beginning with `x-`, options beginning with `--x-`, and exit statuses
+64–125 belong to implementations, as in §20.7.2.
+
+### 21.13 `serve` and `stop`
+
+21.13.1 `serve STORE` starts a handler for STORE in the foreground. It creates a
+missing store as `set` does, exits with status 1 when another handler holds the
+pointer lock, and exits with status 0 after a clean stop.
+
+21.13.2 `stop STORE` sends `stop` to the handler of STORE and exits with status 0
+once it has replied. It exits with status 1 when no handler answers.
 
 ---
 
@@ -1176,4 +1383,29 @@ else
     echo "tsvz failed" >&2
     exit 1
 fi
+```
+
+A handler (§21), driven from the shell:
+
+```
+$ tsvz serve people.tsvz &
+tsvz: serving people.tsvz at unix:/run/user/1000/tsvz-k3x9/s (pid 41234)
+$ tsvz get people.tsvz alice              # answered by the handler
+alice	Alice	30
+$ printf 'get\talice\nlen\n' | socat - UNIX-CONNECT:/run/user/1000/tsvz-k3x9/s
+alice	Alice	30
+#0
+2
+#0
+$ tsvz stop people.tsvz
+```
+
+From Python, with TSVZ's client:
+
+```python
+import TSVZ
+
+with TSVZ.TSVZClient('people.tsvz') as people:
+    people['carol'] = ['carol', 'Carol', '25']
+    print(people['alice'], len(people))
 ```

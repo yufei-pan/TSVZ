@@ -267,8 +267,11 @@ stop. A TCP handler adds a random `token` and gives the pointer file the
 socket's mode.
 
 **Server lifecycle.** `tsvz serve STORE [--x-idle-timeout S] [--x-group G]
-[--x-mode MODE] [--x-header H] [--x-defaults D]`: lock, load, bind, write
-pointer, log the address on stderr, serve. SIGINT/SIGTERM or `stop`: stop
+[--x-mode MODE] [--x-tcp] [--x-header H] [--x-defaults D]`: lock, load, bind,
+write pointer, log the address on stderr, serve. `--x-header` and `--x-defaults`
+apply only when `serve` creates the store; the served view never uses initial
+defaults or 3.39 strict mode, so routed output equals direct output (§20.8).
+`--x-tcp` uses the TCP transport on any platform. SIGINT/SIGTERM or `stop`: stop
 accepting, drain the queue, `fsync`, remove socket, socket directory and pointer,
 exit 0. Idle timeout: the same after S seconds with no connection. Tolerance
 events are reported once per kind on stderr (as everywhere in 4.1) and as `#!`
@@ -281,12 +284,15 @@ over TCP, and `request(fields, options, bulkLines=None) -> (lines, diagnostics,
 status)`.
 
 **CLI routing.** In `_cliMain`, before running a store operation (everything but
-`serve`), unless `--x-direct`: find the pointer; if live, forward. Output
+`serve` and `stop`): find the pointer; if live, forward. A command line is
+forwarded only when it has none of `--x-direct`, `--x-header`, `--x-defaults`,
+`--x-strict`, and, for a loose file, the server's delimiter (the pointer records
+it as `x-delimiter`). Output
 re-encodes protocol rows into the store's own delimiter for records, or prints
 the table; diagnostics go to stderr (`-q` drops warnings); the status is the
 exit code. A stale or unreachable pointer: one warning, then the direct path.
 
-**`TSVZClient(fileName, sync=False, timeout=5, teeLogger=None)`.** A
+**`TSVZClient(fileName, sync=False, timeout=None, teeLogger=None)`.** A
 MutableMapping with `TSVZed`'s semantics:
 
 - `c[k]`: the row; for a missing key of a spec store the §14.5 defaults row while
@@ -297,7 +303,9 @@ MutableMapping with `TSVZed`'s semantics:
   `clear()`, `setDefaults()` (a `#_defaults_#` marker write), `close()`, `with`.
 - `c[k] = v` normalises `v` as `TSVZed.__setitem__` does (a string is split on
   the store's delimiter; the key is put first when missing), then `set`s it.
-  `del c[k]` uses `pop`, so a missing key raises `KeyError`.
+  `del c[k]` writes a tombstone; a missing key is not an error, as in `TSVZed`.
+- `timeout` is the time to wait for each answer (None: no limit); connecting
+  gives up after 0.5 s.
 - `sync=True` adds `--sync` to every write.
 - `move_to_end`, `rewrite`, `mapToFile`, `hardMapToFile` raise
   `NotImplementedError` (order is first appearance, §3.4; rewriting is `scrub`).
