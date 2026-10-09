@@ -444,7 +444,11 @@ def _legacy_corpora(d):
 
 def _drive_tsvzed(mod, path, ops):
 	seen = []
-	kwargs = dict(header=LEGACY_HEADER, append_check_delay=0.001)
+	# monitor_external_changes=False: with it on, the append worker can mistake this
+	# instance's own write for an external change and rewrite queued rows that the
+	# same tick then appends again -- a timing race 3.39 has too, so the two modules'
+	# bytes could differ by luck. Both modules get the same settings.
+	kwargs = dict(header=LEGACY_HEADER, append_check_delay=0.001, monitor_external_changes=False)
 	t = mod.TSVZed(path, **kwargs)
 	for op in ops:
 		if op[0] == 'reopen':
@@ -2142,6 +2146,31 @@ def test_spec_compressed_repair_never_overwrites_a_backup(tmp_path, monkeypatch,
 	assert synced == [os.stat(backup).st_ino, os.stat(g).st_ino, os.stat(backup + '.1').st_ino, os.stat(g).st_ino]
 	warnings = [w for w in _tsvz_warnings(capsys) if g in w]
 	assert len(warnings) == 2 and warnings[0].endswith(backup) and warnings[1].endswith(backup + '.1')
+
+
+def test_lite_spec_write_locks_and_unlocks_at_raw_offset_zero(tmp_path, monkeypatch):
+	# msvcrt.locking locks from the raw fd position, so the lock and the unlock in
+	# TSVZedLite._specWrite must both start at raw offset 0, even after a read has
+	# filled the buffered file object's read buffer from offset 0.
+	p = str(tmp_path / 'w.tsvz')
+	_touch(p, b'k0\t' + b'v' * 200 + b'\nk1\tx\n')
+	positions = []
+	real_lock, real_unlock = TSVZ._lockFile, TSVZ._unlockFile
+
+	def lock(f):
+		positions.append(('lock', os.lseek(f.fileno(), 0, os.SEEK_CUR)))
+		real_lock(f)
+
+	def unlock(f):
+		positions.append(('unlock', os.lseek(f.fileno(), 0, os.SEEK_CUR)))
+		real_unlock(f)
+	monkeypatch.setattr(TSVZ, '_lockFile', lock)
+	monkeypatch.setattr(TSVZ, '_unlockFile', unlock)
+	lite = TSVZ.TSVZedLite(p, strict=False)
+	assert lite['k0'][0] == 'k0'
+	lite['k2'] = ['k2', 'y']
+	lite.close()
+	assert positions == [('lock', 0), ('unlock', 0)]
 
 
 if __name__ == '__main__':

@@ -586,6 +586,17 @@ def _unlockFile(f):
 		pass
 
 
+def _seekRawStart(f):
+	"""Move a buffered file object's underlying fd to offset 0.
+
+	A plain ``f.seek(0)`` can be served from the read buffer without moving the
+	raw position, but ``msvcrt.locking`` locks from the raw position. Seeking to
+	the end first discards the buffer, so the following seek really moves it.
+	"""
+	f.seek(0, os.SEEK_END)
+	f.seek(0)
+
+
 def _lastNewlineEnd(f, size):
 	"""Return the offset just after the last b'\\n' within the first ``size`` bytes of ``f``, or 0."""
 	position = size
@@ -3822,7 +3833,7 @@ class TSVZedLite(MutableMapping):
 		with _pathLock(self._activePath):
 			# The 3.39 exclusive lockf, as every other writer takes: under it an
 			# unterminated tail really is uncommitted, and the end cannot move.
-			f.seek(0)  # msvcrt locks from the current position: lock and unlock the same range
+			_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
 			_lockFile(f)
 			try:
 				size = f.seek(0, os.SEEK_END)
@@ -3840,7 +3851,7 @@ class TSVZedLite(MutableMapping):
 				f.flush()
 			finally:
 				try:
-					f.seek(0)
+					_seekRawStart(f)
 				except Exception:
 					pass  # a failed write is already propagating; the lock must still be released
 				_unlockFile(f)
