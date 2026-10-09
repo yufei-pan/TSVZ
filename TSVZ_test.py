@@ -2530,5 +2530,63 @@ def test_cli_read_piped_into_set_copies_the_store(tmp_path, ext):
 	assert list(TSVZ.readTabularFile(dst, verifyHeader=False).items()) == expected
 
 
+# ==========================================================================
+# CLI (spec §20.2): verify and parts
+# ==========================================================================
+def _crc32(data):
+	import zlib
+	return '%08x' % (zlib.crc32(data) & 0xffffffff)
+
+
+def test_cli_verify(tmp_path):
+	p = str(tmp_path / 'v.tsvz')
+	_touch(p, ('#_checksum_crc32_#\na\t1\nb\t2\n#_checksum_crc32_#\t' + _crc32(b'a\t1\nb\t2\n') + '\n'
+			   'c\t3\n#_checksum_crc32_#\tdeadbeef\n').encode())
+	assert _run('verify', p) == (4, '{}\t6\tcrc32\tdeadbeef\t{}\n'.format(p, _crc32(b'c\t3\n')), '')
+	status, out, _ = _run('verify', p, '--format', 'table')
+	assert status == 4 and 'expected' in out and 'deadbeef' in out
+	m = str(tmp_path / 'm.tsvz')  # a digest runs across parts (spec §17.4); lines count per part
+	_touch(m, b'#_checksum_crc32_#\na\t1\n')
+	_touch(m + '.1', b'b\t2\n#_checksum_crc32_#\t00000000\n')
+	assert _run('verify', m) == (4, '{}.1\t2\tcrc32\t00000000\t{}\n'.format(m, _crc32(b'a\t1\nb\t2\n')), '')
+	clean = str(tmp_path / 'clean.tsvz')
+	_touch(clean, ('#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t' + _crc32(b'a\t1\n') + '\n').encode())
+	assert _run('verify', clean) == (0, '', '')
+	plain = str(tmp_path / 'plain.tsvz')
+	_touch(plain, b'a\t1\n')
+	assert _run('verify', plain) == (0, '', '')  # no markers: nothing to check (spec §20.2.3)
+	loose = str(tmp_path / 'loose.tsv')
+	_touch(loose, b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t00000000\n')
+	assert _run('verify', loose) == (0, '', '')  # a loose file has no checksums (spec §20.2.4)
+	odd = str(tmp_path / 'odd.tsvz')
+	_touch(odd, b'#_checksum_nosuchalgo_#\na\t1\n#_checksum_nosuchalgo_#\tff\n')
+	status, out, err = _run('verify', odd)
+	assert (status, out) == (0, '') and 'not verified' in err
+	status, out, err = _run('verify', str(tmp_path / 'none.tsvz'))
+	assert (status, out) == (1, '') and 'no such store' in err
+
+
+def test_cli_parts(tmp_path):
+	base = str(tmp_path / 'e.tsvz')
+	_touch(base, b'a\t1\n')
+	_touch(base + '.0190c3a1', b'b\t2\n')
+	_touch(base + '.0a.gz', gzip.compress(b'c\t3\n'))
+	_touch(base + '.2.rotated', b'')
+	assert _run('parts', base) == (0, '0\t\t{0}\t\n1\t0a\t{0}.0a.gz\tgz\n2\t0190c3a1\t{0}.0190c3a1\tactive\n'.format(base), '')
+	status, out, _ = _run('parts', base, '--format', 'table')
+	assert status == 0 and 'ordinal' in out and '|' in out
+	numbered = str(tmp_path / 'n.tsvz')
+	_touch(numbered + '.1', b'k\tv\n')
+	assert _run('parts', numbered) == (0, '0\t1\t{}.1\tactive\n'.format(numbered), '')
+	loose = str(tmp_path / 'x.tsv')
+	_touch(loose, b'k\tv\n')
+	assert _run('parts', loose) == (0, '0\t\t{}\tactive\n'.format(loose), '')
+	packed = str(tmp_path / 'y.tsv.gz')
+	_touch(packed, gzip.compress(b'k\tv\n'))
+	assert _run('parts', packed) == (0, '0\t\t{}\tactive,gz\n'.format(packed), '')
+	status, out, err = _run('parts', str(tmp_path / 'none.tsvz'))
+	assert (status, out) == (1, '') and 'no such store' in err
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

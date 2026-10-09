@@ -531,6 +531,10 @@ class _Reporter(object):
 		else:
 			event[0] += 1
 
+	def discard(self, kind):
+		"""Forget the events of ``kind`` (for a caller that reports them another way)."""
+		self._events.pop(kind, None)
+
 	def flush(self):
 		for count, where, detail in self._events.values():
 			message = 'TSVZ warning: {}: {}'.format(self.path, detail)
@@ -1482,6 +1486,7 @@ class _SpecState(object):
 		self.writeAck = 'memory'
 		self.sawDefaults = False
 		self.digests = {}
+		self.mismatches = []
 		self.rowState = None
 		self.refresh()
 
@@ -1767,8 +1772,12 @@ def _decodeLine(raw, reporter, where):
 	return text
 
 
-def _specChecksum(state, algo, text, delimiter, reporter, where):
-	"""Arm or verify-and-reset the ``algo`` accumulator (spec §15.3)."""
+def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
+	"""Arm or verify-and-reset the ``algo`` accumulator (spec §15.3).
+
+	A mismatch is noted on ``reporter`` and appended to ``state.mismatches`` as
+	``position + (algo, expected, computed)``; ``position`` is ``(partPath, lineNo)``.
+	"""
 	if algo in state.digests:
 		fields = text.split(delimiter)
 		expected = fields[1].strip().lower() if len(fields) > 1 else ''
@@ -1776,6 +1785,7 @@ def _specChecksum(state, algo, text, delimiter, reporter, where):
 			actual = state.digests[algo].hexdigest()
 			if actual != expected:
 				reporter.note('checksum', where, '#_checksum_{}_# mismatch: expected {}, computed {}; data kept'.format(algo, expected, actual))
+				state.mismatches.append(tuple(position or (None, None)) + (algo, expected, actual))
 	state.digests[algo] = _newDigest(algo)
 
 
@@ -1807,7 +1817,7 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 				if name != algo:
 					digest.update(raw)
 			if algo:
-				_specChecksum(state, algo, text, delimiter, reporter, where)
+				_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
 				continue
 			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
 
@@ -1854,6 +1864,24 @@ def _storeParts(path, reporter=None):
 	parts += [os.path.join(directory, entry) for _, entry in numbered]
 	return parts, (parts[-1] if numbered else path)
 
+
+
+def _specVerify(fileName, delimiter, reporter):
+	"""Replay the store ``fileName`` names and return its checksum mismatches (spec §15).
+
+	Each mismatch is ``(partPath, lineNo, algo, expected, computed)``, where
+	``lineNo`` is the 1-based line of the checksum marker in its part. The
+	mismatches are returned rather than reported. A checksum marker whose
+	algorithm this Python lacks is reported, since it cannot be verified.
+	"""
+	state = _SpecState()
+	parts, _ = _storeParts(fileName, reporter)
+	for _, _, text, _ in _specReplay(parts, delimiter, state, reporter, []):
+		check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+		if check:
+			reporter.note('checksum-unsupported', None, '#_checksum_{}_# not verified: this Python does not provide that algorithm'.format(check.group(1).lower()))
+	reporter.discard('checksum')
+	return state.mismatches
 
 
 class _SpecLoad(object):
@@ -4751,8 +4779,51 @@ def _cliScrub(args, delimiter, logger, stdin, stdout):
 	return 1
 
 
+def _cliVerify(args, delimiter, logger, stdin, stdout):
+	"""``verify STORE`` (spec §20.2): one line per checksum mismatch; exit 4 when there is one."""
+	if not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	if not _isSpecPath(args.store):
+		return 0  # a loose file has no checksums (spec §20.2.4)
+	reporter = _Reporter(args.store, logger)
+	try:
+		mismatches = _specVerify(args.store, delimiter, reporter)
+	finally:
+		reporter.flush()
+	rows = [[path, str(lineNo), algo, expected, computed] for path, lineNo, algo, expected, computed in mismatches]
+	_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
+	return 4 if rows else 0
+
+
+def _cliParts(args, delimiter, logger, stdin, stdout):
+	"""``parts STORE`` (spec §20.2): index, hexadecimal ordinal, path and flags of each part, in replay order."""
+	if not _cliStoreExists(args.store):
+		raise _CliStoreMissing()
+	if _isSpecPath(args.store):
+		reporter = _Reporter(args.store, logger)
+		try:
+			parts, active = _storeParts(args.store, reporter)
+		finally:
+			reporter.flush()
+	else:
+		parts, active = [args.store], args.store  # a loose file is its only part (spec §20.2.4)
+	rows = []
+	for index, path in enumerate(parts):
+		name = _parsePartName(path)
+		ordinal = ''
+		if name.ordinal is not None:
+			base = os.path.basename(path)
+			if name.codec:
+				base = base[:-len(name.codec) - 1]
+			ordinal = base.rpartition('.')[2]  # as the file name spells it
+		flags = (['active'] if path == active else []) + ([name.codec] if name.codec else [])
+		rows.append([str(index), ordinal, path, ','.join(flags)])
+	_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
+	return 0
+
+
 _CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
-				 'clear': _cliClear, 'scrub': _cliScrub}
+				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts}
 
 
 def _cliMain(argv, stdin=None, stdout=None, stderr=None):
