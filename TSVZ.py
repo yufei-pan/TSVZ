@@ -585,6 +585,25 @@ def _lockFile(f):
 		msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
 
 
+def _tryLockFile(f):
+	"""Take an exclusive whole-file lock without waiting; return False when another handle holds it.
+
+	POSIX uses ``flock``: it belongs to the open file description, so closing
+	another descriptor of the same file in this process does not drop it.
+	Windows locks are mandatory, so there one byte far past the content is
+	locked and readers can still read the file.
+	"""
+	try:
+		if os.name == 'posix':
+			fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+		elif os.name == 'nt':
+			os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)
+			msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+		return True
+	except OSError:
+		return False
+
+
 def _unlockFile(f):
 	try:
 		if os.name == 'posix':
@@ -1146,28 +1165,45 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 				# if lineCache:
 				# 	taskDic[lineCache[0]] = lineCache
 				return lineCache
-			lines = iter(file)
-			while True:
-				try:
-					line = next(lines)
-				except StopIteration:
-					break
-				except Exception as e:
-					# L5: a damaged compressed stream ends the read instead of raising.
-					if not _isCompressedFile(fileName):
-						raise
-					reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
-					break
-				lineNo += 1
-				try:
-					text = line.decode(encoding=encoding)
-				except UnicodeDecodeError:
-					text = line.decode(encoding=encoding,errors='replace')
-					reporter.note('decode', 'line {}'.format(lineNo), 'invalid {} replaced with U+FFFD'.format(encoding))
-				correctColumnNum, _ = _processLine(text,taskDic,correctColumnNum,strict = strict,delimiter=delimiter,defaults = defaults,storeOffset=storeOffset,offset=file.tell()-len(line),reporter=reporter)
+			_legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults,
+							storeOffset, encoding, reporter)
 	finally:
 		reporter.flush()
 	return taskDic
+
+
+def _legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults, storeOffset,
+					encoding, reporter):
+	"""3.39's read loop over the rest of an open legacy file (``readTabularFile``).
+
+	Returns ``(correctColumnNum, committed, lineNo)``: the column count after
+	the last line, the offset just past the last line that ends in b'\\n'
+	(decompressed bytes for a compressed file) and the number of lines read.
+	"""
+	committed = file.tell()
+	lines = iter(file)
+	while True:
+		try:
+			line = next(lines)
+		except StopIteration:
+			break
+		except Exception as e:
+			# L5: a damaged compressed stream ends the read instead of raising.
+			if not _isCompressedFile(fileName):
+				raise
+			reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+			break
+		lineNo += 1
+		try:
+			text = line.decode(encoding=encoding)
+		except UnicodeDecodeError:
+			text = line.decode(encoding=encoding,errors='replace')
+			reporter.note('decode', 'line {}'.format(lineNo), 'invalid {} replaced with U+FFFD'.format(encoding))
+		position = file.tell()
+		correctColumnNum, _ = _processLine(text,taskDic,correctColumnNum,strict = strict,delimiter=delimiter,defaults = defaults,storeOffset=storeOffset,offset=position-len(line),reporter=reporter)
+		if line.endswith(b'\n'):
+			committed = position
+	return correctColumnNum, committed, lineNo
 
 def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):
 	"""
@@ -1236,6 +1272,32 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
 		return
+	payload, count = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
+										  strict, delimiter)
+	if not count:
+		if verbose:
+			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
+		return
+	if _isCompressedFile(fileName):
+		with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
+			file.write(payload)
+	else:
+		# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
+		# instead of gluing the new record onto it.
+		reporter = _Reporter(fileName, teeLogger)
+		_lockedAppend(fileName, payload, 'newline', reporter)
+		reporter.flush()
+	if verbose:
+		__teePrintOrNot(f"Appended {count} lines to {fileName}",teeLogger=teeLogger)
+
+
+def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter):
+	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
+
+	``header`` is a formatted header list and ``delimiter`` a resolved
+	delimiter. Rows are sanitised and padded or cut to the column count: the
+	header's when the file's first line matches it, else the longest row's.
+	"""
 	formatedLines = []
 	for line in linesToAppend:
 		if isinstance(linesToAppend,dict):
@@ -1260,9 +1322,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 				line = [key]+line
 		formatedLines.append(_sanitize(line,delimiter=delimiter))
 	if not formatedLines:
-		if verbose:
-			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
-		return
+		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
 	if any(header) and verifyHeader:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
@@ -1278,17 +1338,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 		elif len(formatedLines[i]) > correctColumnNum:
 			formatedLines[i] = formatedLines[i][:correctColumnNum]
 	payload = b'\n'.join([delimiter.join(line).encode(encoding=encoding,errors='replace') for line in formatedLines]) + b'\n'
-	if _isCompressedFile(fileName):
-		with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
-			file.write(payload)
-	else:
-		# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
-		# instead of gluing the new record onto it.
-		reporter = _Reporter(fileName, teeLogger)
-		_lockedAppend(fileName, payload, 'newline', reporter)
-		reporter.flush()
-	if verbose:
-		__teePrintOrNot(f"Appended {len(formatedLines)} lines to {fileName}",teeLogger=teeLogger)
+	return payload, len(formatedLines)
 
 def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t'):
 	"""
@@ -1660,6 +1710,8 @@ class _PartInfo(object):
 		self.tail = b''
 		self.damaged = ''
 		self.goodRawEnd = 0
+		self.committed = 0  # bytes of committed lines read (decompressed bytes for a compressed part)
+		self.lines = 0  # committed lines replayed (set by _specReplay)
 
 
 def _newDecompressor(codec):
@@ -1754,7 +1806,9 @@ def _iterPartLines(info, reporter):
 				rest = data[start:]
 		except OSError as e:
 			reporter.note('unreadable', None, 'stopped reading part {} ({})'.format(info.path, e))
+			info.committed = offset
 			return
+	info.committed = offset
 	if rest:
 		info.tail = rest
 		reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(rest[:80]))
@@ -1824,6 +1878,32 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 				_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
 				continue
 			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
+		info.lines = lineNo
+
+
+def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter):
+	"""Replay one committed line of the part ``path``, as ``_specReplay`` does for each line.
+
+	``raw`` is the line with its b'\\n'; ``lineNo`` counts from 1 within the
+	part and ``label`` prefixes locations in reports. Returns ``(text,
+	record)`` as ``_specProcessRecord`` sees it, or None for the checksum
+	marker of a supported algorithm. (``_specReplay`` keeps this logic inline
+	for speed; the two must stay in step.)
+	"""
+	where = '{}line {}'.format(label, lineNo)
+	if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
+		raw = raw[3:]
+		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+	text = _decodeLine(raw, reporter, where)
+	check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+	algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
+	for name, digest in state.digests.items():
+		if name != algo:
+			digest.update(raw)
+	if algo:
+		_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
+		return None
+	return text, _specProcessRecord(text, state, delimiter, reporter, where)
 
 
 def _storeParts(path, reporter=None):
@@ -1952,12 +2032,7 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 		if row is None:
 			data.pop(key, None)
 			continue
-		if width == -1:
-			width = len(state.defaults) if len(state.defaults) > 1 else len(row)
-		target = max(width, len(state.defaults))
-		if len(row) < target:
-			bound = state.defaults
-			row.extend(bound[j] if j < len(bound) else '' for j in range(len(row), target))
+		width = _specPadRow(row, state, width)
 		result.lastLine = (offset, row)
 		if storeOffset and partIndex == activeIndex and not result.infos[partIndex].codec:
 			if state.rowState is not lastRowState:
@@ -1970,6 +2045,21 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
 	result.correctColumnNum = width
 	return result
+
+
+def _specPadRow(row, state, width):
+	"""Pad a data row in place to the store width with its row-bound defaults (design §4.7).
+
+	``width`` is the store width so far (-1 before the first data row); the
+	width after this row is returned. Nothing is trimmed.
+	"""
+	if width == -1:
+		width = len(state.defaults) if len(state.defaults) > 1 else len(row)
+	target = max(width, len(state.defaults))
+	if len(row) < target:
+		bound = state.defaults
+		row.extend(bound[j] if j < len(bound) else '' for j in range(len(row), target))
+	return width
 
 
 def _specOptions(fileName, delimiter, encoding, reporter):
@@ -4758,26 +4848,43 @@ def _cliStdinBatch(args, delimiter, logger, stdin, keysOnly):
 	"""
 	spec = _isSpecPath(args.store)
 	source = _Reporter('<stdin>', logger)
-	batch = []
 	try:
-		for lineNo, text in enumerate(_cliStdinLines(stdin, source), 1):
-			fields = text.split(delimiter)
-			if keysOnly:
-				fields = fields[:1]
-			first = fields[0]
-			if _MARKER_RE.match(first):
-				batch.append(delimiter.join(fields) if spec else _unsanitize(fields, delimiter))
-				continue
-			if first.startswith('#') or not text:
-				continue
-			cells = [_specDecodeField(field, delimiter) for field in fields] if spec else _unsanitize(fields, delimiter)
-			if not cells[0]:
-				source.note('empty-key', 'line {}'.format(lineNo), 'skipped a line with an empty key')
-				continue
-			batch.append(_specFormatRecord(cells, delimiter) if spec else cells)
+		rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, spec, keysOnly, source)
 	finally:
 		source.flush()
-	return batch
+	if not spec:
+		return [cells for cells, marker in rows]
+	return [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows]
+
+
+def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
+	"""Parse record lines of a stream (spec §20.3) into ``[(cells, marker), ...]``.
+
+	A line whose first field matches the reserved pattern is a marker line
+	(``marker`` True, key kept as written). Other fields are decoded per §13
+	for a spec store, by 3.39's rules otherwise. Comment lines and empty lines
+	are skipped, and so is a line with an empty key (reported on
+	``reporter``). ``keysOnly`` keeps the first field only.
+	"""
+	rows = []
+	for lineNo, text in enumerate(texts, 1):
+		fields = text.split(delimiter)
+		if keysOnly:
+			fields = fields[:1]
+		first = fields[0]
+		marker = bool(_MARKER_RE.match(first))
+		if not marker and (first.startswith('#') or not text):
+			continue
+		if spec:
+			cells = [first] + [_specDecodeField(field, delimiter) for field in fields[1:]] if marker else \
+				[_specDecodeField(field, delimiter) for field in fields]
+		else:
+			cells = _unsanitize(fields, delimiter)
+		if not cells[0]:
+			reporter.note('empty-key', 'line {}'.format(lineNo), 'skipped a line with an empty key')
+			continue
+		rows.append((cells, marker))
+	return rows
 
 
 def _cliAppendBatch(args, delimiter, logger, batch):

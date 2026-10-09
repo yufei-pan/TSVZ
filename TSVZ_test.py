@@ -2667,5 +2667,93 @@ def test_cli_delimiter_option_is_checked(tmp_path):
 	assert (status, out) == (2, '') and 'usage: tsvz' in err
 
 
+# ==========================================================================
+# Write handler (spec §21): library helpers
+# ==========================================================================
+def test_part_info_counts_committed_bytes(tmp_path):
+	p = str(tmp_path / 'c.tsvz')
+	_touch(p, b'a\t1\nb\t2\ntorn')
+	info = TSVZ._PartInfo(p)
+	reporter = TSVZ._Reporter(p)
+	assert [raw for raw, _ in TSVZ._iterPartLines(info, reporter)] == [b'a\t1\n', b'b\t2\n']
+	assert (info.committed, info.tail) == (8, b'torn')
+	assert TSVZ._specLoad(p, '\t', reporter=TSVZ._Reporter(p)).infos[0].lines == 2
+
+
+def test_spec_replay_line_matches_spec_replay(tmp_path):
+	p = str(tmp_path / 'r.tsvz')
+	good = '%08x' % (__import__('zlib').crc32(b'a\t1\n') & 0xffffffff)
+	_touch(p, ('\ufeff#_defaults_#\t\tD\n#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t' + good + '\n'
+			   '<#>h\tx<sep>y\nb\n#c\n\xe9\t2\n').encode('utf-8') + b'bad\xff\t3\n')
+	whole = TSVZ._SpecState()
+	expected = [(text, record) for _, _, text, record in
+				TSVZ._specReplay([p], '\t', whole, TSVZ._Reporter(p), [])]
+	single = TSVZ._SpecState()
+	reporter = TSVZ._Reporter(p)
+	got = []
+	for lineNo, (raw, _) in enumerate(TSVZ._iterPartLines(TSVZ._PartInfo(p), reporter), 1):
+		replayed = TSVZ._specReplayLine(raw, lineNo, '', p, single, '\t', reporter)
+		if replayed is not None:
+			got.append(replayed)
+	assert got == expected
+	assert single.defaults == whole.defaults == ['#_defaults_#', '', 'D']
+	assert single.mismatches == whole.mismatches == []
+
+
+def test_spec_pad_row():
+	state = TSVZ._SpecState(['#_defaults_#', 'x', 'y'])
+	row = ['k', '1']
+	assert TSVZ._specPadRow(row, state, -1) == 3 and row == ['k', '1', 'y']
+	row = ['k', '1', '2', '3']
+	assert TSVZ._specPadRow(row, state, 3) == 3 and row == ['k', '1', '2', '3']
+
+
+def test_legacy_read_loop_reports_width_and_committed_offset(tmp_path):
+	p = str(tmp_path / 'l.tsv')
+	_touch(p, b'k\tv\nj\tw\nlast\tx')
+	data = OrderedDict()
+	with open(p, 'rb') as f:
+		width, committed, lines = TSVZ._legacyReadLoop(f, p, data, -1, 0, False, '\t', [], False, 'utf8', TSVZ._Reporter(p))
+	assert (width, committed, lines) == (2, 8, 3)
+	assert list(data) == ['k', 'j', 'last']  # 3.39 reads an unterminated last line as a record
+
+
+def test_legacy_format_payload_is_what_append_writes(tmp_path):
+	p = str(tmp_path / 'f.tsv')
+	rows = [['k', 'a\tb'], ['j'], ['i', 'x', 'y']]
+	payload, count = TSVZ._legacyFormatPayload(p, rows, None, [''], True, False, 'utf8', False, '\t')
+	TSVZ.appendLinesTabularFile(p, rows, createIfNotExist=True)
+	assert count == 3 and open(p, 'rb').read() == b'\n' + payload
+	assert payload == b'k\ta<sep>b\t\nj\t\t\ni\tx\ty\n'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='flock')
+def test_try_lock_file_excludes_a_second_handle(tmp_path):
+	p = str(tmp_path / 'x.serve')
+	first = open(p, 'a+b')
+	second = open(p, 'a+b')
+	try:
+		assert TSVZ._tryLockFile(first) is True
+		assert TSVZ._tryLockFile(second) is False
+		open(p, 'rb').close()  # closing another descriptor keeps a flock
+		assert TSVZ._tryLockFile(second) is False
+	finally:
+		first.close()
+	assert TSVZ._tryLockFile(second) is True
+	second.close()
+
+
+def test_parse_record_lines():
+	reporter = TSVZ._Reporter('<test>')
+	texts = ['# comment', '', 'k\tv<sep>w', '<#>_x_#\tdata', '#_defaults_#\t\tD<lt>', '\tno key', 'j']
+	assert TSVZ._parseRecordLines(texts, '\t', True, False, reporter) == [
+		(['k', 'v\tw'], False), (['#_x_#', 'data'], False), (['#_defaults_#', '', 'D<'], True), (['j'], False)]
+	assert TSVZ._parseRecordLines(texts, '\t', True, True, reporter) == [
+		(['k'], False), (['#_x_#'], False), (['#_defaults_#'], True), (['j'], False)]
+	assert TSVZ._parseRecordLines(['k,a<sep>b', '#c', 'j,x'], ',', False, False, reporter) == [
+		(['k', 'a,b'], False), (['j', 'x'], False)]
+	assert reporter._events['empty-key'][0] == 2
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
