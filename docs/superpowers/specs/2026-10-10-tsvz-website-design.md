@@ -69,6 +69,8 @@ tsvz_site.py build OUTDIR          [--base-url URL] [--spec PATH]
   only look up bytes. A missing input file exits with status 1 and a message.
 - `serve` defaults to `127.0.0.1:8765`, the address and port of
   `serve_spec.py`.
+- `serve` exits with status 1 and one line,
+  `tsvz_site: cannot listen on HOST:PORT: <reason>`, when it cannot listen.
 - `build OUTDIR` writes the same bodies as files (section 4.1), for any static
   host.
 - The spec's date is the output of `git log -1 --format=%cs -- <spec>`, run in
@@ -230,7 +232,7 @@ This covers what `index.md`, `spec-glance.md` and `tsvz-spec-v1.md` use.
 | URL | Browsers | Agents and command-line clients | `build` writes |
 |---|---|---|---|
 | `/`, `/index.html` | landing HTML | `index.md` | `index.html` |
-| `/spec` | spec HTML | `tsvz-spec-v1.md`, unchanged | `spec/index.html` |
+| `/spec`, `/spec/` | spec HTML | `tsvz-spec-v1.md`, unchanged | `spec/index.html` |
 | `/index.md` | `index.md` | same | `index.md` |
 | `/spec.md`, `/tsvz-spec-v1.md` | the spec | same | `spec.md`, `tsvz-spec-v1.md` |
 | `/llms.txt` | generated (4.4) | same | `llms.txt` |

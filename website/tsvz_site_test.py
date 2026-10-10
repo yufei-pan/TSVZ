@@ -1,13 +1,18 @@
 """Tests for website/tsvz_site.py.  Run: python3 -m pytest website/tsvz_site_test.py -q"""
 
 import gzip
+import http.client
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
+import threading
 from html.parser import HTMLParser
 from pathlib import Path
+
+import pytest
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -464,3 +469,152 @@ def test_cli_build_and_missing_input(tmp_path):
                           str(tmp_path / "missing.md")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     assert run.returncode == 1
     assert run.stderr.decode().startswith("tsvz_site: cannot read ")
+
+
+# -- Task 5: serving -----------------------------------------------------------
+
+CHROME = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/140.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+}
+CURL = {"User-Agent": "curl/8.5.0", "Accept": "*/*"}
+CLAUDEBOT = {"User-Agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; "
+                           "ClaudeBot/1.0; +claudebot@anthropic.com)", "Accept": "*/*"}
+MD_ACCEPT = {"User-Agent": "SomeAgent/1.0", "Accept": "text/markdown, text/html;q=0.9"}
+HTML = "text/html; charset=utf-8"
+MD = "text/markdown; charset=utf-8"
+
+
+@pytest.fixture(scope="module")
+def port():
+    server = tsvz_site.make_server(SITE, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server.server_address[1]
+    server.shutdown()
+    server.server_close()
+
+
+def fetch(port, path, headers=None, method="GET"):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request(method, path, headers=dict(headers or {}))
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, body
+
+
+@pytest.mark.parametrize("path,headers,ctype,name", [
+    ("/", CHROME, HTML, "index.html"),
+    ("/index.html", CHROME, HTML, "index.html"),
+    ("/spec", CHROME, HTML, "spec.html"),
+    ("/spec/", CHROME, HTML, "spec.html"),
+    ("/", CURL, MD, "index.md"),
+    ("/spec", CURL, MD, "spec.md"),
+    ("/spec", CLAUDEBOT, MD, "spec.md"),
+    ("/", MD_ACCEPT, MD, "index.md"),
+    ("/?format=md", CHROME, MD, "index.md"),
+    ("/spec?format=html", CURL, HTML, "spec.html"),
+    ("/index.md", CHROME, MD, "index.md"),
+    ("/spec.md", CHROME, MD, "spec.md"),
+    ("/tsvz-spec-v1.md", CHROME, MD, "spec.md"),
+    ("/llms.txt", CHROME, "text/plain; charset=utf-8", "llms.txt"),
+    ("/llms-full.txt", CURL, "text/plain; charset=utf-8", "llms-full.txt"),
+    ("/robots.txt", CURL, "text/plain; charset=utf-8", "robots.txt"),
+    ("/sitemap.xml", CURL, "application/xml", "sitemap.xml"),
+])
+def test_who_gets_what(port, path, headers, ctype, name):
+    status, head, body = fetch(port, path, headers)
+    assert status == 200
+    assert head["content-type"] == ctype
+    assert body == SITE.bodies[name].data
+    assert head["content-length"] == str(len(body))
+
+
+def test_headers(port):
+    _, head, _ = fetch(port, "/", CHROME)
+    assert head["vary"] == "Accept, User-Agent, Accept-Encoding"
+    assert head["link"] == '<https://tsvz.org/index.md>; rel="alternate"; type="text/markdown"'
+    assert head["content-security-policy"] == SITE.csp
+    assert head["x-content-type-options"] == "nosniff"
+    assert head["referrer-policy"] == "strict-origin-when-cross-origin"
+    assert head["cache-control"] == "public, max-age=300"
+    assert head["etag"] == SITE.bodies["index.html"].etag
+    _, head, _ = fetch(port, "/spec", CURL)
+    assert head["content-disposition"] == 'inline; filename="tsvz-spec-v1.md"'
+    assert "content-security-policy" not in head and "link" not in head
+    _, head, _ = fetch(port, "/llms.txt", CHROME)
+    assert head["vary"] == "Accept-Encoding"
+
+
+def test_gzip(port):
+    _, head, body = fetch(port, "/spec", dict(CHROME, **{"Accept-Encoding": "gzip, deflate, br"}))
+    assert head["content-encoding"] == "gzip"
+    assert gzip.decompress(body) == SITE.bodies["spec.html"].data
+    for refused in ("identity", "gzip;q=0", "br"):
+        _, head, body = fetch(port, "/spec", dict(CHROME, **{"Accept-Encoding": refused}))
+        assert "content-encoding" not in head and body == SITE.bodies["spec.html"].data
+
+
+def test_etags_and_304(port):
+    etag = SITE.bodies["spec.html"].etag
+    for tag in (etag, "W/" + etag, '"other", ' + etag, "*"):
+        status, head, body = fetch(port, "/spec", dict(CHROME, **{"If-None-Match": tag}))
+        assert status == 304 and body == b"" and head["etag"] == etag
+    status, _, _ = fetch(port, "/spec", dict(CHROME, **{"If-None-Match": '"stale"'}))
+    assert status == 200
+
+
+def test_head_matches_get(port):
+    status, get_head, get_body = fetch(port, "/spec", CHROME)
+    status2, head_head, head_body = fetch(port, "/spec", CHROME, method="HEAD")
+    assert status == status2 == 200 and head_body == b""
+    assert head_head["content-length"] == get_head["content-length"] == str(len(get_body))
+
+
+def test_not_found(port):
+    status, head, body = fetch(port, "/nope", CHROME)
+    assert status == 404 and head["content-type"] == HTML and b"No page here" in body
+    status, head, body = fetch(port, "/nope", CURL)
+    assert status == 404 and body == b"Not found. See https://tsvz.org/llms.txt\n"
+    status, _, _ = fetch(port, "/nope", dict(CHROME, **{"If-None-Match": "*"}))
+    assert status == 404
+
+
+def test_other_methods(port):
+    for method in ("POST", "PUT", "DELETE", "OPTIONS", "PROPFIND"):
+        status, head, body = fetch(port, "/", CHROME, method=method)
+        assert status == 405 and head["allow"] == "GET, HEAD" and body == b""
+
+
+def test_cli_serve_starts_and_answers(tmp_path):
+    proc = subprocess.Popen([sys.executable, str(HERE / "tsvz_site.py"), "serve", "-p", "0"],
+                            cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        line = proc.stdout.readline().decode()
+        m = re.search(r"on http://127\.0\.0\.1:(\d+)/", line)
+        assert m, line
+        status, head, _ = fetch(int(m.group(1)), "/", CURL)
+        assert status == 200 and head["content-type"] == MD
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def test_cli_serve_port_in_use():
+    busy = socket.socket()
+    busy.bind(("127.0.0.1", 0))
+    busy.listen(1)
+    try:
+        port_number = busy.getsockname()[1]
+        run = subprocess.run([sys.executable, str(HERE / "tsvz_site.py"), "serve", "-p", str(port_number)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    finally:
+        busy.close()
+    assert run.returncode == 1
+    assert run.stderr.decode().startswith("tsvz_site: cannot listen on 127.0.0.1:%d: " % port_number)

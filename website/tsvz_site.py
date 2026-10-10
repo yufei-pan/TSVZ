@@ -21,7 +21,9 @@ import re
 import subprocess
 import sys
 from collections import namedtuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 # ---------------------------------------------------------------------------
 # Markdown renderer
@@ -869,21 +871,254 @@ class Site:
         return written
 
 
+# ---------------------------------------------------------------------------
+# Serving: HTML to browsers, markdown to agents (logic from serve_spec.py)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 8765
+
+NEGOTIATED = {
+    "/": ("index.html", "index.md"),
+    "/index.html": ("index.html", "index.md"),
+    "/spec": ("spec.html", "spec.md"),
+    "/spec/": ("spec.html", "spec.md"),
+}
+FIXED = {
+    "/index.md": "index.md",
+    "/spec.md": "spec.md",
+    "/tsvz-spec-v1.md": "spec.md",
+    "/llms.txt": "llms.txt",
+    "/llms-full.txt": "llms-full.txt",
+    "/robots.txt": "robots.txt",
+    "/sitemap.xml": "sitemap.xml",
+}
+
+# curl, wget, common CLI / library clients
+_CLI_UA = re.compile(
+    r"(curl/|wget/|httpie/|Go-http-client/|python-requests/|"
+    r"Python-urllib/|libwww-perl/|aiohttp/|httpx/|okhttp/|"
+    r"Java/|node-fetch/|axios/|PostmanRuntime/)",
+    re.I,
+)
+
+# Known AI / LLM crawlers and fetch agents
+_AI_UA = re.compile(
+    r"(GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-Web|"
+    r"anthropic-ai|Google-Extended|GoogleOther|PerplexityBot|"
+    r"Bytespider|CCBot|Amazonbot|FacebookBot|Meta-ExternalAgent|"
+    r"Applebot-Extended|cohere-ai|Diffbot|YouBot|AI2Bot|"
+    r"ImagesiftBot|anthropic|OpenAI|Claude|Perplexity|Gemini|"
+    r"bingbot.*chat|CopilotBot|MetaAI|meta-externalfetch|"
+    r"aiagent|fetcher|llm|langchain|LlamaIndex)",
+    re.I,
+)
+
+
+def _accept_prefers_markdown(accept: str) -> bool:
+    if not accept or accept.strip() == "*/*":
+        return True
+    parts = [p.strip() for p in accept.split(",") if p.strip()]
+    scored: list[tuple[float, str]] = []
+    for part in parts:
+        if ";" in part:
+            media, *params = part.split(";")
+            q = 1.0
+            for param in params:
+                param = param.strip()
+                if param.startswith("q="):
+                    try:
+                        q = float(param[2:])
+                    except ValueError:
+                        pass
+        else:
+            media, q = part, 1.0
+        media = media.strip().lower()
+        scored.append((q, media))
+    scored.sort(key=lambda x: -x[0])
+    for q, media in scored:
+        if media in ("text/markdown", "text/x-markdown", "text/plain"):
+            return True
+        if media == "text/html":
+            return False
+        if media == "*/*":
+            return True
+    return False
+
+
+def wants_markdown(
+    user_agent: str,
+    accept: str,
+    headers: dict[str, str],
+    *,
+    query_format: str | None = None,
+) -> bool:
+    if query_format == "md":
+        return True
+    if query_format == "html":
+        return False
+
+    ua = user_agent or ""
+    if _CLI_UA.search(ua) or _AI_UA.search(ua):
+        return True
+
+    accept_l = (accept or "").lower()
+    if "text/markdown" in accept_l or "text/x-markdown" in accept_l:
+        return True
+
+    # Modern browsers send Sec-Fetch-Mode: navigate on top-level loads.
+    sec_mode = headers.get("Sec-Fetch-Mode", headers.get("sec-fetch-mode", ""))
+    sec_dest = headers.get("Sec-Fetch-Dest", headers.get("sec-fetch-dest", ""))
+    if sec_mode == "navigate" and "text/html" in accept_l:
+        return False
+    if sec_dest == "document" and "text/html" in accept_l:
+        return False
+
+    if _accept_prefers_markdown(accept):
+        return True
+
+    if "text/html" in accept_l:
+        return False
+
+    return True
+
+
+def accepts_gzip(header):
+    """True when an Accept-Encoding header allows gzip."""
+    for part in (header or "").split(","):
+        name, _, params = part.partition(";")
+        if name.strip().lower() == "gzip":
+            m = re.search(r"q\s*=\s*([0-9.]+)", params)
+            try:
+                return not m or float(m.group(1)) > 0
+            except ValueError:
+                return True
+    return False
+
+
+def etag_matches(header, etag):
+    """True when an If-None-Match header names etag (or is *)."""
+    if not header:
+        return False
+    tags = [t.strip() for t in header.split(",")]
+    return "*" in tags or etag in tags or "W/" + etag in tags
+
+
+class Handler(BaseHTTPRequestHandler):
+    """Serves one Site's bodies.  GET and HEAD only."""
+
+    site = None
+    server_version = "tsvz.org"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+
+    def __getattr__(self, name):
+        if name.startswith("do_"):
+            return self._not_allowed
+        raise AttributeError(name)
+
+    def _not_allowed(self):
+        self.send_response(405)
+        self.send_header("Allow", "GET, HEAD")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        self._serve(send_body=True)
+
+    def do_HEAD(self):
+        self._serve(send_body=False)
+
+    def _wants_markdown(self, query_format):
+        headers = {k: v for k, v in self.headers.items()}
+        return wants_markdown(self.headers.get("User-Agent", ""), self.headers.get("Accept", ""),
+                              headers, query_format=query_format)
+
+    def _serve(self, send_body):
+        parts = urlsplit(self.path)
+        status, vary = 200, "Accept, User-Agent, Accept-Encoding"
+        if parts.path in NEGOTIATED:
+            fmt = parse_qs(parts.query).get("format", [None])[0]
+            html_name, md_name = NEGOTIATED[parts.path]
+            name = md_name if self._wants_markdown(fmt) else html_name
+        elif parts.path in FIXED:
+            name, vary = FIXED[parts.path], "Accept-Encoding"
+        else:
+            status = 404
+            name = "404.txt" if self._wants_markdown(None) else "404.html"
+        body = self.site.bodies[name]
+        if status == 200 and etag_matches(self.headers.get("If-None-Match"), body.etag):
+            self.send_response(304)
+            self._common_headers(body, vary)
+            self.end_headers()
+            return
+        use_gzip = accepts_gzip(self.headers.get("Accept-Encoding"))
+        data = body.gz if use_gzip else body.data
+        self.send_response(status)
+        self.send_header("Content-Type", body.ctype)
+        self.send_header("Content-Length", str(len(data)))
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self._common_headers(body, vary)
+        if body.ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", self.site.csp)
+        if body.link:
+            self.send_header("Link", body.link)
+        if body.disposition:
+            self.send_header("Content-Disposition", body.disposition)
+        self.end_headers()
+        if send_body:
+            self.wfile.write(data)
+
+    def _common_headers(self, body, vary):
+        self.send_header("Vary", vary)
+        self.send_header("ETag", body.etag)
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+
+def make_server(site, host, port):
+    """A ThreadingHTTPServer that serves site (port 0 picks a free port)."""
+    handler = type("SiteHandler", (Handler,), {"site": site})
+    return ThreadingHTTPServer((host, port), handler)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="tsvz_site.py", description="The tsvz.org website.")
     sub = parser.add_subparsers(dest="command", required=True)
+    serve = sub.add_parser("serve", help="serve the site over HTTP")
+    serve.add_argument("-H", "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    serve.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+                       help="port (default: %d)" % DEFAULT_PORT)
     build = sub.add_parser("build", help="write the site as static files")
     build.add_argument("outdir", help="directory to write into")
-    build.add_argument("--base-url", default=DEFAULT_BASE_URL, help="public URL (default: %(default)s)")
-    build.add_argument("--spec", default=str(DEFAULT_SPEC), help="the spec's markdown file")
+    for p in (serve, build):
+        p.add_argument("--base-url", default=DEFAULT_BASE_URL, help="public URL (default: %(default)s)")
+        p.add_argument("--spec", default=str(DEFAULT_SPEC), help="the spec's markdown file")
     args = parser.parse_args(argv)
     try:
         site = Site(base_url=args.base_url, spec_path=Path(args.spec))
     except SiteError as e:
         print("tsvz_site: %s" % e, file=sys.stderr)
         return 1
-    for path in site.build(Path(args.outdir)):
-        print(path)
+    if args.command == "build":
+        for path in site.build(Path(args.outdir)):
+            print(path)
+        return 0
+    try:
+        server = make_server(site, args.host, args.port)
+    except OSError as e:
+        print("tsvz_site: cannot listen on %s:%d: %s" % (args.host, args.port, e.strerror or e), file=sys.stderr)
+        return 1
+    print("Serving %s on http://%s:%d/" % (site.base_url, args.host, server.server_address[1]), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 
