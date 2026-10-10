@@ -46,7 +46,7 @@ TSVZ/
     index.md                 landing page content (Appendix A); served as-is to agents
     spec-glance.md           the "At a glance" box (Appendix B)
     style.css                inlined into every HTML page
-    test_tsvz_site.py        tests (section 6)
+    tsvz_site_test.py        tests (section 6)
   deploy/tsvz-site.service   replaces deploy/tsvz-spec.service
 ```
 
@@ -384,11 +384,11 @@ With JavaScript off, every page reads and works the same apart from these.
 
 ## 6. Testing
 
-`website/test_tsvz_site.py` holds plain pytest functions, matching the repo's
-style:
+`website/tsvz_site_test.py` holds plain pytest functions, matching the repo's
+style. It is named like `TSVZ_test.py` because `.gitignore` ignores `test*`:
 
 ```bash
-python3 -m pytest website/test_tsvz_site.py -q
+python3 -m pytest website/tsvz_site_test.py -q
 ```
 
 - **Renderer.**
