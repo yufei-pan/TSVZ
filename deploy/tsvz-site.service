@@ -28,9 +28,10 @@ Type=simple
 # Clone or copy the repo here (must contain website/ and tsvz-spec-v1.md).
 WorkingDirectory=/opt/tsvz
 
-# Listen on all interfaces; put nginx/caddy in front for TLS in production.
-# For localhost-only (reverse proxy on same host), use: -H 127.0.0.1
-ExecStart=/usr/bin/python3 /opt/tsvz/website/tsvz_site.py serve -H 0.0.0.0 -p 8765
+# Listen on localhost only: the reverse proxy on this host (frp on tsvz.org)
+# forwards to it and terminates TLS. If the proxy runs on another host, use
+# -H 0.0.0.0 and firewall the port.
+ExecStart=/usr/bin/python3 /opt/tsvz/website/tsvz_site.py serve -H 127.0.0.1 -p 8765
 
 # Dedicated unprivileged account (create with: useradd --system --home /opt/tsvz --shell /usr/sbin/nologin tsvz)
 User=tsvz

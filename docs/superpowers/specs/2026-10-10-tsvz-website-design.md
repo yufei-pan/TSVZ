@@ -452,9 +452,11 @@ python3 -m pytest website/tsvz_site_test.py -q
 ## 7. Deployment and switch-over
 
 - **Service.** `deploy/tsvz-site.service` replaces `deploy/tsvz-spec.service`.
-  It keeps the same port, bind address and hardening, so the proxy
-  configuration does not change. `ExecStart` runs
-  `website/tsvz_site.py serve`.
+  It keeps the same port and hardening, so the proxy configuration does not
+  change. `ExecStart` runs `website/tsvz_site.py serve -H 127.0.0.1`: the
+  proxy (frp on the tsvz.org host) runs on the same machine, so the port is
+  not reachable from outside. (Changed after deployment on 2026-10-10; the old
+  unit listened on 0.0.0.0.)
 - **Same commit.**
   - Remove `serve_spec.py` and `deploy/tsvz-spec.service`.
   - Add `https://tsvz.org` to the top of `README.md`.
