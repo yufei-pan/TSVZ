@@ -5,7 +5,7 @@
 # dependencies = [
 # ]
 # ///
-"""TSVZ 4.1: a key-value store kept in a delimiter-separated text file.
+"""TSVZ 4.2: a key-value store kept in a delimiter-separated text file.
 
 Plain ``.tsv`` / ``.csv`` / ``.nsv`` / ``.psv`` files (and any other
 extension) keep the exact TSVZ 3.39 format. ``.tsvz`` / ``.csvz`` / ``.nsvz``
@@ -40,10 +40,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '4.1'
+version = '4.2'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-10-07'
+COMMIT_DATE = '2026-10-09'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -2514,7 +2514,7 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 							 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
-				attempt.note('multipart', None, 'scrub skipped: 4.1 does not compact multi-part stores or single parts of them; nothing was written')
+				attempt.note('multipart', None, 'scrub skipped: TSVZ does not compact multi-part stores or single parts of them; nothing was written')
 				return taskDic, False
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read

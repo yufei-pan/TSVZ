@@ -5,7 +5,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 4.1**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 4.2**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -17,7 +17,7 @@ pip install -e .          # editable, from this directory
 
 | Extension | Rules |
 |---|---|
-| `.tsv` `.csv` `.nsv` `.psv` (and any other) | The TSVZ **3.39** format, unchanged. A 3.39 host can read every file 4.1 writes. |
+| `.tsv` `.csv` `.nsv` `.psv` (and any other) | The TSVZ **3.39** format, unchanged. A 3.39 host can read every file 4.x writes. |
 | `.tsvz` `.csvz` `.nsvz` `.psvz` | The **[tsvz-spec-v1](tsvz-spec-v1.md)** append-only key-value log. |
 
 The delimiter follows the extension: tab, comma, NUL, pipe. A trailing
@@ -61,7 +61,7 @@ tsvz people.tsvz append carol Carol 5     # the 3.39 form still works
 tsvz -V
 ```
 
-## What 4.1 does with `.tsvz` files
+## What TSVZ 4 does with `.tsvz` files
 
 - **Reads** everything a conformant writer can produce: markers
   (`#_defaults_#`, `#_strip_trailing_whites_#`, `#_fill_empty_with_default_#`,
