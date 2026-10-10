@@ -364,3 +364,15 @@ No 3.39 behaviour changes.
 - Handler-driven snapshot, rotation and promotion (§19.2, §19.9).
 - HTTP.
 - Moving `TSVZed` or `TSVZedLite` onto the handler.
+
+## 6. Later change: Unix-domain sockets only (2026-10-09)
+
+After the implementation, the TCP transport (loopback TCP with a token, `--x-tcp`)
+was removed from spec §21 and from TSVZ. It existed only for platforms whose
+Python has no Unix-domain sockets (Windows), and it brought most of the security
+surface (token secrecy, authentication, limits on unauthenticated clients). A
+handler now listens on a Unix-domain socket only; elsewhere `tsvz serve` exits 1
+and tools work on the files. Network access, if it is wanted, belongs in a
+separate adapter that relays a network endpoint (TCP with TLS, HTTPS, ...) to the
+handler's socket and does its own authentication; it can be written in any
+language.

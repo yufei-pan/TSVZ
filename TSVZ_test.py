@@ -3129,31 +3129,6 @@ def test_serve_closes_a_connection_with_an_overlong_line(tmp_path, served, monke
 	assert _raw(handle.address, b'get\t' + b'k' * 200 + b'\nlen\n') == b''
 	assert _raw(handle.address, b'len\n') == b'0\n#0\n'
 
-
-def test_serve_over_tcp_requires_the_token(tmp_path, served):
-	p = str(tmp_path / 't.tsvz')
-	handle = served(p, tcp=True)
-	info = TSVZ._serveFind(p)
-	assert info['address'].startswith('tcp:127.0.0.1:') and len(info['token']) == 32
-	assert os.stat(p + '.serve').st_mode & 0o777 == 0o600  # the token is in it
-	connection = TSVZ._ServeConnection(info)
-	try:
-		assert connection.request('set\tk\tv')[2] == 0 and connection.request('get\tk')[0] == ['k\tv']
-	finally:
-		connection.close()
-	import socket
-	host, port = info['address'][4:].rsplit(':', 1)
-	for first in (b'read\n', b'auth\twrong\n'):
-		sock = socket.create_connection((host, int(port)), 2)
-		try:
-			sock.sendall(first)
-			assert sock.makefile('rb').read().startswith(b'#1\t')
-		finally:
-			sock.close()
-	with pytest.raises(TSVZ._ServeUnreachable):
-		TSVZ._ServeConnection(dict(info, token='0' * 32))
-
-
 @pytest.mark.skipif(os.name != 'posix', reason='POSIX permissions')
 def test_serve_socket_permissions(tmp_path, served):
 	def modes(handle):
@@ -3545,9 +3520,9 @@ def test_serve_replaces_a_stale_pointer_instead_of_writing_into_it(tmp_path, ser
 	os.chmod(p + '.serve', 0o666)
 	old = open(p + '.serve', 'rb')  # a descriptor opened before the handler starts
 	try:
-		served(p, tcp=True)
+		served(p)
 		st = os.stat(p + '.serve')
-		assert st.st_uid == os.geteuid() and st.st_mode & 0o777 == 0o600
+		assert st.st_uid == os.geteuid() and st.st_mode & 0o777 == 0o644
 		assert st.st_ino != os.fstat(old.fileno()).st_ino and old.read() == b'old\n'
 	finally:
 		old.close()
@@ -3571,11 +3546,11 @@ def test_clients_ignore_untrusted_pointer_files(tmp_path):
 	_touch(p, b'a\t1\n')
 	sock = str(tmp_path / 'none.sock')
 	cases = [
-		(['tsvz-handler\t1', 'address\ttcp:10.255.255.1:9', 'host\t' + host, 'pid\t1', 'token\t' + 'ab' * 16],
-		 0o644, 'not a loopback'),
+		(['tsvz-handler\t1', 'address\ttcp:10.255.255.1:9', 'host\t' + host, 'pid\t1'],
+		 0o644, 'not a Unix-domain socket'),
 		(['tsvz-handler\t1', 'address\tunix:' + sock, 'host\t' + host, 'pid\t1'], 0o664, 'writable by others'),
-		(['tsvz-handler\t1', 'address\ttcp:127.0.0.1:9', 'host\t' + host, 'pid\t1', 'token\tab<LF>set<sep>x'],
-		 0o644, 'token'),
+		(['tsvz-handler\t1', 'address\tunix:' + sock, 'host\t' + host, 'pid\t1<LF>stop'],
+		 0o644, 'control characters'),
 	]
 	for lines, mode, reason in cases:
 		_write_pointer(p + '.serve', lines, mode)
@@ -3724,33 +3699,6 @@ def test_serve_accepts_a_burst_of_connections(tmp_path, served):
 		t.join()
 	assert failures == []
 
-
-def test_serve_tcp_limits_unauthenticated_clients(tmp_path, served):
-	"""I8: before authentication a line is short and slow clients are cut off; a bad token gets #1."""
-	import socket
-	p = str(tmp_path / 'a.tsvz')
-	served(p, tcp=True)
-	host, port = TSVZ._serveFind(p)['address'][4:].rsplit(':', 1)
-	sock = socket.create_connection((host, int(port)), 2)
-	try:
-		sock.settimeout(10)
-		sock.sendall(b'auth\t' + b'x' * 5000)  # no newline: an oversized first line
-		try:
-			answer = sock.recv(100)
-		except ConnectionResetError:  # closed with unread bytes pending
-			answer = b''
-		assert answer == b''
-	finally:
-		sock.close()
-	sock = socket.create_connection((host, int(port)), 2)
-	try:
-		sock.settimeout(10)
-		sock.sendall('auth\té\n'.encode('utf-8'))
-		assert sock.makefile('rb').read().startswith(b'#1\t')
-	finally:
-		sock.close()
-
-
 def test_engine_reloads_on_a_same_size_edit(tmp_path, engines):
 	"""M1: an in-place edit that keeps the size is seen, even when the bytes before the offset are unchanged."""
 	p = str(tmp_path / 'm.tsvz')
@@ -3786,32 +3734,42 @@ def test_serve_reports_a_file_system_without_locks(tmp_path, monkeypatch):
 	status, out, err = _run('serve', str(tmp_path / 'l.tsvz'))
 	assert (status, out) == (1, '') and 'cannot lock' in err and 'already served' not in err
 
-def test_serve_tcp_auth_deadline_cannot_be_stretched(tmp_path, served, monkeypatch):
-	"""A client that trickles its first line one byte at a time is still cut off at the deadline."""
+
+# ==========================================================================
+# Write handler: Unix-domain sockets only
+# ==========================================================================
+def test_serve_has_no_tcp_option():
+	with pytest.raises(TSVZ._CliUsageError):
+		TSVZ._cliParseArgs(['serve', 'x.tsvz', '--x-tcp'])
+
+
+def test_clients_ignore_a_pointer_with_a_tcp_address(tmp_path):
+	"""Spec §21.3: a handler listens on a Unix-domain socket; other addresses are not used."""
 	import socket
-	monkeypatch.setattr(TSVZ, '_SERVE_AUTH_SECONDS', 1.0)
-	p = str(tmp_path / 'd.tsvz')
-	served(p, tcp=True)
-	host, port = TSVZ._serveFind(p)['address'][4:].rsplit(':', 1)
-	sock = socket.create_connection((host, int(port)), 2)
-	start = time.monotonic()
-	closed = False
-	try:
-		while time.monotonic() - start < 6:
-			try:
-				sock.sendall(b'a')
-				sock.settimeout(0.4)
-				if sock.recv(10) == b'':
-					closed = True
-					break
-			except socket.timeout:
-				continue
-			except OSError:
-				closed = True
-				break
-	finally:
-		sock.close()
-	assert closed and time.monotonic() - start < 4
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'a\t1\n')
+	_write_pointer(p + '.serve', ['tsvz-handler\t1', 'address\ttcp:127.0.0.1:9', 'host\t' + socket.gethostname(),
+								  'pid\t1'])
+	status, out, err = _run('get', p, 'a')
+	assert (status, out) == (0, 'a\t1\n') and 'not a Unix-domain socket' in err
+
+
+@pytest.mark.skipif(not _UNIX, reason='Unix sockets')
+def test_serve_has_no_auth_operation(tmp_path, served):
+	handle = served(str(tmp_path / 'n.tsvz'))
+	assert _raw(handle.address, b'auth\tx\nlen\n') == b'#2\tunknown operation auth\n0\n#0\n'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='removes socket.AF_UNIX to imitate a platform without it')
+def test_serve_needs_unix_domain_sockets(tmp_path):
+	"""Without Unix-domain sockets, serve refuses before it touches the store or its pointer file."""
+	p = str(tmp_path / 'w.tsvz')
+	code = ("import socket, sys\ndel socket.AF_UNIX\nsys.path.insert(0, {!r})\nimport TSVZ\n"
+			"sys.exit(TSVZ._cliMain(['serve', {!r}]))\n").format(HERE, p)
+	r = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+					   universal_newlines=True, timeout=20)
+	assert r.returncode == 1 and 'Unix-domain sockets' in r.stderr
+	assert not os.path.exists(p + '.serve') and not os.path.exists(p)
 
 
 

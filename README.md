@@ -131,12 +131,12 @@ status stay the same.
   `memory`, the default), or after `fsync` (`#_write_ack_#` `disk`, or
   `TSVZClient(..., sync=True)`). Reads always see acknowledged writes.
 - **Access.** Only the user who started the server can connect (socket mode 0600).
-  `--x-group G` or `--x-mode 0660` opens it on purpose. `--x-tcp` listens on
-  127.0.0.1 with a token in the pointer file instead (on Windows the token's
-  secrecy rests on the directory's permissions).
+  `--x-group G` or `--x-mode 0660` opens it on purpose. The server listens on a
+  Unix-domain socket only; reaching it from other hosts is left to a separate
+  adapter (for example TCP with TLS) that would relay to the socket.
 - **Trust.** Clients use `STORE.serve` only when it is a regular file owned by
   them or by the store's owner, not writable by anyone else, naming a socket that
-  belongs to that owner or a loopback address. Otherwise they warn and use the
+  belongs to that owner. Otherwise they warn and use the
   files. `serve` never writes through a symbolic link or into a file it did not
   create.
 - **Lifetime.** It runs in the foreground until `tsvz stop STORE`, SIGINT or
@@ -245,7 +245,7 @@ and `-d=,`, except the ones C5 and C9 list.
 - §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, and reloads a part whose size stayed the same but whose inode or modification time changed. A rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
 - §21.9: `tsvz` commands and `TSVZClient` ask the server to answer writes once they are written (`--x-written`), so a write the server cannot make fails as it would on the files. While writes fail, every answer carries a warning.
 - §17.7: the server appends to the store's current part; it does not start a new part when it starts.
-- §21.3: where Python has no Unix sockets (Windows), the server uses loopback TCP with a token. The test suite exercises the TCP transport on Linux only.
+- §21.3: `tsvz serve` needs Unix-domain sockets. Where Python has none (Windows), it exits 1, and `tsvz` commands and `TSVZClient` work on the files.
 - §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.
 
 ## Tests

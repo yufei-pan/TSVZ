@@ -5003,9 +5003,6 @@ _SERVE_UNREADABLE = 'could not read every part of the store'
 _SERVE_NEED_STORE = ('read', 'get', 'has', 'len', 'keys', 'pop', 'popitem', 'scrub', 'verify', 'parts')
 #: A pointer file larger than this is not one (spec §21.2).
 _SERVE_POINTER_LIMIT = 64 << 10
-#: Before a TCP client authenticates: its line limit (bytes) and how long it may take (seconds).
-_SERVE_AUTH_LIMIT = 1024
-_SERVE_AUTH_SECONDS = 5.0
 
 
 class _ServeUsage(Exception):
@@ -5267,8 +5264,8 @@ def _serveLookup(store):
 	``info`` is None when there is no usable pointer file; ``problem`` then
 	says why one that exists was not trusted (None: nothing to report).
 	A pointer file is trusted only when it is a regular file owned by this
-	user or by the store's owner, not writable by others, with plain values,
-	a hexadecimal token and, for TCP, a loopback address.
+	user or by the store's owner, not writable by others, with plain values
+	and a Unix-domain socket address.
 	"""
 	path = _servePointerPath(store)
 	for attempt in range(2):
@@ -5292,12 +5289,9 @@ def _serveLookup(store):
 	for name, value in fields.items():
 		if any(ord(c) < 32 for c in value):
 			return None, '{} has control characters in its {}'.format(path, name)
-	token = fields.get('token')
-	if token is not None and not re.match(r'^[0-9a-f]{32,128}$', token):
-		return None, '{} has a malformed token'.format(path)
 	address = fields['address']
-	if address.startswith('tcp:') and address[4:].rpartition(':')[0] not in ('127.0.0.1', '[::1]', '::1'):
-		return None, '{} names {}, which is not a loopback address'.format(path, address)
+	if not address.startswith('unix:'):
+		return None, '{} names {}, which is not a Unix-domain socket'.format(path, address)
 	fields['owner'] = getattr(st, 'st_uid', None)
 	return fields, None
 
@@ -5308,7 +5302,7 @@ def _serveFind(store):
 
 
 class _ServeConnection(object):
-	"""A connection to the handler a trusted pointer file names (spec §21.3–§21.6, §21.11)."""
+	"""A connection to the handler a trusted pointer file names (spec §21.3–§21.6)."""
 
 	def __init__(self, info, timeout=None):
 		import socket
@@ -5316,28 +5310,17 @@ class _ServeConnection(object):
 			raise _ServeUnreachable('it runs on host {}'.format(info.get('host')), quiet=True)
 		address = info.get('address', '')
 		owner = info.get('owner')
+		if not address.startswith('unix:') or not hasattr(socket, 'AF_UNIX'):
+			raise _ServeUnreachable('{!r} is not a Unix-domain socket this platform can reach'.format(address),
+									quiet=True)
 		try:
-			if address.startswith('unix:') and hasattr(socket, 'AF_UNIX'):
-				sock = self._connectUnix(socket, address[5:], owner)
-			elif address.startswith('tcp:'):
-				host, _, port = address[4:].rpartition(':')
-				sock = socket.create_connection((host.strip('[]'), int(port)), 0.5)
-			else:
-				raise _ServeUnreachable('unusable address {!r}'.format(address), quiet=True)
-		except (OSError, ValueError) as e:
-			raise _ServeUnreachable(str(e), quiet=getattr(e, 'errno', None) in (errno.EACCES, errno.EPERM))
+			sock = self._connectUnix(socket, address[5:], owner)
+		except OSError as e:
+			raise _ServeUnreachable(str(e), quiet=e.errno in (errno.EACCES, errno.EPERM))
 		sock.settimeout(timeout)
 		self.sock = sock
 		self.rfile = sock.makefile('rb')
 		self.lock = threading.Lock()
-		if info.get('token'):
-			try:
-				status = self.request('auth\t' + info['token'])[2]
-			except _ServeLost:
-				status = 1
-			if status != 0:
-				self.close()
-				raise _ServeUnreachable('the handler refused the token')
 
 	@staticmethod
 	def _connectUnix(socket, path, owner):
@@ -5412,12 +5395,7 @@ def _serveClasses():
 			def handle(self):
 				self.server.serving.connection(self.rfile, self.wfile, self.request)
 
-		class TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-			daemon_threads = True
-			allow_reuse_address = True
-			request_queue_size = 128
-
-		_SERVE_CLASSES.update(handler=Handler, tcp=TCPServer)
+		_SERVE_CLASSES['handler'] = Handler
 		if hasattr(socketserver, 'UnixStreamServer'):
 			class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 				daemon_threads = True
@@ -5425,6 +5403,12 @@ def _serveClasses():
 
 			_SERVE_CLASSES['unix'] = UnixServer
 	return _SERVE_CLASSES
+
+
+def _serveSupported():
+	"""True when this Python can serve: it has Unix-domain sockets (spec §21.3)."""
+	import socket
+	return hasattr(socket, 'AF_UNIX') and 'unix' in _serveClasses()
 
 
 def _serveGroup(group):
@@ -5455,12 +5439,11 @@ class _ServeHandle(object):
 	removes the socket and the pointer file.
 	"""
 
-	def __init__(self, storePath, logger=None, group=None, mode=None, tcp=False, idleTimeout=0):
+	def __init__(self, storePath, logger=None, group=None, mode=None, idleTimeout=0):
 		self.storePath = storePath
 		self.logger = logger
 		self.group = group
 		self.mode = mode
-		self.tcp = tcp
 		self.idleTimeout = idleTimeout
 		self.pointer = _servePointerPath(storePath)
 		self.pointerFile = None
@@ -5468,7 +5451,6 @@ class _ServeHandle(object):
 		self.server = None
 		self.socketDir = None
 		self.address = None
-		self.token = None
 		self.guard = threading.Lock()
 		self.active = 0
 		self.sockets = set()
@@ -5541,37 +5523,28 @@ class _ServeHandle(object):
 		gid = _serveGroup(self.group)
 		mode = self.mode if self.mode is not None else (0o660 if gid is not None else 0o600)
 		shared = self.group is not None or self.mode is not None
-		if self.tcp or 'unix' not in classes:
-			self.server = classes['tcp'](('127.0.0.1', 0), classes['handler'])
-			self.address = 'tcp:127.0.0.1:{}'.format(self.server.server_address[1])
-			self.token = ''.join('%02x' % b for b in os.urandom(16))
-		else:
-			base = os.environ.get('XDG_RUNTIME_DIR', '')
-			if shared or not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
-				base = tempfile.gettempdir()  # others cannot enter a private runtime directory
-			self.socketDir = tempfile.mkdtemp(prefix='tsvz-', dir=base)
-			path = os.path.join(self.socketDir, 's')
-			self.server = classes['unix'](path, classes['handler'])
-			if gid is not None:
-				os.chown(self.socketDir, -1, gid)
-				os.chown(path, -1, gid)
-			os.chmod(path, mode)
-			os.chmod(self.socketDir, 0o700 | (0o010 if mode & 0o070 else 0) | (0o001 if mode & 0o007 else 0))
-			self.address = 'unix:' + path
+		if 'unix' not in classes:
+			raise OSError('tsvz serve needs Unix-domain sockets, which Python does not provide on this platform')
+		base = os.environ.get('XDG_RUNTIME_DIR', '')
+		if shared or not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
+			base = tempfile.gettempdir()  # others cannot enter a private runtime directory
+		self.socketDir = tempfile.mkdtemp(prefix='tsvz-', dir=base)
+		path = os.path.join(self.socketDir, 's')
+		self.server = classes['unix'](path, classes['handler'])
+		if gid is not None:
+			os.chown(self.socketDir, -1, gid)
+			os.chown(path, -1, gid)
+		os.chmod(path, mode)
+		os.chmod(self.socketDir, 0o700 | (0o010 if mode & 0o070 else 0) | (0o001 if mode & 0o007 else 0))
+		self.address = 'unix:' + path
 		self.server.serving = self
 		lines = ['tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION), 'address\t' + _serveEncode(self.address),
 				 'host\t' + _serveEncode(socket.gethostname()), 'pid\t{}'.format(os.getpid())]
-		if self.token:
-			lines.append('token\t' + self.token)
 		if not store.spec:
 			lines.append('x-delimiter\t' + _serveEncode(store.delimiter))
 		f = self.pointerFile
-		if hasattr(os, 'fchmod'):  # before the token is written; never writable by others
-			if self.token and gid is not None:
-				os.fchown(f.fileno(), -1, gid)
-				os.fchmod(f.fileno(), 0o640)
-			else:
-				os.fchmod(f.fileno(), 0o600 if self.token else 0o644)
+		if hasattr(os, 'fchmod'):
+			os.fchmod(f.fileno(), 0o644)  # readable by all, writable by its owner only
 		f.seek(0)
 		f.truncate()
 		f.write(''.join(line + '\n' for line in lines).encode('utf-8'))
@@ -5630,41 +5603,15 @@ class _ServeHandle(object):
 				return
 
 	def connection(self, rfile, wfile, sock=None):
-		"""Answer the requests of one connection (spec §21.3–§21.11)."""
+		"""Answer the requests of one connection (spec §21.3–§21.10)."""
 		with self.guard:
 			self.active += 1
 			if sock is not None:
 				self.sockets.add(sock)
-		watchdog = None
 		try:
-			authed = self.token is None
-			if not authed and sock is not None:
-				sock.settimeout(_SERVE_AUTH_SECONDS)
-				# A deadline for the whole of authentication: a per-read timeout alone
-				# restarts with every byte a slow client trickles in.
-				watchdog = threading.Timer(_SERVE_AUTH_SECONDS, self._cutOff, args=(sock,))
-				watchdog.daemon = True
-				watchdog.start()
 			while True:
-				line = self._readLine(rfile, _SERVE_LINE_LIMIT if authed else _SERVE_AUTH_LIMIT)
+				line = self._readLine(rfile)
 				if line is None:
-					return
-				fields = line.split('\t')
-				if fields[0] == 'auth':
-					import hmac
-					ok = len(fields) == 2 and (self.token is None or hmac.compare_digest(
-						fields[1].encode('utf-8', 'replace'), self.token.encode('ascii')))
-					self._send(wfile, ['#0'] if ok else ['#1\tauthentication failed'])
-					if not ok:
-						return
-					authed = True
-					if watchdog is not None:
-						watchdog.cancel()
-					if sock is not None:
-						sock.settimeout(None)
-					continue
-				if not authed:
-					self._send(wfile, ['#1\tauthentication required'])
 					return
 				bulk = None
 				if _serveNeedsBulk(line):
@@ -5685,25 +5632,14 @@ class _ServeHandle(object):
 		except OSError:
 			return  # the client went away
 		finally:
-			if watchdog is not None:
-				watchdog.cancel()
 			with self.guard:
 				self.active -= 1
 				self.sockets.discard(sock)
 				self.lastActivity = time.monotonic()
 
-	@staticmethod
-	def _cutOff(sock):
-		"""End a connection that did not authenticate in time."""
-		import socket
-		try:
-			sock.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
-
-	def _readLine(self, rfile, limit=None):
+	def _readLine(self, rfile):
 		"""One request line without its terminator; None at the end of the connection or past the limit."""
-		raw = rfile.readline((_SERVE_LINE_LIMIT if limit is None else limit) + 1)
+		raw = rfile.readline(_SERVE_LINE_LIMIT + 1)
 		if not raw.endswith(b'\n'):
 			return None
 		text = raw[:-1].decode('utf-8', 'replace')
@@ -5976,7 +5912,7 @@ _CLI_OPTIONS = {
 	'--x-strict': ('strict', False), '-s': ('strict', False), '--strict': ('strict', False),
 	'--x-force': ('force', False), '-f': ('force', False), '--force': ('force', False),
 	'--x-direct': ('direct', False), '--x-idle-timeout': ('idleTimeout', True),
-	'--x-group': ('group', True), '--x-mode': ('mode', True), '--x-tcp': ('tcp', False),
+	'--x-group': ('group', True), '--x-mode': ('mode', True),
 }
 _CLI_NEGATIVE_NUMBER_RE = re.compile(r'^-[0-9.]')
 _CLI_USAGE = 'usage: tsvz [OPTION ...] OPERATION STORE [ARG ...]   (tsvz -h for help)'
@@ -6019,7 +5955,6 @@ options:
   --x-direct                   work on the files even when a server runs
   --x-idle-timeout S           serve: stop after S seconds without connections
   --x-group G, --x-mode M      serve: let group G connect / set the socket's octal mode
-  --x-tcp                      serve: listen on 127.0.0.1 instead of a Unix socket
   --                           every argument after this is positional
   (--x-header and --x-defaults decode backslash escapes such as \\t)
 
@@ -6048,7 +5983,6 @@ class _CliArgs(object):
 		self.idleTimeout = None
 		self.group = None
 		self.mode = None
-		self.tcp = False
 		self.operation = None
 		self.store = None
 		self.args = []
@@ -6585,7 +6519,11 @@ def _cliServe(args, delimiter, logger, stdin, stdout):
 		_serveGroup(args.group)
 	except (ValueError, KeyError) as e:
 		raise _CliUsageError('serve: bad --x-idle-timeout, --x-mode or --x-group ({})'.format(e))
-	handle = _ServeHandle(args.store, logger=logger, group=args.group, mode=mode, tcp=args.tcp, idleTimeout=idle)
+	if not _serveSupported():
+		logger.teelog('tsvz: {}: tsvz serve needs Unix-domain sockets, which Python does not provide on this '
+					  'platform; tsvz commands work on the files'.format(args.store), 'error')
+		return 1
+	handle = _ServeHandle(args.store, logger=logger, group=args.group, mode=mode, idleTimeout=idle)
 	try:
 		handle.lock()
 	except _ServeBusy as e:

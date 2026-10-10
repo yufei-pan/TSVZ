@@ -1066,10 +1066,9 @@ format and the protocol version. The other lines may come in any order:
 
 | Name | Value |
 |---|---|
-| `address` | `unix:PATH` for a Unix-domain socket, or `tcp:HOST:PORT` with a loopback HOST (`127.0.0.1` or `[::1]`). |
+| `address` | `unix:PATH`: the path of the handler's Unix-domain socket. |
 | `host` | The name of the host the handler runs on. |
 | `pid` | The handler's process id. |
-| `token` | Present with a TCP address: the token of §21.11. |
 
 Readers MUST ignore names they do not know. Names beginning with `x-` belong to
 implementations.
@@ -1087,9 +1086,8 @@ stops cleanly.
 - is not a regular file;
 - is owned by a user other than the client's user and the store's owner, or may
   be written by users other than its owner;
-- does not begin with `tsvz-handler<TAB>1`, or has control characters in a value
-  or a token that is not hexadecimal;
-- names another host, or a TCP address that is not a loopback address;
+- does not begin with `tsvz-handler<TAB>1`, or has control characters in a value;
+- names another host, or an address that is not a Unix-domain socket;
 - names a Unix-domain socket that does not belong to the pointer file's owner, or
   (where the platform reports it) whose listening process runs as another user;
 - or whose handler does not accept a connection.
@@ -1099,8 +1097,14 @@ a pointer is stale until a handler obtains the lock and replaces it.
 
 ### 21.3 Transport
 
-21.3.1 A handler listens on a stream socket on the local host: a Unix-domain socket
-where the platform has one, else TCP on a loopback address.
+21.3.1 A handler listens on a Unix-domain stream socket on the local host. On a
+platform without Unix-domain sockets a handler cannot run, and tools there operate
+on the files.
+
+**Note (informative).** Access from other hosts is out of scope for version 1. It
+can be provided by a separate adapter that accepts network connections (for
+example TCP with TLS, or HTTPS), authenticates its clients, and relays their
+requests to the handler's socket.
 
 21.3.2 A connection carries any number of requests, one at a time: the client sends
 a request and reads its whole response before it sends the next one.
@@ -1145,12 +1149,11 @@ characters of a line decide its kind.
 ### 21.7 Operations
 
 21.7.1 A handler MUST implement every operation of §20.2 except `serve`, with the
-effect, output and exit status that §20 gives it, and these two:
+effect, output and exit status that §20 gives it, and this one:
 
 | Operation | Effect |
 |---|---|
 | `stop` | Make every acknowledged write durable, reply `#0`, then stop serving (§21.13). |
-| `auth TOKEN` | Authenticate the connection (§21.11). |
 
 21.7.2 **Bulk input.** A `set -`, `append -` or `delete -` request is followed by
 record lines in the protocol encoding, handled as §20.3 handles standard input,
@@ -1205,13 +1208,6 @@ keeps serving.
 21.11.1 A handler SHOULD by default accept connections only from the user it runs
 as, for example through a Unix socket of mode 0600 in a directory only that user
 can enter. Wider access MUST be an explicit choice of whoever starts it.
-
-21.11.2 A handler on TCP MUST require authentication: the first line of a
-connection is `auth<TAB>TOKEN`, with TOKEN (hexadecimal) from the pointer file,
-and the handler answers `#0`, or answers status 1 and closes the connection. The
-pointer file's permissions then govern who may connect. Before a connection is
-authenticated a handler MAY limit the length of its first line and the time it
-takes to send it.
 
 ### 21.12 Extensions
 
