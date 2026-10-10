@@ -876,6 +876,7 @@ class Site:
 # ---------------------------------------------------------------------------
 
 DEFAULT_PORT = 8765
+REQUEST_TIMEOUT = 30  # seconds a connection may stay silent
 
 NEGOTIATED = {
     "/": ("index.html", "index.md"),
@@ -1079,9 +1080,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
 
 
-def make_server(site, host, port):
-    """A ThreadingHTTPServer that serves site (port 0 picks a free port)."""
-    handler = type("SiteHandler", (Handler,), {"site": site})
+def make_server(site, host, port, timeout=REQUEST_TIMEOUT):
+    """A ThreadingHTTPServer that serves site (port 0 picks a free port).
+
+    A connection that sends nothing for timeout seconds is closed, so idle
+    clients cannot hold its threads and file descriptors forever.
+    """
+    handler = type("SiteHandler", (Handler,), {"site": site, "timeout": timeout})
     return ThreadingHTTPServer((host, port), handler)
 
 

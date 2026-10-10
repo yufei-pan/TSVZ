@@ -618,3 +618,20 @@ def test_cli_serve_port_in_use():
         busy.close()
     assert run.returncode == 1
     assert run.stderr.decode().startswith("tsvz_site: cannot listen on 127.0.0.1:%d: " % port_number)
+
+
+# -- Final review fixes ---------------------------------------------------------
+
+
+def test_idle_connections_are_closed():
+    assert tsvz_site.make_server(SITE, "127.0.0.1", 0).RequestHandlerClass.timeout == 30
+    server = tsvz_site.make_server(SITE, "127.0.0.1", 0, timeout=1)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        idle = socket.create_connection(server.server_address, timeout=5)
+        idle.sendall(b"GET / HTTP/1.1\r\n")  # never finishes its headers
+        assert idle.recv(1024) == b""  # closed by the server, not by our 5 s timeout
+        idle.close()
+    finally:
+        server.shutdown()
+        server.server_close()
