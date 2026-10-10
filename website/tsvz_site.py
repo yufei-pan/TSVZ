@@ -13,8 +13,15 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
+import base64
+import gzip
+import hashlib
 import re
+import subprocess
+import sys
 from collections import namedtuple
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Markdown renderer
@@ -688,3 +695,197 @@ def page(*, css, title, description, canonical, md_url, current, main, body_clas
         "<script>%s</script>\n</body>\n</html>\n" % SCRIPT,
     ]
     return "".join(head + body)
+
+
+# ---------------------------------------------------------------------------
+# Site: every response body, built once
+# ---------------------------------------------------------------------------
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_SPEC = HERE.parent / "tsvz-spec-v1.md"
+DEFAULT_BASE_URL = "https://tsvz.org/"
+LLMS_SUMMARY = ("An append-only CSV that's also a key-value store: an open, plain-text "
+                "key-value log format (spec v1) that people, agents and CSV tools read as-is.")
+
+Body = namedtuple("Body", "data gz ctype etag disposition link")
+
+BUILD_FILES = {
+    "index.html": "index.html",
+    "index.md": "index.md",
+    "spec/index.html": "spec.html",
+    "spec.md": "spec.md",
+    "tsvz-spec-v1.md": "spec.md",
+    "llms.txt": "llms.txt",
+    "llms-full.txt": "llms-full.txt",
+    "robots.txt": "robots.txt",
+    "sitemap.xml": "sitemap.xml",
+    "404.html": "404.html",
+}
+
+
+def _csp_hash(text):
+    """A CSP source expression for an inline <style> or <script> body."""
+    return "'sha256-%s'" % base64.b64encode(hashlib.sha256(text.encode("utf-8")).digest()).decode("ascii")
+
+
+def _git_date(path):
+    """The date of path's last git commit (YYYY-MM-DD), or None."""
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%cs", "--", path.name],
+                             cwd=str(path.parent), stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=2, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    date = out.stdout.decode("ascii", "replace").strip()
+    return date if re.match(r"^\d{4}-\d{2}-\d{2}$", date) else None
+
+
+class SiteError(Exception):
+    """An input file is missing or unreadable."""
+
+
+def _read(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise SiteError("cannot read %s: %s" % (path, e))
+
+
+def implementations(index_md):
+    """The rows of the Implementations table in index.md, as dicts."""
+    blocks, _ = render(index_md)
+    in_section = False
+    for block in blocks:
+        if block.kind == "h2":
+            in_section = block.heading.id == "implementations"
+        elif in_section and block.kind == "table":
+            lines = block.raw.split("\n")
+            head = split_row(lines[0])
+            return [dict(zip(head, split_row(line))) for line in lines[2:]]
+    return []
+
+
+class Site:
+    """Reads the sources and renders every response body once."""
+
+    def __init__(self, base_url=DEFAULT_BASE_URL, spec_path=DEFAULT_SPEC, root=HERE):
+        self.base_url = base_url.rstrip("/") + "/"
+        self.index_md = _read(root / "index.md")
+        self.glance_md = _read(root / "spec-glance.md")
+        self.css = _read(root / "style.css").strip()
+        self.spec_md = _read(spec_path)
+        self.spec_date = _git_date(spec_path)
+        self.csp = ("default-src 'none'; style-src %s; script-src %s; img-src data:; "
+                    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                    % (_csp_hash(self.css), _csp_hash(SCRIPT)))
+        self.bodies = {}
+        self._build_pages()
+        self._build_texts()
+
+    def _add(self, name, text, ctype, disposition=None, link=None):
+        data = text.encode("utf-8")
+        etag = '"%s"' % hashlib.sha256(data).hexdigest()[:16]
+        self.bodies[name] = Body(data, gzip.compress(data, mtime=0), ctype, etag, disposition, link)
+
+    def _link(self, md_path):
+        return '<%s%s>; rel="alternate"; type="text/markdown"' % (self.base_url, md_path)
+
+    def _build_pages(self):
+        index_blocks, _ = render(self.index_md)
+        lead = next(b for b in index_blocks if b.kind == "para")
+        spec_blocks, self.anchors = render(self.spec_md, spec=True)
+        glance_blocks, _ = render(self.glance_md, spec=True, anchors=self.anchors)
+        tagline = next(b for b in spec_blocks if b.kind == "para" and not b.raw.startswith("**Version:**"))
+        common = {"css": self.css}
+        self._add("index.html", page(
+            title=LANDING_TITLE, description=plain_text(lead.raw), canonical=self.base_url,
+            md_url="/index.md", current="home", main=landing_main(index_blocks),
+            body_class="page-landing", md_link_text="This page as markdown", **common),
+            "text/html; charset=utf-8", link=self._link("index.md"))
+        self._add("spec.html", page(
+            title=SPEC_TITLE, description=plain_text(tagline.raw), canonical=self.base_url + "spec",
+            md_url="/spec.md", current="spec",
+            main=spec_main(spec_blocks, "".join(b.html for b in glance_blocks), self.spec_date),
+            body_class="page-spec", md_link_text="This page as markdown", **common),
+            "text/html; charset=utf-8", link=self._link("spec.md"))
+        self._add("404.html", page(
+            title="Not found · TSVZ", description="No page at this address.", canonical=None,
+            md_url=None, current="", main=NOT_FOUND_MAIN, body_class="page-404",
+            md_link_text="", **common), "text/html; charset=utf-8")
+
+    def _build_texts(self):
+        md = "text/markdown; charset=utf-8"
+        text = "text/plain; charset=utf-8"
+        self._add("index.md", self.index_md, md, disposition='inline; filename="index.md"')
+        self._add("spec.md", self.spec_md, md, disposition='inline; filename="tsvz-spec-v1.md"')
+        self._add("llms.txt", self.llms_txt(), text)
+        self._add("llms-full.txt", "\n\n---\n\n".join(
+            [self.index_md.rstrip("\n"), "# At a glance\n\n" + self.glance_md.rstrip("\n"),
+             self.spec_md.rstrip("\n")]) + "\n", text)
+        self._add("robots.txt", "User-agent: *\nAllow: /\n\nSitemap: %ssitemap.xml\n" % self.base_url, text)
+        self._add("sitemap.xml", self.sitemap_xml(), "application/xml")
+        self._add("404.txt", "Not found. See %sllms.txt\n" % self.base_url, text)
+
+    def llms_txt(self):
+        """The llmstxt.org index, generated from index.md and spec-glance.md."""
+        def absolute(m):
+            target = resolve_ref(m.group(1), self.anchors)
+            if not target:
+                return m.group(0)
+            return "[%s](%sspec#s%s)" % (m.group(0), self.base_url, target)
+
+        lines = ["# TSVZ", "", "> " + LLMS_SUMMARY, "",
+                 _SECTION_REF.sub(absolute, self.glance_md.strip()), "",
+                 "## Docs", "",
+                 "- [Overview](%sindex.md): what TSVZ is, quick start, trade-offs" % self.base_url,
+                 "- [Specification v1](%sspec.md): the full format specification" % self.base_url,
+                 "", "## Implementations", ""]
+        for row in implementations(self.index_md):
+            url = re.search(r"\]\(([^)\s]+)\)", row.get("Links", ""))
+            features = [name for name, value in row.items() if value == "✓"]
+            lines.append("- [%s, %s](%s): %s; %s" % (
+                row.get("Language", ""), row.get("Version", ""), url.group(1) if url else GITHUB_URL,
+                row.get("Package", ""), ", ".join(features)))
+        lines += ["", "## Optional", "",
+                  "- [Everything in one file](%sllms-full.txt)" % self.base_url, ""]
+        return "\n".join(lines)
+
+    def sitemap_xml(self):
+        lastmod = "<lastmod>%s</lastmod>" % self.spec_date if self.spec_date else ""
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                "  <url><loc>%s</loc></url>\n"
+                "  <url><loc>%sspec</loc>%s</url>\n"
+                "</urlset>\n" % (self.base_url, self.base_url, lastmod))
+
+    def build(self, outdir):
+        """Write every page and text file under outdir; returns the paths written."""
+        written = []
+        for rel, name in BUILD_FILES.items():
+            path = Path(outdir) / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.bodies[name].data)
+            written.append(path)
+        return written
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="tsvz_site.py", description="The tsvz.org website.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser("build", help="write the site as static files")
+    build.add_argument("outdir", help="directory to write into")
+    build.add_argument("--base-url", default=DEFAULT_BASE_URL, help="public URL (default: %(default)s)")
+    build.add_argument("--spec", default=str(DEFAULT_SPEC), help="the spec's markdown file")
+    args = parser.parse_args(argv)
+    try:
+        site = Site(base_url=args.base_url, spec_path=Path(args.spec))
+    except SiteError as e:
+        print("tsvz_site: %s" % e, file=sys.stderr)
+        return 1
+    for path in site.build(Path(args.outdir)):
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

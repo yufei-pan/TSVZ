@@ -1,5 +1,6 @@
 """Tests for website/tsvz_site.py.  Run: python3 -m pytest website/tsvz_site_test.py -q"""
 
+import gzip
 import os
 import re
 import shlex
@@ -353,3 +354,113 @@ def test_quick_start_console_shows_real_output(tmp_path):
             assert output == shown, command
         ran += 1
     assert ran == 6
+
+
+# -- Task 4: the site's bodies and static export ------------------------------
+
+SITE = tsvz_site.Site(base_url="https://tsvz.org/", spec_path=REPO / "tsvz-spec-v1.md", root=HERE)
+
+
+def test_site_bodies():
+    names = {"index.html", "spec.html", "404.html", "index.md", "spec.md", "llms.txt",
+             "llms-full.txt", "robots.txt", "sitemap.xml", "404.txt"}
+    assert set(SITE.bodies) == names
+    index = SITE.bodies["index.html"]
+    assert index.ctype == "text/html; charset=utf-8"
+    assert index.link == '<https://tsvz.org/index.md>; rel="alternate"; type="text/markdown"'
+    assert re.match(r'^"[0-9a-f]{16}"$', index.etag)
+    assert gzip.decompress(index.gz) == index.data
+    assert SITE.bodies["spec.md"].data == (REPO / "tsvz-spec-v1.md").read_bytes()
+    assert SITE.bodies["spec.md"].disposition == 'inline; filename="tsvz-spec-v1.md"'
+    assert SITE.bodies["index.md"].data == (HERE / "index.md").read_bytes()
+    assert SITE.bodies["sitemap.xml"].ctype == "application/xml"
+    assert len(index.data) <= 30 * 1024
+
+
+def test_site_pages_have_descriptions_and_csp_hashes():
+    landing = SITE.bodies["index.html"].data.decode()
+    spec = SITE.bodies["spec.html"].data.decode()
+    assert '<meta name="description" content="TSVZ files are plain CSV or TSV where every write' in landing
+    assert ('<meta name="description" content="A line-oriented, append-only, key–value '
+            'write-ahead-log format in plain UTF-8 text.">') in spec
+    assert '<link rel="canonical" href="https://tsvz.org/spec">' in spec
+    assert '<a href="/spec" aria-current="page">Spec</a>' in spec
+    assert "<style>" in SITE.bodies["404.html"].data.decode()
+    style = re.search(r"<style>(.*?)</style>", landing, re.S).group(1)
+    script = re.search(r"<script>(.*?)</script>", landing, re.S).group(1)
+    assert tsvz_site._csp_hash(style) in SITE.csp and tsvz_site._csp_hash(script) in SITE.csp
+    assert "default-src 'none'" in SITE.csp and "frame-ancestors 'none'" in SITE.csp
+
+
+def test_llms_txt_lists_glance_docs_and_every_implementation():
+    text = SITE.bodies["llms.txt"].data.decode()
+    assert text.startswith("# TSVZ\n\n> An append-only CSV that's also a key-value store")
+    assert "[§4.3](https://tsvz.org/spec#s4.3)" in text
+    assert "- [Specification v1](https://tsvz.org/spec.md)" in text
+    rows = tsvz_site.implementations(INDEX_MD)
+    assert rows and rows[0]["Language"] == "Python (reference)"
+    for row in rows:
+        assert "- [%s, %s](" % (row["Language"], row["Version"]) in text
+    assert "Read, Write, CLI §20, Handler §21" in text
+    assert text.rstrip().endswith("- [Everything in one file](https://tsvz.org/llms-full.txt)")
+
+
+def test_llms_full_robots_sitemap():
+    full = SITE.bodies["llms-full.txt"].data.decode()
+    assert full.startswith(INDEX_MD.rstrip("\n")) and "# At a glance" in full
+    assert full.rstrip("\n").endswith(SPEC.rstrip("\n"))
+    assert SITE.bodies["robots.txt"].data == b"User-agent: *\nAllow: /\n\nSitemap: https://tsvz.org/sitemap.xml\n"
+    sitemap = SITE.bodies["sitemap.xml"].data.decode()
+    assert "<loc>https://tsvz.org/</loc>" in sitemap and "<loc>https://tsvz.org/spec</loc>" in sitemap
+
+
+def test_base_url_is_normalised():
+    site = tsvz_site.Site(base_url="http://localhost:8765", spec_path=REPO / "tsvz-spec-v1.md", root=HERE)
+    assert site.base_url == "http://localhost:8765/"
+    assert b'href="http://localhost:8765/spec"' in site.bodies["spec.html"].data
+
+
+def test_missing_input_is_a_site_error(tmp_path):
+    try:
+        tsvz_site.Site(spec_path=tmp_path / "nope.md", root=HERE)
+    except tsvz_site.SiteError as e:
+        assert "nope.md" in str(e)
+    else:
+        raise AssertionError("no SiteError")
+
+
+def test_non_utf8_source_is_a_site_error(tmp_path):
+    bad = tmp_path / "spec.md"
+    bad.write_bytes(b"# Spec\n\xff\xfe\n")
+    try:
+        tsvz_site.Site(spec_path=bad, root=HERE)
+    except tsvz_site.SiteError as e:
+        assert "spec.md" in str(e)
+    else:
+        raise AssertionError("no SiteError")
+
+
+def test_git_date(tmp_path):
+    date = tsvz_site._git_date(REPO / "tsvz-spec-v1.md")
+    assert date is None or re.match(r"^\d{4}-\d{2}-\d{2}$", date)
+    (tmp_path / "x.md").write_text("x")
+    assert tsvz_site._git_date(tmp_path / "x.md") is None
+
+
+def test_build_writes_the_file_list(tmp_path):
+    written = SITE.build(tmp_path)
+    rel = sorted(str(p.relative_to(tmp_path)) for p in written)
+    assert rel == sorted(tsvz_site.BUILD_FILES)
+    assert (tmp_path / "spec" / "index.html").read_bytes() == SITE.bodies["spec.html"].data
+
+
+def test_cli_build_and_missing_input(tmp_path):
+    script = str(HERE / "tsvz_site.py")
+    run = subprocess.run([sys.executable, script, "build", str(tmp_path / "out")], cwd=str(tmp_path),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert run.returncode == 0, run.stderr
+    assert (tmp_path / "out" / "llms.txt").is_file()
+    run = subprocess.run([sys.executable, script, "build", str(tmp_path / "o2"), "--spec",
+                          str(tmp_path / "missing.md")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert run.returncode == 1
+    assert run.stderr.decode().startswith("tsvz_site: cannot read ")
