@@ -258,6 +258,13 @@ first lines.
    `text/html`) gets HTML.
 5. Otherwise, the `Accept` header is weighed.
 
+One site rule runs first, without `?format=`. Link-preview fetchers and search
+crawlers (Slackbot, Twitterbot, facebookexternalhit, LinkedInBot, Discordbot,
+Googlebot, bingbot and similar) get HTML unless they also match an AI-agent
+pattern. They read `<title>` and the Open Graph tags (4.3) and often send
+`Accept: */*`, which `wants_markdown()` answers with markdown. This was added
+after the final review; `wants_markdown()` itself is unchanged.
+
 ### 4.3 Responses
 
 - **Methods.** GET and HEAD. Any other method gets 405 with

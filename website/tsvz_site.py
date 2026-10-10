@@ -987,6 +987,22 @@ def wants_markdown(
     return True
 
 
+# Link-preview fetchers and search crawlers read <title> and the Open Graph tags, and
+# often send Accept: */*, which wants_markdown answers with markdown.  A site rule,
+# checked before wants_markdown (which stays as in serve_spec.py).
+_PREVIEW_UA = re.compile(
+    r"(Slackbot|Twitterbot|facebookexternalhit|LinkedInBot|Discordbot|TelegramBot|WhatsApp|"
+    r"SkypeUriPreview|redditbot|Mastodon|Pinterestbot|Embedly|Iframely|vkShare|"
+    r"Googlebot|bingbot|DuckDuckBot|Applebot(?!-Extended)|YandexBot|Baiduspider|Slurp)",
+    re.I,
+)
+
+
+def prefers_html(user_agent):
+    """True for link-preview fetchers and search crawlers that are not also AI agents."""
+    return bool(_PREVIEW_UA.search(user_agent or "")) and not _AI_UA.search(user_agent or "")
+
+
 def accepts_gzip(header):
     """True when an Accept-Encoding header allows gzip."""
     for part in (header or "").split(","):
@@ -1036,9 +1052,11 @@ class Handler(BaseHTTPRequestHandler):
         self._serve(send_body=False)
 
     def _wants_markdown(self, query_format):
+        user_agent = self.headers.get("User-Agent", "")
+        if query_format is None and prefers_html(user_agent):
+            return False
         headers = {k: v for k, v in self.headers.items()}
-        return wants_markdown(self.headers.get("User-Agent", ""), self.headers.get("Accept", ""),
-                              headers, query_format=query_format)
+        return wants_markdown(user_agent, self.headers.get("Accept", ""), headers, query_format=query_format)
 
     def _serve(self, send_body):
         parts = urlsplit(self.path)

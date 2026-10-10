@@ -700,3 +700,24 @@ def test_private_use_characters_render_as_text():
     run = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
     assert run.returncode == 0, run.stderr
     assert run.stdout.decode() == "<p>a&#xE000;b <code>c&#xE001;</code> &#xE000;0&#xE001; <code>x</code></p>\n\n"
+
+
+@pytest.mark.parametrize("user_agent", [
+    "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+    "Twitterbot/1.0",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
+    "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+])
+def test_link_previews_and_search_crawlers_get_html(port, user_agent):
+    # They read <title> and the Open Graph tags, and often send Accept: */*.
+    status, head, _ = fetch(port, "/", {"User-Agent": user_agent, "Accept": "*/*"})
+    assert status == 200 and head["content-type"] == HTML
+
+
+def test_ai_agents_and_format_still_win_over_the_preview_rule(port):
+    _, head, _ = fetch(port, "/", {"User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0) chat", "Accept": "*/*"})
+    assert head["content-type"] == MD
+    _, head, _ = fetch(port, "/?format=md", {"User-Agent": "Twitterbot/1.0", "Accept": "*/*"})
+    assert head["content-type"] == MD
