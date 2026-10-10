@@ -727,8 +727,9 @@ def test_request_log_escapes_control_characters(port, capsys):
     # A client must not be able to write terminal escapes or fake log lines into the log.
     raw = socket.create_connection(("127.0.0.1", port), timeout=10)
     raw.sendall(b"GET /\x1b[31mred\rFAKE HTTP/1.0\r\n\r\n")
-    assert raw.recv(64).startswith(b"HTTP/1.0 400")  # a bare CR splits the request line
+    response = raw.makefile("rb").read()  # read to the end, so the server finishes writing
     raw.close()
+    assert response.startswith(b"HTTP/1.0 400")  # a bare CR splits the request line
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\r" not in err
     assert "/\\x1b[31mred\\x0dFAKE" in err
