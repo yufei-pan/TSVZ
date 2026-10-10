@@ -1,6 +1,8 @@
 """Tests for website/tsvz_site.py.  Run: python3 -m pytest website/tsvz_site_test.py -q"""
 
+import re
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -138,3 +140,84 @@ def test_console_block():
 def test_table_cells_carry_data_labels():
     out = html_of("| Language | CLI §20 |\n|---|---|\n| Python | ✓ |\n")
     assert '<td data-label="Language">Python</td><td data-label="CLI §20">✓</td>' in out
+
+
+# -- Task 2: spec mode ------------------------------------------------------
+
+
+def test_spec_mode_numbered_paragraphs_and_section_links():
+    text = ("## 4. Framing\n\n4.3 A reader **MUST** discard bytes; see §4.3–§4.5, §19.2.3.\n\n"
+            "4.5 Recovery is unconditional (§9) and `§4.3` in code stays.\n\n## 19. Snapshot\n\n"
+            "19.2 Steps.\n")
+    blocks, anchors = tsvz_site.render(text, spec=True)
+    out = "".join(b.html for b in blocks)
+    assert {"4", "4.3", "4.5", "19", "19.2"} <= anchors
+    assert '<span class="anchor" id="s4"></span>' in out
+    assert '<p id="s4.3"><span class="num">4.3</span> A reader' in out
+    assert '<a class="sref" href="#s4.3">§4.3</a>–<a class="sref" href="#s4.5">§4.5</a>' in out
+    assert '<a class="sref" href="#s19.2">§19.2.3</a>.' in out  # closest parent; full stop outside
+    assert "§9" in out and 'href="#s9"' not in out  # no anchor anywhere: left as text
+    assert "<code>§4.3</code>" in out
+    assert '<strong><span class="rfc">MUST</span></strong>' in out
+
+
+def test_spec_mode_notes_pilcrows_and_external_anchors():
+    out = html_of("## 2. Terms\n\n> A note with MAY.\n", spec=True)
+    assert ('<h2 id="2-terms"><span class="anchor" id="s2"></span>2. Terms '
+            '<a class="pilcrow" href="#2-terms" aria-label="Link to this section">¶</a></h2>') in out
+    assert '<blockquote class="note">' in out and '<span class="rfc">MAY</span>' in out
+    glance = html_of("- Last line wins. §3.3\n", spec=True, anchors={"3", "3.3"})
+    assert '<a class="sref" href="#s3.3">§3.3</a>' in glance
+
+
+def test_plain_mode_has_no_spec_features():
+    out = html_of("## 2. Terms\n\n2.1 A reader MUST see §2.\n\n> note\n")
+    assert "pilcrow" not in out and "sref" not in out and "rfc" not in out
+    assert 'class="note"' not in out and "<p>2.1 A reader MUST see §2.</p>" in out
+
+
+class _TagChecker(HTMLParser):
+    VOID = {"meta", "link", "br", "hr", "img", "input"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.errors = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.VOID:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.errors.append("unexpected </%s> with open %s" % (tag, self.stack[-3:]))
+        else:
+            self.stack.pop()
+
+
+def assert_balanced(html):
+    checker = _TagChecker()
+    checker.feed(html)
+    checker.close()
+    assert not checker.errors, checker.errors[:3]
+    assert not checker.stack, checker.stack
+
+
+def test_whole_spec_renders_cleanly():
+    out = html_of(SPEC, spec=True)
+    outside_code = re.sub(r"<code[^>]*>.*?</code>", "", out, flags=re.S)
+    assert "**" not in outside_code and "```" not in out and "|---" not in out
+    assert not re.search(r"<h[1-4](?! id=)", out)  # every heading has an id
+    ids = re.findall(r'id="([^"]+)"', out)
+    assert len(ids) == len(set(ids)), "duplicate ids"
+    missing = set(re.findall(r'href="#([^"]+)"', out)) - set(ids)
+    assert not missing, sorted(missing)[:5]
+    unlinked = re.sub(r'<a class="sref"[^>]*>§[^<]*</a>', "", outside_code)
+    assert "§" not in unlinked
+    assert_balanced(out)
+
+
+def test_readme_spec_anchors_exist():
+    ids = set(re.findall(r'id="([^"]+)"', html_of(SPEC, spec=True)))
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    anchors = re.findall(r"tsvz-spec-v1\.md#([A-Za-z0-9_-]+)", readme)
+    assert anchors and set(anchors) <= ids

@@ -407,6 +407,81 @@ def plain_text(markdown):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def render(text):
-    """Render markdown; returns (blocks, anchors).  anchors is always empty here."""
-    return Renderer().render(text), set()
+_PARA_NUMBER = re.compile(r"^(\d+\.\d+(?:\.\d+)*)[ \t]+")
+_SECTION_REF = re.compile(r"§(\d+(?:\.\d+)*|[A-Z](?![A-Za-z]))")
+_RFC = re.compile(r"\b(MUST\s+NOT|MUST|SHOULD\s+NOT|SHOULD|MAY|REQUIRED|RECOMMENDED|OPTIONAL)\b")
+
+
+def resolve_ref(number, anchors):
+    """The closest numbered anchor at or above number ("19.2.3" -> "19.2"), or None."""
+    while number:
+        if number in anchors:
+            return number
+        number = number.rpartition(".")[0]
+    return None
+
+
+class SpecRenderer(Renderer):
+    """The renderer for the spec page.
+
+    Adds anchors for numbered headings and paragraphs (id="s4.3"), links every
+    §-reference to its anchor, marks RFC 2119 keywords, styles blockquotes as
+    notes and gives each heading a ¶ link.  anchors starts with the numbers
+    passed in and gains every number found in the rendered text.
+    """
+
+    quote_class = ' class="note"'
+
+    def __init__(self, anchors=None):
+        super().__init__()
+        self.anchors = set(anchors or ())
+
+    def prepare(self, nodes):
+        for node in nodes:
+            if node[0] == "heading":
+                number = heading_number(node[2])
+            elif node[0] == "para":
+                m = _PARA_NUMBER.match(node[1])
+                number = m.group(1) if m else None
+            else:
+                number = None
+            if number:
+                self.anchors.add(number)
+
+    def heading_inner(self, text, info):
+        anchor = ""
+        if info.number and "s" + info.number not in self.ids:
+            self.ids.add("s" + info.number)
+            anchor = '<span class="anchor" id="s%s"></span>' % info.number
+        return '%s%s <a class="pilcrow" href="#%s" aria-label="Link to this section">¶</a>' % (
+            anchor, self.inline(text), info.id)
+
+    def para(self, text):
+        m = _PARA_NUMBER.match(text)
+        if m and "s" + m.group(1) not in self.ids:
+            number = m.group(1)
+            self.ids.add("s" + number)
+            return '<p id="s%s"><span class="num">%s</span> %s</p>\n' % (
+                number, number, self.inline(text[m.end():]))
+        return super().para(text)
+
+    def decorate(self, text):
+        text = _SECTION_REF.sub(self.section_link, text)
+        return _RFC.sub(lambda m: '<span class="rfc">%s</span>' % m.group(1), text)
+
+    def section_link(self, m):
+        target = resolve_ref(m.group(1), self.anchors)
+        if not target:
+            return m.group(0)
+        return '<a class="sref" href="#s%s">%s</a>' % (target, m.group(0))
+
+
+def render(text, spec=False, anchors=None):
+    """Render markdown; returns (blocks, anchors).
+
+    spec=True uses SpecRenderer; anchors seeds the section numbers that
+    §-references may link to (the spec's, when rendering the glance box).
+    """
+    renderer = SpecRenderer(anchors) if spec else Renderer()
+    blocks = renderer.render(text)
+    return blocks, getattr(renderer, "anchors", set())
