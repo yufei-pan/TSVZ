@@ -1024,6 +1024,10 @@ def etag_matches(header, etag):
     return "*" in tags or etag in tags or "W/" + etag in tags
 
 
+# C0 and C1 control characters, written as \xNN in the request log.
+_LOG_ESCAPES = {c: "\\x%02x" % c for c in list(range(0x20)) + list(range(0x7F, 0xA0))}
+
+
 class Handler(BaseHTTPRequestHandler):
     """Serves one Site's bodies.  GET and HEAD only."""
 
@@ -1032,7 +1036,8 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+        message = (fmt % args).translate(_LOG_ESCAPES)  # the request line is client data
+        sys.stderr.write("%s - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), message))
 
     def __getattr__(self, name):
         if name.startswith("do_"):
