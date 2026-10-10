@@ -690,3 +690,13 @@ def test_idle_connections_are_closed():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_private_use_characters_render_as_text():
+    # The renderer's own placeholders are U+E000..U+E001; text containing them must not
+    # hang it, crash it or be swapped for other content.  Run in a child: a hang times out.
+    code = ("import sys; sys.path.insert(0, %r); import tsvz_site; "
+            "b, _ = tsvz_site.render('a\\ue000b `c\\ue001` \\ue0000\\ue001 `x`'); print(b[0].html)" % str(HERE))
+    run = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.decode() == "<p>a&#xE000;b <code>c&#xE001;</code> &#xE000;0&#xE001; <code>x</code></p>\n\n"

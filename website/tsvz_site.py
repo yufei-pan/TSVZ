@@ -365,12 +365,16 @@ class Renderer:
             store.append(fragment)
             return "\ue000%d\ue001" % (len(store) - 1)
 
+        # U+E000 and U+E001 mark placeholders; any already in the text become references.
+        text = re.sub("[\ue000\ue001]", lambda m: keep("&#x%X;" % ord(m.group(0))), text)
         text = self.code_spans(text, keep)
         text = re.sub(r"\\([!-/:-@\[-`{-~])", lambda m: keep(escape(m.group(1))), text)
         text = re.sub(r"(?<!!)\[([^\]]+)\]\(([^)\s]+)\)", lambda m: keep('<a href="%s">%s</a>' % (
             escape(m.group(2)), self.finish(m.group(1)))), text)
         text = self.finish(text)
-        while "\ue000" in text:
+        for _ in range(len(store)):  # placeholders nest at most len(store) deep
+            if "\ue000" not in text:
+                break
             text = re.sub(r"\ue000(\d+)\ue001", lambda m: store[int(m.group(1))], text)
         return text
 
