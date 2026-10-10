@@ -732,3 +732,37 @@ def test_request_log_escapes_control_characters(port, capsys):
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\r" not in err
     assert "/\\x1b[31mred\\x0dFAKE" in err
+
+
+def _site_root(tmp_path, index_md):
+    root = tmp_path / "site"
+    root.mkdir()
+    (root / "index.md").write_text(index_md, encoding="utf-8")
+    for name in ("spec-glance.md", "style.css"):
+        (root / name).write_bytes((HERE / name).read_bytes())
+    return root
+
+
+def test_byte_order_mark_in_sources_is_ignored(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_bytes(b"\xef\xbb\xbf" + (REPO / "tsvz-spec-v1.md").read_bytes())
+    root = _site_root(tmp_path, "﻿" + INDEX_MD)
+    site = tsvz_site.Site(spec_path=spec, root=root)
+    assert b"<h1>TSVZ \xe2\x80\x94 Format Specification</h1>" in site.bodies["spec.html"].data
+    assert site.bodies["index.html"].data == SITE.bodies["index.html"].data
+
+
+@pytest.mark.parametrize("which,text,message", [
+    ("spec", "No title line here.\n", "has no '# ' title line"),
+    ("spec", "# Title only\n", "has no summary paragraph"),
+    ("index", "", "has no paragraph"),
+    ("index", "# Only a heading\n", "has no paragraph"),
+])
+def test_sources_without_their_structure_are_site_errors(tmp_path, which, text, message):
+    spec = tmp_path / "spec.md"
+    spec.write_text(text if which == "spec" else SPEC, encoding="utf-8")
+    root = _site_root(tmp_path, text if which == "index" else INDEX_MD)
+    with pytest.raises(tsvz_site.SiteError) as e:
+        tsvz_site.Site(spec_path=spec, root=root)
+    assert message in str(e.value)
+    assert str(spec if which == "spec" else root / "index.md") in str(e.value)

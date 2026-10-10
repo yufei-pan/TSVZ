@@ -752,7 +752,7 @@ class SiteError(Exception):
 
 def _read(path):
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8-sig")  # an editor's byte order mark is dropped
     except (OSError, UnicodeDecodeError) as e:
         raise SiteError("cannot read %s: %s" % (path, e))
 
@@ -776,7 +776,8 @@ class Site:
 
     def __init__(self, base_url=DEFAULT_BASE_URL, spec_path=DEFAULT_SPEC, root=HERE):
         self.base_url = base_url.rstrip("/") + "/"
-        self.index_md = _read(root / "index.md")
+        self.index_path, self.spec_path = root / "index.md", spec_path
+        self.index_md = _read(self.index_path)
         self.glance_md = _read(root / "spec-glance.md")
         self.css = _read(root / "style.css").strip()
         self.spec_md = _read(spec_path)
@@ -798,10 +799,16 @@ class Site:
 
     def _build_pages(self):
         index_blocks, _ = render(self.index_md)
-        lead = next(b for b in index_blocks if b.kind == "para")
+        lead = next((b for b in index_blocks if b.kind == "para"), None)
+        if lead is None:
+            raise SiteError("%s has no paragraph to describe the landing page" % self.index_path)
         spec_blocks, self.anchors = render(self.spec_md, spec=True)
+        if not any(b.kind == "h1" for b in spec_blocks):
+            raise SiteError("%s has no '# ' title line" % self.spec_path)
         glance_blocks, _ = render(self.glance_md, spec=True, anchors=self.anchors)
-        tagline = next(b for b in spec_blocks if b.kind == "para" and not b.raw.startswith("**Version:**"))
+        tagline = next((b for b in spec_blocks if b.kind == "para" and not b.raw.startswith("**Version:**")), None)
+        if tagline is None:
+            raise SiteError("%s has no summary paragraph under its title" % self.spec_path)
         common = {"css": self.css}
         self._add("index.html", page(
             title=LANDING_TITLE, description=plain_text(lead.raw), canonical=self.base_url,
