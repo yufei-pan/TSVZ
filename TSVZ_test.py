@@ -3786,6 +3786,34 @@ def test_serve_reports_a_file_system_without_locks(tmp_path, monkeypatch):
 	status, out, err = _run('serve', str(tmp_path / 'l.tsvz'))
 	assert (status, out) == (1, '') and 'cannot lock' in err and 'already served' not in err
 
+def test_serve_tcp_auth_deadline_cannot_be_stretched(tmp_path, served, monkeypatch):
+	"""A client that trickles its first line one byte at a time is still cut off at the deadline."""
+	import socket
+	monkeypatch.setattr(TSVZ, '_SERVE_AUTH_SECONDS', 1.0)
+	p = str(tmp_path / 'd.tsvz')
+	served(p, tcp=True)
+	host, port = TSVZ._serveFind(p)['address'][4:].rsplit(':', 1)
+	sock = socket.create_connection((host, int(port)), 2)
+	start = time.monotonic()
+	closed = False
+	try:
+		while time.monotonic() - start < 6:
+			try:
+				sock.sendall(b'a')
+				sock.settimeout(0.4)
+				if sock.recv(10) == b'':
+					closed = True
+					break
+			except socket.timeout:
+				continue
+			except OSError:
+				closed = True
+				break
+	finally:
+		sock.close()
+	assert closed and time.monotonic() - start < 4
+
+
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

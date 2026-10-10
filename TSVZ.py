@@ -5635,10 +5635,16 @@ class _ServeHandle(object):
 			self.active += 1
 			if sock is not None:
 				self.sockets.add(sock)
+		watchdog = None
 		try:
 			authed = self.token is None
 			if not authed and sock is not None:
 				sock.settimeout(_SERVE_AUTH_SECONDS)
+				# A deadline for the whole of authentication: a per-read timeout alone
+				# restarts with every byte a slow client trickles in.
+				watchdog = threading.Timer(_SERVE_AUTH_SECONDS, self._cutOff, args=(sock,))
+				watchdog.daemon = True
+				watchdog.start()
 			while True:
 				line = self._readLine(rfile, _SERVE_LINE_LIMIT if authed else _SERVE_AUTH_LIMIT)
 				if line is None:
@@ -5652,6 +5658,8 @@ class _ServeHandle(object):
 					if not ok:
 						return
 					authed = True
+					if watchdog is not None:
+						watchdog.cancel()
 					if sock is not None:
 						sock.settimeout(None)
 					continue
@@ -5677,10 +5685,21 @@ class _ServeHandle(object):
 		except OSError:
 			return  # the client went away
 		finally:
+			if watchdog is not None:
+				watchdog.cancel()
 			with self.guard:
 				self.active -= 1
 				self.sockets.discard(sock)
 				self.lastActivity = time.monotonic()
+
+	@staticmethod
+	def _cutOff(sock):
+		"""End a connection that did not authenticate in time."""
+		import socket
+		try:
+			sock.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
 
 	def _readLine(self, rfile, limit=None):
 		"""One request line without its terminator; None at the end of the connection or past the limit."""
