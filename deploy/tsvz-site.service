@@ -1,0 +1,51 @@
+# Sample systemd unit for website/tsvz_site.py, the tsvz.org website.
+#
+# Install (adjust paths and user first):
+#   sudo cp deploy/tsvz-site.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tsvz-site.service
+#
+# It replaces tsvz-spec.service (serve_spec.py) on the same port; if that unit
+# is installed:  sudo systemctl disable --now tsvz-spec.service
+#
+# Publish an edit to website/*.md, website/style.css or tsvz-spec-v1.md:
+#   sudo systemctl restart tsvz-site.service
+#
+# The spec page's "updated" date comes from `git log`; it is left out when git
+# cannot read the checkout (for example, when the tsvz user does not own it).
+#
+# Logs: journalctl -u tsvz-site.service -f
+
+[Unit]
+Description=tsvz.org website (landing page and TSVZ format specification)
+Documentation=https://tsvz.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Clone or copy the repo here (must contain website/ and tsvz-spec-v1.md).
+WorkingDirectory=/opt/tsvz
+
+# Listen on all interfaces; put nginx/caddy in front for TLS in production.
+# For localhost-only (reverse proxy on same host), use: -H 127.0.0.1
+ExecStart=/usr/bin/python3 /opt/tsvz/website/tsvz_site.py serve -H 0.0.0.0 -p 8765
+
+# Dedicated unprivileged account (create with: useradd --system --home /opt/tsvz --shell /usr/sbin/nologin tsvz)
+User=tsvz
+Group=tsvz
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening (read-only service; only needs the repo directory)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+ReadOnlyPaths=/opt/tsvz
+
+[Install]
+WantedBy=multi-user.target

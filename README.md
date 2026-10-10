@@ -1,5 +1,7 @@
 # TSVZ
 
+**[tsvz.org](https://tsvz.org)**: the format, its specification and its implementations.
+
 TSVZ is a small, dependency-free library and CLI that keeps an **ordered
 key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
@@ -248,10 +250,24 @@ and `-d=,`, except the ones C5 and C9 list.
 - §21.3: `tsvz serve` needs Unix-domain sockets. Where Python has none (Windows), it exits 1, and `tsvz` commands and `TSVZClient` work on the files.
 - §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.
 
+## Website
+
+`website/` holds the tsvz.org site. `website/tsvz_site.py` (standard library
+only, Python 3.8+) renders `website/index.md`, `website/spec-glance.md` and
+`tsvz-spec-v1.md`, and serves HTML to browsers and markdown to agents.
+
+```bash
+python3 website/tsvz_site.py serve -p 8765     # http://127.0.0.1:8765/
+python3 website/tsvz_site.py build /tmp/site   # static files for any host
+```
+
+`deploy/tsvz-site.service` runs it under systemd; restart it to publish an edit.
+
 ## Tests
 
 ```bash
 python3 -m pytest TSVZ_test.py -q                         # everything, incl. 3.39 differential tests
+python3 -m pytest website/tsvz_site_test.py -q            # the tsvz.org site
 python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a test)
 ```
 
