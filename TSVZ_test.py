@@ -2270,7 +2270,7 @@ def test_cli_logger_and_writers():
 	args.format = 'table'
 	out = io.StringIO()
 	TSVZ._cliEmitRows([['k', 'v']], args, out, True, '\t')
-	assert out.getvalue() == 'k | v\n--+--\n\n'
+	assert out.getvalue() == 'k | v\n\n'  # a store row is not a header
 	assert TSVZ._cliFormat(TSVZ._CliArgs(), io.StringIO()) == 'records'
 
 
@@ -2410,6 +2410,22 @@ def test_cli_output_into_a_closed_pipe(tmp_path):
 	proc.wait()
 	assert first == b'k0\tv0\n'
 	assert proc.returncode == 1 and b'Traceback' not in err and b'Exception ignored' not in err
+
+
+def test_cli_table_prints_rows_not_a_header(tmp_path):
+	"""--format table never draws a store row as a header, and no row loses columns.
+
+	Only ``read`` of a loose file keeps 3.39's table, whose first row is the file's header line.
+	"""
+	p = str(tmp_path / 't.tsvz')
+	_touch(p, b'alice\tAlice\t30\nbob\tBob\t25\tx\n')
+	assert _run('get', p, 'alice', '--format', 'table') == (0, 'alice | Alice | 30\n\n', '')
+	assert _run('read', p, '--format', 'table') == (0, 'alice | Alice | 30 |  \nbob   | Bob   | 25 | x\n\n', '')
+	assert _run('keys', p, '--format', 'table') == (0, 'alice\nbob  \n\n', '')
+	q = str(tmp_path / 't.tsv')
+	_touch(q, b'id\tname\nalice\tAlice\n')
+	assert _run('read', q, '--format', 'table') == (0, 'id    | name \n------+------\nalice | Alice\n\n', '')
+	assert _run('get', q, 'alice', '--format', 'table') == (0, 'alice | Alice\n\n', '')
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='needs a pseudo-terminal')

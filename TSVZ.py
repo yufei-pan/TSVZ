@@ -6130,10 +6130,21 @@ def _cliFormat(args, stdout):
 		return 'records'
 
 
-def _cliEmitRows(rows, args, stdout, spec, delimiter):
-	"""Print store rows for ``read`` / ``get`` (spec §20.4): §13 records, 3.39 records or the 3.39 table."""
+def _cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=False):
+	"""Print store rows for ``read`` / ``get`` (spec §20.4): §13 records, 3.39 records or a table.
+
+	The table shows the rows only, each padded to the widest and none truncated to the
+	terminal's width. ``headerRow`` keeps 3.39's ``read`` table of a loose file, whose
+	first row is the file's header line.
+	"""
 	if _cliFormat(args, stdout) == 'table':
-		_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter) + '\n')
+		if headerRow or not rows:
+			_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter) + '\n')
+			return
+		width = max(len(row) for row in rows)
+		rows = [list(row) + [''] * (width - len(row)) for row in rows]
+		table = pretty_format_table(rows, delimiter=delimiter, header=[''] * width, full=True)
+		_cliWrite(stdout, table.split('\n', 2)[2] + '\n')  # drop the blank header and its rule
 		return
 	if spec:
 		lines = [_specFormatRecord(row, delimiter) for row in rows]
@@ -6243,7 +6254,7 @@ def _cliRead(args, delimiter, logger, stdin, stdout):
 	if not _isSpecPath(args.store):
 		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
 							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-		_cliEmitRows(list(data.values()), args, stdout, False, delimiter)
+		_cliEmitRows(list(data.values()), args, stdout, False, delimiter, headerRow=True)
 		return 0
 	load, readable = _cliSpecLoad(args, delimiter, logger)
 	_cliEmitRows(list(load.data.values()), args, stdout, True, delimiter)
@@ -6474,7 +6485,8 @@ def _cliEmitServed(args, delimiter, logger, stdout, response):
 	spec = _isSpecPath(args.store)
 	operation = args.operation
 	if operation in ('read', 'get', 'pop', 'popitem', 'setdefault'):
-		_cliEmitRows([_serveDecodeLine(line) for line in lines], args, stdout, spec, delimiter)
+		_cliEmitRows([_serveDecodeLine(line) for line in lines], args, stdout, spec, delimiter,
+					 headerRow=operation == 'read' and not spec)
 	elif operation == 'keys':
 		_cliEmitRows([[_specDecodeField(line, '\t')] for line in lines], args, stdout, spec, delimiter)
 	elif operation == 'len':

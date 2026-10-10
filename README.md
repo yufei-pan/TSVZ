@@ -225,6 +225,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C7 | `-c/--header`, `--defaults`, `-s/--strict` and `-f/--force` are undocumented aliases of the `--x-` options. `--x-header` and `--x-defaults` keep non-ASCII text. |
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
+| C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line. |
 
 ## Spec deviations and interpretations
 
