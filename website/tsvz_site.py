@@ -485,3 +485,206 @@ def render(text, spec=False, anchors=None):
     renderer = SpecRenderer(anchors) if spec else Renderer()
     blocks = renderer.render(text)
     return blocks, getattr(renderer, "anchors", set())
+
+
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
+SCRIPT = """(function () {
+  var d = document;
+  if (navigator.clipboard) {
+    d.querySelectorAll('.code').forEach(function (box) {
+      var code = box.querySelector('code');
+      var b = d.createElement('button');
+      b.type = 'button';
+      b.className = 'copy';
+      b.textContent = 'Copy';
+      b.addEventListener('click', function () {
+        var cmds = code.querySelectorAll('.cmd');
+        var text = cmds.length ? Array.prototype.map.call(cmds, function (c) {
+          return c.textContent;
+        }).join('\\n') : code.textContent;
+        navigator.clipboard.writeText(text).then(function () {
+          b.textContent = 'Copied';
+          setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+        });
+      });
+      box.appendChild(b);
+    });
+  }
+  var toc = d.getElementById('toc');
+  if (!toc || !window.IntersectionObserver) return;
+  var links = {}, current = null;
+  toc.querySelectorAll('a').forEach(function (a) { links[a.hash.slice(1)] = a; });
+  function mark(id) {
+    var a = links[id];
+    if (!a || a === current) return;
+    if (current) current.classList.remove('on');
+    toc.querySelectorAll('li.open').forEach(function (li) { li.classList.remove('open'); });
+    a.classList.add('on');
+    current = a;
+    for (var el = a.parentNode; el && el !== toc; el = el.parentNode) {
+      if (el.tagName === 'LI') el.classList.add('open');
+    }
+  }
+  var seen = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) { if (e.isIntersecting) mark(e.target.id); });
+  }, { rootMargin: '0px 0px -75% 0px' });
+  d.querySelectorAll('#at-a-glance, .doc h2[id], .doc h3[id]').forEach(function (h) {
+    if (links[h.id]) seen.observe(h);
+  });
+})();
+"""
+
+FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+           "%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E"
+           "%3Ctext x='16' y='23' font-family='ui-monospace,Menlo,monospace' font-size='20' "
+           "font-weight='700' fill='white' text-anchor='middle'%3Ez%3C/text%3E%3C/svg%3E")
+
+GITHUB_URL = "https://github.com/yufei-pan/TSVZ"
+PYPI_URL = "https://pypi.org/project/TSVZ/"
+CC_BY_URL = "https://creativecommons.org/licenses/by/4.0/"
+LANDING_TITLE = "TSVZ — an append-only CSV that's also a key-value store"
+SPEC_TITLE = "TSVZ Format Specification (v1)"
+
+
+def landing_main(blocks):
+    """The landing page's <main> content from the rendered blocks of index.md."""
+    groups, current = [], (None, [])
+    for block in blocks:
+        if block.kind == "h2":
+            groups.append(current)
+            current = (block, [])
+        else:
+            current[1].append(block)
+    groups.append(current)
+    hero = groups[0][1]
+    split = next((k for k, b in enumerate(hero) if b.kind == "file"), len(hero))
+    out = ['<section class="hero">\n<div class="hero-text">\n']
+    out.extend(b.html for b in hero[:split])
+    out.append('</div>\n<div class="hero-art">\n')
+    out.extend(b.html for b in hero[split:])
+    out.append("</div>\n</section>\n")
+    for heading, body in groups[1:]:
+        out.append('<section class="sec-%s">\n' % heading.heading.id)
+        out.append(heading.html)
+        first_sub = next((k for k, b in enumerate(body) if b.kind == "h3"), len(body))
+        out.extend(b.html for b in body[:first_sub])
+        if first_sub < len(body):
+            out.append('<div class="subs">\n')
+            for k, b in enumerate(body[first_sub:]):
+                if b.kind == "h3":
+                    out.append("</div>\n" if k else "")
+                    out.append('<div class="sub">\n')
+                out.append(b.html)
+            out.append("</div>\n</div>\n")
+        out.append("</section>\n")
+    return "".join(out)
+
+
+def _toc_items(headings, nested):
+    out, open_h2 = [], False
+    for h in headings:
+        if h.level == 2:
+            if open_h2:
+                out.append("</ul></li>\n" if nested == "sub" else "</li>\n")
+            out.append('<li><a href="#%s">%s</a>' % (h.id, escape(h.text)))
+            open_h2 = True
+            if nested == "sub":
+                out.append("<ul>")
+        elif h.level == 3 and nested == "sub":
+            out.append('<li><a href="#%s">%s</a></li>' % (h.id, escape(h.text)))
+    if open_h2:
+        out.append("</ul></li>\n" if nested == "sub" else "</li>\n")
+    return "".join(out).replace("<ul></ul>", "")
+
+
+def spec_main(blocks, glance_html, date):
+    """The spec page's <main> content: header, contents, glance box and body."""
+    title = next(b.heading.text for b in blocks if b.kind == "h1")
+    meta = next((b for b in blocks if b.kind == "para" and b.raw.startswith("**Version:**")), None)
+    version = status = None
+    if meta:
+        m = re.search(r"\*\*Version:\*\*\s*(\S+)", meta.raw)
+        version = m.group(1) if m else None
+        m = re.search(r"\*\*Status:\*\*\s*(\S+)", meta.raw)
+        status = m.group(1) if m else None
+    body = [b for b in blocks if b.kind != "h1" and b is not meta]
+    headings = [b.heading for b in body if b.heading and b.heading.level in (2, 3)]
+    facts = []
+    if version:
+        facts.append("Version %s" % escape(version))
+    if status:
+        facts.append(escape(status))
+    if date:
+        facts.append("updated %s" % date)
+    glance_item = '<li><a href="#at-a-glance">At a glance</a></li>\n'
+    return "".join([
+        '<header class="doc-head">\n<h1>%s</h1>\n' % escape(title),
+        '<p class="meta">%s</p>\n' % " · ".join(facts),
+        '<p class="meta"><a href="/spec.md">Markdown</a> · <a href="%s">CC BY 4.0</a> · '
+        "anyone may implement</p>\n</header>\n" % CC_BY_URL,
+        '<div class="doc-layout">\n',
+        '<nav class="toc" id="toc" aria-label="Contents">\n<p class="toc-title">Contents</p>\n<ul>\n',
+        glance_item, _toc_items(headings, "sub"), "</ul>\n</nav>\n",
+        '<article class="doc">\n',
+        '<details class="toc-mobile"><summary>Contents</summary>\n<ul>\n',
+        glance_item, _toc_items(headings, "flat"), "</ul>\n</details>\n",
+        '<aside class="glance" id="at-a-glance">\n<p class="glance-title">At a glance</p>\n',
+        glance_html, "</aside>\n",
+        "".join(b.html for b in body),
+        "</article>\n</div>\n",
+    ])
+
+
+NOT_FOUND_MAIN = ('<section class="notfound">\n<h1>No page here</h1>\n'
+                  '<p><a href="/">Home</a> · <a href="/spec">The specification</a></p>\n</section>\n')
+
+
+def page(*, css, title, description, canonical, md_url, current, main, body_class, md_link_text):
+    """A complete HTML page in the site template."""
+    def nav_link(href, label, name, extra=""):
+        here = ' aria-current="page"' if name == current else ""
+        return '<a%s href="%s"%s>%s</a>' % (extra, href, here, label)
+
+    head = [
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n",
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n',
+        '<meta name="color-scheme" content="light dark">\n',
+        "<title>%s</title>\n" % escape(title),
+        '<meta name="description" content="%s">\n' % escape(description),
+    ]
+    if canonical:
+        head += [
+            '<link rel="canonical" href="%s">\n' % canonical,
+            '<meta property="og:type" content="website">\n',
+            '<meta property="og:site_name" content="TSVZ">\n',
+            '<meta property="og:title" content="%s">\n' % escape(title),
+            '<meta property="og:description" content="%s">\n' % escape(description),
+            '<meta property="og:url" content="%s">\n' % canonical,
+            '<meta name="twitter:card" content="summary">\n',
+        ]
+    if md_url:
+        head.append('<link rel="alternate" type="text/markdown" href="%s">\n' % md_url)
+    head += ['<link rel="icon" href="%s">\n' % FAVICON, "<style>%s</style>\n" % css, "</head>\n"]
+    footer_links = ['<a href="%s">GitHub</a>' % GITHUB_URL, '<a href="%s">PyPI</a>' % PYPI_URL]
+    if md_url:
+        footer_links.append('<a href="%s">%s</a>' % (md_url, md_link_text))
+    footer_links.append('<a href="/llms.txt">llms.txt</a>')
+    body = [
+        '<body class="%s">\n<a class="skip" href="#main">Skip to content</a>\n' % body_class,
+        '<header class="site-head"><nav aria-label="Site">',
+        '<a class="brand" href="/">tsvz</a><span class="nav-links">',
+        nav_link("/spec", "Spec", "spec"),
+        nav_link("/#implementations", "Implementations", "", ' class="nav-impl"'),
+        nav_link(GITHUB_URL, "GitHub", ""),
+        "</span></nav></header>\n",
+        '<main id="main">\n', main, "</main>\n",
+        '<footer class="site-foot">\n',
+        '<p>Spec v1 (draft) · <a href="%s">CC BY 4.0</a>, anyone may implement TSVZ under any license'
+        " · Python implementation: GPL-3.0-or-later</p>\n" % CC_BY_URL,
+        "<p>%s</p>\n</footer>\n" % " · ".join(footer_links),
+        "<script>%s</script>\n</body>\n</html>\n" % SCRIPT,
+    ]
+    return "".join(head + body)

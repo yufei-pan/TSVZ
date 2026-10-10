@@ -101,9 +101,13 @@ Both pages share the template: a skip link, the nav, `<main>`, and the footer.
 ### 2.1 Landing page (`/`)
 
 The content is `index.md` (Appendix A). Each `##` section is wrapped in
-`<section id="<heading id>">`, and everything before the first `##` is wrapped
-in `<section id="top" class="hero">`. The layout comes from `style.css`
-selecting on those ids. A test checks that every id the CSS uses exists.
+`<section class="sec-<heading id>">`, and the `<h2>` inside keeps the id, so
+`/#implementations` lands on the heading. Everything before the first `##` is
+wrapped in `<section class="hero">`, split into `<div class="hero-text">` and
+`<div class="hero-art">` at the annotated file. Within a section, each `###`
+starts a `<div class="sub">`, and the subs share one `<div class="subs">`. The
+layout comes from `style.css` selecting on those classes. A test checks that
+every `sec-` class the CSS uses exists.
 
 | # | Section | Layout at 760px and wider | Below 760px |
 |---|---|---|---|
@@ -114,6 +118,10 @@ selecting on those ids. A test checks that every id the CSS uses exists.
 | ⑤ | Implementations: a table, then two short paragraphs | Table | One card per row; each cell labelled with its column name |
 | ⑥ | When TSVZ isn't the right fit: a 5-item list | 2 text columns | 1 column |
 | ⑦ | Footer (template) | One row | Wraps |
+
+The hero and the Quick start split into two columns from 1000px, not 760px;
+between 760px and 1000px they stack. At 768px a split hero squeezed the
+headline into five lines.
 
 ### 2.2 Spec page (`/spec`)
 
@@ -339,6 +347,10 @@ were measured.
 | `--on-accent` | `#ffffff` (5.5 on accent) | `#04201c` (9.2 on accent) | primary button text |
 | `--marker` | `#b45309` (4.8) | `#f2a33a` (8.8) | `#_markers_#` in the file |
 | `--delete` | `#b91c1c` (6.2) | `#f87171` (6.6) | deleted line in the file |
+| `--accent-soft` | `#e3f1ee` | `#123a35` | step-number circles (accent on it: 4.7 / 6.7) |
+| `--rfc` | `#9a3412` (6.9) | `#fb923c` (8.1) | MUST, SHOULD, MAY in the spec |
+| `--inline-code` | `#efece4` | `#2a2925` | inline code background (ink on it: 14.6 / 12.0) |
+| `--note-bg` | `#f1efe8` | `#24231f` | note callouts (muted on it: 6.7 / 8.0) |
 | `--code-bg`, `--code-fg`, `--code-dim`, `--code-prompt` | `#1f1f1d`, `#e9e6df` (13.3), `#9a958b` (5.5), `#5eead4` (11.2) | same | code blocks (dark in both themes) |
 
 ### 5.2 Type, layout and screen sizes
@@ -349,15 +361,15 @@ were measured.
   most 1100px wide.
 - **Below 760px.** One column with a 16px gutter. "Implementations" leaves
   the nav.
-- **760px and wider.** The hero splits; cards and code blocks sit side by
-  side.
-- **1000px and wider.** The spec's sticky contents sidebar appears.
+- **760px and wider.** Cards, steps and file notes sit side by side.
+- **1000px and wider.** The hero and the Quick start split into two columns,
+  and the spec's sticky contents sidebar appears.
 - **No sideways scrolling.** The page never scrolls horizontally. Tables and
   code blocks scroll inside their own box.
 
 ### 5.3 JavaScript
 
-There are two inline scripts, each under 1 KB, and both are optional:
+One inline script, about 1.6 KB, does two optional things:
 
 - **The spec's contents sidebar.** An `IntersectionObserver` marks the
   section being read and opens its subsections.
@@ -406,7 +418,7 @@ python3 -m pytest website/tsvz_site_test.py -q
   - an existing id for every `tsvz-spec-v1.md#…` anchor in `README.md`;
   - balanced tags (checked with `html.parser`).
 - **Landing.**
-  - Every section id that `style.css` selects exists.
+  - Every `sec-` class that `style.css` selects exists.
   - The HTML is within 30 KB.
   - `llms.txt` lists every row of the implementations table.
 - **Quick start runs.** Extract the two Quick start code blocks from
@@ -529,7 +541,7 @@ alice,Alice,30
 bob,Bob,25
 alice,Alice,31
 bob
-$ tsvz get people.csvz alice      # the current row: alice, Alice, 31
+$ tsvz get people.csvz alice    # → alice, Alice, 31
 ```
 
 ### Python
@@ -537,12 +549,13 @@ $ tsvz get people.csvz alice      # the current row: alice, Alice, 31
 ```python
 import TSVZ
 
-t = TSVZ.TSVZed('people.csvz', header='id,name,score')
+t = TSVZ.TSVZed('people.csvz',
+                header='id,name,score')
 t['alice'] = ['alice', 'Alice', '30']
 t['bob'] = ['bob', 'Bob', '25']
-t['alice'] = ['alice', 'Alice', '31']   # last write wins
-del t['bob']                            # appends "bob": a key alone
-print(t['alice'])                       # ['alice', 'Alice', '31']
+t['alice'] = ['alice', 'Alice', '31']
+del t['bob']       # appends "bob": a key alone
+print(t['alice'])  # ['alice', 'Alice', '31']
 t.close()
 ```
 

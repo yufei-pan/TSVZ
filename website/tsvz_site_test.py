@@ -1,6 +1,9 @@
 """Tests for website/tsvz_site.py.  Run: python3 -m pytest website/tsvz_site_test.py -q"""
 
+import os
 import re
+import shlex
+import subprocess
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
@@ -221,3 +224,132 @@ def test_readme_spec_anchors_exist():
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     anchors = re.findall(r"tsvz-spec-v1\.md#([A-Za-z0-9_-]+)", readme)
     assert anchors and set(anchors) <= ids
+
+
+# -- Task 3: content, stylesheet and page templates ---------------------------
+
+INDEX_MD = (HERE / "index.md").read_text(encoding="utf-8")
+CSS = (HERE / "style.css").read_text(encoding="utf-8").strip()
+
+
+def landing_html():
+    blocks, _ = tsvz_site.render(INDEX_MD)
+    return tsvz_site.page(css=CSS, title=tsvz_site.LANDING_TITLE, description="d",
+                          canonical="https://tsvz.org/", md_url="/index.md", current="home",
+                          main=tsvz_site.landing_main(blocks), body_class="page-landing",
+                          md_link_text="This page as markdown")
+
+
+def test_landing_sections():
+    blocks, _ = tsvz_site.render(INDEX_MD)
+    main = tsvz_site.landing_main(blocks)
+    hero = main.split("</section>", 1)[0]
+    assert hero.startswith('<section class="hero">\n<div class="hero-text">\n<h1')
+    text, art = hero.split('<div class="hero-art">')
+    assert '<p class="actions">' in text and "pip install tsvz" in text
+    assert art.lstrip().startswith('<figure class="file">') and "Current state" in art
+    for cls in ("why-tsvz", "how-it-works", "quick-start", "implementations",
+                "when-tsvz-isnt-the-right-fit"):
+        assert '<section class="sec-%s">' % cls in main
+    quick = main.split('<section class="sec-quick-start">', 1)[1].split("</section>", 1)[0]
+    assert quick.count('<div class="sub">') == 2 and '<div class="subs">' in quick
+    assert_balanced(main)
+
+
+def test_every_css_section_class_exists():
+    page = landing_html()
+    for cls in set(re.findall(r"\.(sec-[a-z0-9-]+)", CSS)):
+        assert 'class="%s"' % cls in page, cls
+
+
+def test_landing_page_template():
+    out = landing_html()
+    assert out.startswith('<!doctype html>\n<html lang="en">')
+    assert "<title>TSVZ — an append-only CSV that's also a key-value store</title>" in out
+    assert '<link rel="canonical" href="https://tsvz.org/">' in out
+    assert '<link rel="alternate" type="text/markdown" href="/index.md">' in out
+    assert '<meta property="og:url" content="https://tsvz.org/">' in out
+    assert '<a class="skip" href="#main">Skip to content</a>' in out
+    assert '<a href="/spec">Spec</a>' in out and 'class="nav-impl" href="/#implementations"' in out
+    assert "<style>%s</style>" % CSS in out and "<script>%s</script>" % tsvz_site.SCRIPT in out
+    assert 'CC BY 4.0</a>, anyone may implement TSVZ under any license' in out
+    assert '<a href="/index.md">This page as markdown</a>' in out
+    assert_balanced(out)
+
+
+def test_landing_size_budget():
+    assert len(landing_html().encode("utf-8")) <= 30 * 1024
+
+
+def test_spec_page_parts():
+    blocks, anchors = tsvz_site.render(SPEC, spec=True)
+    glance_blocks, _ = tsvz_site.render((HERE / "spec-glance.md").read_text(encoding="utf-8"),
+                                        spec=True, anchors=anchors)
+    main = tsvz_site.spec_main(blocks, "".join(b.html for b in glance_blocks), "2026-10-09")
+    assert '<header class="doc-head">\n<h1>TSVZ — Format Specification</h1>' in main
+    assert '<p class="meta">Version 1 · Draft · updated 2026-10-09</p>' in main
+    assert "**Version:**" not in main and "<strong>Version:</strong>" not in main
+    assert main.count("<h1") == 1
+    toc = main.split('<nav class="toc" id="toc" aria-label="Contents">', 1)[1].split("</nav>", 1)[0]
+    assert '<li><a href="#at-a-glance">At a glance</a></li>' in toc
+    assert '<a href="#20-command-line-interface">20. Command-line interface</a><ul>' in toc
+    assert '<li><a href="#201-invocation">20.1 Invocation</a></li>' in toc
+    mobile = main.split('<details class="toc-mobile">', 1)[1].split("</details>", 1)[0]
+    assert '<a href="#20-command-line-interface">' in mobile and "201-invocation" not in mobile
+    assert '<aside class="glance" id="at-a-glance">' in main
+    assert '<a class="sref" href="#s4.3">§4.3</a>' in main.split("</aside>", 1)[0]
+    assert_balanced(main)
+
+
+def test_spec_page_without_date_or_meta():
+    blocks, _ = tsvz_site.render("# Title\n\nTagline.\n\n## 1. One\n", spec=True)
+    main = tsvz_site.spec_main(blocks, "", None)
+    assert '<p class="meta"></p>' in main and "<h1>Title</h1>" in main
+
+
+def _quick_start_blocks():
+    blocks, _ = tsvz_site.render(INDEX_MD)
+    console = next(b.raw for b in blocks if 'class="language-console"' in b.html)
+    python = next(b.raw for b in blocks if 'class="language-python"' in b.html)
+    hero = next(b.raw for b in blocks if b.kind == "file")
+    return console, python, hero
+
+
+def test_quick_start_python_writes_the_hero_file(tmp_path):
+    _, python, hero = _quick_start_blocks()
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    run = subprocess.run([sys.executable, "-c", python], cwd=str(tmp_path), env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    assert run.returncode == 0, run.stderr
+    # TSVZed also prints "Created people.csvz" first, as 3.39 did.
+    assert run.stdout.decode().splitlines()[-1] == "['alice', 'Alice', '31']"
+    expected = "\n".join(re.sub(r"\s{2,}← .*$", "", line).rstrip() for line in hero.split("\n")) + "\n"
+    assert (tmp_path / "people.csvz").read_text(encoding="utf-8") == expected
+
+
+def test_quick_start_console_shows_real_output(tmp_path):
+    console, _, _ = _quick_start_blocks()
+    steps, current = [], None
+    for line in console.split("\n"):
+        if line.startswith("$ "):
+            current = [line[2:], []]
+            steps.append(current)
+        else:
+            current[1].append(line)
+    ran = 0
+    for command, shown in steps:
+        argv = shlex.split(command, comments=True)
+        if argv[:2] == ["pip", "install"]:
+            continue
+        if argv[0] == "tsvz":
+            argv = [sys.executable, str(REPO / "TSVZ.py")] + argv[1:]
+        run = subprocess.run(argv, cwd=str(tmp_path), stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=30)
+        assert run.returncode == 0, (command, run.stdout)
+        output = run.stdout.decode().splitlines()
+        if command.startswith("tsvz get"):
+            assert output == ["alice,Alice,31"] and "alice, Alice, 31" in command
+        else:
+            assert output == shown, command
+        ran += 1
+    assert ran == 6
