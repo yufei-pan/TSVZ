@@ -211,18 +211,73 @@ def assert_balanced(html):
     assert not checker.stack, checker.stack
 
 
-def test_whole_spec_renders_cleanly():
-    out = html_of(SPEC, spec=True)
+# References the design lets link to their closest numbered parent: (reference, target).
+FALLBACK_REFS = {("19.2.3", "19.2")}
+
+# Markdown the renderer does not support: it would show up as literal text on the site.
+UNSUPPORTED = {
+    "image": r"!\[",
+    "reference link": r"\]\[",
+    "strikethrough": r"~~",
+    "autolink": r"<https?://",
+    "raw HTML": r"</?(?:a|b|i|p|br|em|div|img|pre|sub|sup|code|span|table|strong|details|summary)\b[^>]*>",
+    "setext heading": r"^[^\n]*\S[^\n]*\n[ \t]{0,3}(?:=+|-+)[ \t]*$",
+    "indented code": r"(?:^|\n)[ \t]*\n(?:    |\t)(?![ \t]*(?:[-*+]|\d+[.)])[ \t])\S",
+}
+
+
+def spec_problems(markdown):
+    """What would go wrong on the site if markdown were the spec; empty when nothing would."""
+    problems = []
+    source = re.sub(r"^```.*?^```[ \t]*$", "", markdown, flags=re.S | re.M)
+    source = re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", source, flags=re.S)
+    for name, pattern in UNSUPPORTED.items():
+        if re.search(pattern, source, re.M):
+            problems.append("unsupported markdown: %s" % name)
+    out = html_of(markdown, spec=True)
     outside_code = re.sub(r"<code[^>]*>.*?</code>", "", out, flags=re.S)
-    assert "**" not in outside_code and "```" not in out and "|---" not in out
-    assert not re.search(r"<h[1-4](?! id=)", out)  # every heading has an id
+    if "**" in outside_code or "```" in out or "|---" in out:
+        problems.append("leftover markdown")
+    if re.search(r"<h[1-4](?! id=)", out):
+        problems.append("heading without an id")
     ids = re.findall(r'id="([^"]+)"', out)
-    assert len(ids) == len(set(ids)), "duplicate ids"
+    if len(ids) != len(set(ids)):
+        problems.append("duplicate ids")
     missing = set(re.findall(r'href="#([^"]+)"', out)) - set(ids)
-    assert not missing, sorted(missing)[:5]
-    unlinked = re.sub(r'<a class="sref"[^>]*>§[^<]*</a>', "", outside_code)
-    assert "§" not in unlinked
-    assert_balanced(out)
+    if missing:
+        problems.append("links to missing ids: %s" % sorted(missing)[:5])
+    if "§" in re.sub(r'<a class="sref"[^>]*>§[^<]*</a>', "", outside_code):
+        problems.append("a § reference that is not a link")
+    for target, ref in re.findall(r'<a class="sref" href="#s([^"]+)">§([^<]+)</a>', out):
+        if ref != target and (ref, target) not in FALLBACK_REFS:
+            problems.append("§%s links to its parent §%s" % (ref, target))
+    checker = _TagChecker()
+    checker.feed(out)
+    checker.close()
+    if checker.errors or checker.stack:
+        problems.append("unbalanced tags")
+    return problems
+
+
+def test_whole_spec_renders_cleanly():
+    assert spec_problems(SPEC) == []
+    assert_balanced(html_of(SPEC, spec=True))
+
+
+@pytest.mark.parametrize("addition", [
+    "See §4.30 for details.",          # a subsection that does not exist links to §4
+    "See §21.99.",
+    "See §4.3.7.",
+    "![diagram](x.png)",                # unsupported markdown renders as literal text
+    "Some <b>raw</b> HTML.",
+    "Setext\n===",
+    "A [reference link][1].",
+    "~~struck~~ text",
+    "An autolink <https://x.org>.",
+    "Para.\n\n    indented code\n",
+])
+def test_spec_guard_catches_regressions(addition):
+    assert spec_problems(SPEC + "\n\n" + addition + "\n")
 
 
 def test_readme_spec_anchors_exist():
