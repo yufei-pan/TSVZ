@@ -1466,3 +1466,364 @@ class _BlindPlan(object):
 		self.mix = {count: [strip(p) for p in plans] for count, plans in plan.mix.items()}
 
 
+# ---------------------------------------------------------------------------
+# The benchmark: running
+# ---------------------------------------------------------------------------
+
+def environment(work):
+	cpu = platform.processor() or platform.machine()
+	try:
+		with open('/proc/cpuinfo') as f:
+			for line in f:
+				if line.startswith('model name'):
+					cpu = line.split(':', 1)[1].strip()
+					break
+	except OSError:
+		pass
+	fs = 'unknown'
+	try:
+		best = ''
+		with open('/proc/mounts') as f:
+			for line in f:
+				fields = line.split()
+				mount = fields[1].replace('\\040', ' ')
+				if (work == mount or work.startswith(mount.rstrip('/') + '/')) and len(mount) >= len(best):
+					best, fs = mount, fields[2]
+	except (OSError, IndexError):
+		pass
+	return {'host': socket.gethostname(), 'cpu': cpu, 'cpus': os.cpu_count(), 'python': platform.python_version(),
+		'kernel': '%s %s' % (platform.system(), platform.release()), 'fs': fs}
+
+
+def fs_warning(fs):
+	"""A warning when the work directory is on a FUSE file system (mergerfs and the like), else None."""
+	if fs.startswith('fuse'):
+		return ('the work directory is on %s: file operations there cost more than on the disk below it, '
+			'which can hide differences; consider --work-dir on a directly mounted file system' % fs)
+	return None
+
+
+class Bench(object):
+	def __init__(self, opts, out=None):
+		self.opts = opts
+		self.params = opts.params
+		self.out = out or sys.stdout
+		self.impls = [Impl(name, command) for name, command in opts.impls]
+		self.results = []
+		self.ceiling = None
+		self.work = None
+		self.own_work = False
+		self.started = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+
+	def setup(self):
+		if self.opts.work_dir:
+			self.work = os.path.abspath(self.opts.work_dir)
+			os.makedirs(self.work, exist_ok=True)
+		else:
+			self.work = tempfile.mkdtemp(prefix='tsvzbench-', dir=os.getcwd())
+			self.own_work = True
+		self.fixtures = Fixtures(os.path.join(self.work, 'fixtures'), self.opts.seed)
+		os.makedirs(self.fixtures.directory, exist_ok=True)
+
+	def preflight(self):
+		"""None when the work directory has room for the suite, else a message."""
+		planned = planned_fixtures(self.params, self.opts.families)
+		need = sum(self.fixtures.estimate(kind, rows) for kind, rows in planned)
+		need += 4 * max(self.params['sizes']) * ROW_BYTES
+		need = int(need * 1.2)
+		stat = os.statvfs(self.work)
+		free = stat.f_bavail * stat.f_frsize
+		if need > free:
+			return 'the %s suite needs about %s in %s; %s is free' % (self.opts.suite, fmt_bytes(need), self.work, fmt_bytes(free))
+		return None
+
+	def cleanup(self):
+		kill_live_groups()
+		if self.work and not self.opts.keep:
+			if self.own_work:
+				shutil.rmtree(self.work, ignore_errors=True)
+			else:
+				shutil.rmtree(os.path.join(self.work, 'runs'), ignore_errors=True)
+				shutil.rmtree(os.path.join(self.work, 'probe'), ignore_errors=True)
+
+	def prepare(self):
+		"""Work directory, preflight, probes and fixtures; returns a problem message or None."""
+		self.setup()
+		problem = self.preflight()
+		if problem:
+			return problem
+		warning = fs_warning(environment(self.work)['fs'])
+		if warning:
+			eprint('tsvzbench: ' + warning)
+		for impl in self.impls:
+			eprint('tsvzbench: probing %s' % impl.name)
+			probe(impl, os.path.join(self.work, 'probe', impl.name), self.params['timeout'])
+		for kind, rows in planned_fixtures(self.params, self.opts.families):
+			if not self.fixtures.cached(kind, rows):
+				eprint('tsvzbench: generating %s %s' % (kind, fmt_rows(rows)))
+			self.fixtures.get(kind, rows)
+		return None
+
+	def run_cases(self, cases):
+		for number, case in enumerate(cases, 1):
+			eprint('tsvzbench: [%d/%d] %s %s' % (number, len(cases), case.family, case.label))
+			if case.kind == 'cli':
+				self.run_cli_case(case)
+			elif case.kind == 'calls':
+				self.run_calls_case(case)
+			else:
+				self.run_socket_case(case)
+
+	def active(self):
+		return [impl for impl in self.impls if impl.problem is None]
+
+	def _new_results(self, case):
+		results = {}
+		for impl in self.impls:
+			result = Result(case, impl)
+			if impl.problem:
+				result.mark = (NA, 'skipped: ' + impl.problem)
+			results[impl.name] = result
+			self.results.append(result)
+		return results
+
+	def _run_dir(self, impl, case):
+		run_dir = os.path.join(self.work, 'runs', impl.name, case.ident)
+		shutil.rmtree(run_dir, ignore_errors=True)
+		os.makedirs(run_dir)
+		return run_dir
+
+	def _rounds(self, results, once, min_repeat=1):
+		"""The warm-up (gated) run of every implementation, then the timed repetitions in rotating order."""
+		active = [impl for impl in self.active() if results[impl.name].mark[0] == NA and not results[impl.name].mark[1]]
+		for impl in active:
+			once(impl, results[impl.name], True)
+		timed = [impl for impl in active if results[impl.name].mark[0] not in (TIMEOUT, NA)]
+		for rep in range(max(self.params['repeat'], min_repeat)):
+			for slot in range(len(timed)):
+				impl = timed[(slot + rep) % len(timed)]
+				once(impl, results[impl.name], False)
+
+	def _fail_log(self, result, path):
+		if os.path.exists(path):
+			lines = _read(path).decode('utf-8', 'replace').rstrip('\n').split('\n')
+			result.log = '\n'.join(lines[-5:])
+
+	def run_cli_case(self, case):
+		results = self._new_results(case)
+		fixture = self.fixtures.get(case.shape, case.rows) if case.shape else None
+		stdin = self.fixtures.get(*case.stdin).path if case.stdin else None
+
+		def once(impl, result, gate):
+			run_dir = self._run_dir(impl, case)
+			if fixture:
+				store = fixture.copy_to(run_dir)
+			else:
+				store = os.path.join(run_dir, 'new.tsvz')
+			if case.op:
+				argv = impl.cli(case.op, store, *case.args)
+			else:
+				argv = impl.argv + ['-V']
+			ctx = RunContext(case, None, run_dir, store, os.path.join(run_dir, 'stdout'), fixture, stdin)
+			if case.op:
+				ctx.before_bytes = store_bytes(store)
+			if case.check is check_scrub_parts:
+				ctx.before_hashes = _hashes(run_dir, fixture.files)
+			sample = run_child(argv, impl.cwd, self.params['timeout'], stdin_path=stdin,
+				stdout_path=ctx.stdout, stderr_path=os.path.join(run_dir, 'stderr'))
+			if case.op:
+				sample.store_bytes = store_bytes(store)
+			ctx.sample = sample
+			if gate:
+				result.mark = self.judge(case, ctx)
+				result.extra['exit'] = sample.exit
+				result.extra['before_bytes'] = ctx.before_bytes
+				if result.mark[0] in FAILED:
+					self._fail_log(result, os.path.join(run_dir, 'stderr'))
+			else:
+				result.samples.append(sample)
+				if sample.exit != result.extra.get('exit'):
+					result.drift = True
+
+		self._rounds(results, once, case.min_repeat)
+
+	def judge(self, case, ctx):
+		sample = ctx.sample
+		if sample.timed_out:
+			return TIMEOUT, 'after %.0f s' % self.params['timeout']
+		if case.check is not check_scrub_parts and sample.exit != case.expect_exit:
+			return EXIT, '%d%s' % (sample.exit, ' (unsupported?)' if case.optional else '')
+		try:
+			return case.check(ctx)
+		except Exception as error:
+			return WRONG, 'could not check: %r' % error
+
+	def run_calls_case(self, case):
+		results = self._new_results(case)
+		fixture = self.fixtures.get(case.shape, case.rows)
+		rng = random.Random('calls-%d' % case.rows)
+		keys = [key_of(rng.randrange(case.rows)) for _ in range(self.params['calls'])]
+		values = [random_values(rng) for _ in keys]
+		timeout = self.params['timeout']
+
+		def once(impl, result, gate):
+			if case.via_handler and not impl.handler:
+				result.mark = (NA, 'no handler')
+				return
+			run_dir = self._run_dir(impl, case)
+			store = fixture.copy_to(run_dir)
+			handler = None
+			if case.via_handler:
+				handler = Handler(impl, store, run_dir, timeout)
+				try:
+					handler.start()
+				except HandlerError as error:
+					handler.stop()
+					if gate:
+						result.mark = (WRONG, 'handler: %s' % error)
+						self._fail_log(result, os.path.join(run_dir, 'serve.err'))
+					return
+			expected = fixture.model() if gate else None
+			problem = None
+			out, err = os.path.join(run_dir, 'stdout'), os.path.join(run_dir, 'stderr')
+			sets, gets = [], []
+			try:
+				for key, cells in zip(keys, values):
+					sample = run_child(impl.cli('set', store, key, *cells), impl.cwd, timeout, stdout_path=out, stderr_path=err)
+					sets.append(sample)
+					problem = problem or self._call_problem(sample, 0)
+					if expected is not None:
+						expected.apply_line(record(key, cells)[:-1])
+				for key in keys:
+					sample = run_child(impl.cli('get', store, key), impl.cwd, timeout, stdout_path=out, stderr_path=err)
+					gets.append(sample)
+					problem = problem or self._call_problem(sample, 0)
+					if expected is not None and not problem:
+						difference = compare_rows(output_rows(_read(out)), [[key] + expected.resolve(key)])
+						if difference:
+							problem = (WRONG, 'get %s: %s' % (key, difference))
+			finally:
+				if handler:
+					handler.stop()
+			if gate:
+				if not problem:
+					difference = compare_rows(read_store(store).iter_rows(), expected.iter_rows())
+					problem = (WRONG, 'post-state: %s' % difference) if difference else None
+				result.mark = problem or (OK, '')
+				if problem:
+					self._fail_log(result, err)
+				return
+			if problem:
+				result.drift = True
+			for name, samples in (('set', sets), ('get', gets)):
+				result.add_series(name, [s.wall for s in samples], len(samples) / sum(s.wall for s in samples),
+					[s.maxrss for s in samples], [s.rss_floor for s in samples])
+
+		self._rounds(results, once)
+
+	def _call_problem(self, sample, want):
+		if sample.timed_out:
+			return (TIMEOUT, 'after %.0f s' % self.params['timeout'])
+		if sample.exit != want:
+			return (EXIT, str(sample.exit))
+		return None
+
+	def socket_plan(self, fixture):
+		if getattr(self, '_plan', None) is None:
+			self._plan = SocketPlan(fixture, self.params)
+		return self._plan
+
+	def _socket_loads(self, path, plan, timeout):
+		"""Every §21 load against one server; returns ({name: (latencies, span)}, problem)."""
+		series = {}
+		problem = None
+		client = Client(path, timeout)
+		try:
+			for name, requests in (('get', plan.gets), ('set', plan.sets), ('--sync set', plan.syncs)):
+				latencies, responses, start, end = client_loop(client, [payload for payload, _ in requests])
+				series[name] = (latencies, end - start)
+				problem = problem or check_responses(responses, [want for _, want in requests])
+		finally:
+			client.close()
+		for count in self.params['clients']:
+			latencies, span, trouble = run_clients(path, plan.mix[count], timeout)
+			series['mix ×%d' % count] = (latencies, span)
+			problem = problem or trouble
+		return series, problem
+
+	def run_socket_case(self, case):
+		results = self._new_results(case)
+		fixture = self.fixtures.get(case.shape, case.rows)
+		plan = self.socket_plan(fixture)
+		timeout = self.params['timeout']
+		self.run_ceiling(plan)
+
+		def once(impl, result, gate):
+			if not impl.handler:
+				result.mark = (NA, 'no handler')
+				return
+			run_dir = self._run_dir(impl, case)
+			store = fixture.copy_to(run_dir)
+			handler = Handler(impl, store, run_dir, timeout)
+			problem = None
+			try:
+				handler.start()
+				series, trouble = self._socket_loads(handler.path, plan, timeout)
+				problem = (WRONG, trouble) if trouble else None
+			except (HandlerError, OSError) as error:
+				series, problem = {}, (WRONG, 'handler: %s' % error)
+			finally:
+				served = handler.stop()
+			if gate:
+				if not problem:
+					difference = compare_rows(read_store(store).iter_rows(), plan.final.iter_rows())
+					problem = (WRONG, 'post-state: %s' % difference) if difference else None
+				result.mark = problem or (OK, '')
+				if problem:
+					self._fail_log(result, os.path.join(run_dir, 'serve.err'))
+				return
+			if problem:
+				result.drift = True
+			for name, (latencies, span) in series.items():
+				result.add_series(name, latencies, len(latencies) / span if span else None)
+			result.add_extra('load_time', handler.load_time)
+			result.add_extra('rss_after_load', handler.rss_after_load)
+			if served is not None and served.maxrss is not None:
+				result.add_extra('handler_cpu', served.cpu)
+				# rusage peaks are approximate (to about 1 MiB) on recent Linux, while the
+				# true peak is at least the RSS /proc showed after load
+				result.add_extra('handler_maxrss', max(served.maxrss, handler.rss_after_load or 0))
+				result.add_extra('handler_rss_floor', served.rss_floor)
+
+		self._rounds(results, once)
+
+	def run_ceiling(self, plan):
+		"""The same loads against a server that answers #0 to everything: where the harness client is the limit."""
+		directory = tempfile.mkdtemp(prefix='tsvzb-')
+		path = os.path.join(directory, 's')
+		ceiling = Result(Case('perop', 'ceiling', 'socket'), None)
+		pid = start_dummy(path)
+		try:
+			for rep in range(self.params['repeat'] + 1):
+				series, _ = self._socket_loads(path, _BlindPlan(plan), self.params['timeout'])
+				if rep:
+					for name, (latencies, span) in series.items():
+						ceiling.add_series(name, latencies, len(latencies) / span if span else None)
+		finally:
+			stop_dummy(pid)
+			shutil.rmtree(directory, ignore_errors=True)
+		self.ceiling = ceiling
+
+	def exit_status(self):
+		if any(impl.problem for impl in self.impls):
+			return 1
+		if any(result.mark[0] in FAILED for result in self.results):
+			return 1
+		return 0
+
+	def _startup(self, impl):
+		for result in self.results:
+			if result.case.name == 'startup' and result.impl is impl:
+				return median([s.wall for s in result.samples])
+		return None
+

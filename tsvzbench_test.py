@@ -480,3 +480,136 @@ def test_socket_plan_is_deterministic_and_tracks_the_final_state(tmp_path):
 	assert all(want is None for _, want in blind.gets) and len(blind.mix[4]) == 4
 
 
+# --- running a benchmark -----------------------------------------------------------------------
+
+FAKE = r'''
+import subprocess, sys, time
+mode, reference, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+ops = ('read', 'len', 'get', 'set', 'delete', 'scrub', 'clear', 'verify', 'serve', 'stop')
+op = next((a for a in args if a in ops), None)
+if mode == 'exit1' and op == 'read':
+	sys.exit(1)
+if mode == 'sleep' and op == 'len':
+	time.sleep(60)
+if mode == 'noserve' and op == 'serve':
+	sys.exit(1)
+data = sys.stdin.buffer.read() if args[-1:] == ['-'] else b''
+if mode == 'corrupt':
+	data = data.replace(b'\t', b'\tX', 1)
+done = subprocess.run([sys.executable, reference] + args, input=data, stdout=subprocess.PIPE)
+out = done.stdout
+if mode == 'drop' and op == 'read':
+	out = b''.join(out.splitlines(True)[:-1])
+sys.stdout.buffer.write(out)
+sys.exit(done.returncode)
+'''
+
+
+def fake(tmp_path, mode):
+	script = tmp_path / 'fake.py'
+	script.write_text(FAKE)
+	return '%s %s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), mode, shlex.quote(REFERENCE))
+
+
+def bench_argv(tmp_path, impls, extra):
+	argv = ['--suite', 'smoke', '--work-dir', str(tmp_path / 'work')] + list(extra)
+	for name, command in impls:
+		argv += ['--impl', '%s=%s' % (name, command)]
+	return argv
+
+
+def run_suite(tmp_path, impls, *extra):
+	"""prepare() and every case of the selected families, without the report."""
+	bench = tb.Bench(tb.parse_args(bench_argv(tmp_path, impls, extra)), out=io.StringIO())
+	try:
+		problem = bench.prepare()
+		if problem is None:
+			bench.run_cases(tb.build_cases(bench.params, bench.opts.families))
+	finally:
+		bench.cleanup()
+	return bench, problem
+
+
+def marks(bench, name):
+	return {(r.case.family, r.case.label): r.mark for r in bench.results if r.impl.name == name}
+
+
+def test_every_case_passes_with_the_reference(tmp_path):
+	bench, problem = run_suite(tmp_path, [('ref', REF_COMMAND)])
+	assert problem is None
+	found = marks(bench, 'ref')
+	assert {key: mark for key, mark in found.items() if mark[0] not in (tb.OK, tb.REFUSED)} == {}
+	assert found[('maint', 'scrub multipart 100')][0] == tb.REFUSED
+	assert bench.exit_status() == 0
+	startup = next(r for r in bench.results if r.case.name == 'startup')
+	assert len(startup.samples) == 5
+	socket_result = next(r for r in bench.results if r.case.kind == 'socket')
+	assert set(socket_result.series) == {'get', 'set', '--sync set', 'mix ×1', 'mix ×4'}
+	assert socket_result.extra['load_time'] and set(bench.ceiling.series) == set(socket_result.series)
+	if socket_result.extra.get('rss_after_load'):
+		assert socket_result.extra['handler_maxrss'][0] >= socket_result.extra['rss_after_load'][0]
+
+
+@pytest.mark.parametrize('mode, family, label, kind', [
+	('drop', 'cold', 'read 100', tb.WRONG),
+	('exit1', 'cold', 'read 100', tb.EXIT),
+	('sleep', 'cold', 'len 100', tb.TIMEOUT),
+	('corrupt', 'bulk', 'set - new 100', tb.WRONG),
+])
+def test_the_gate_catches_a_misbehaving_implementation(tmp_path, mode, family, label, kind):
+	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, mode))], '--only', family, '--timeout', '3')
+	result = next(r for r in bench.results if (r.case.family, r.case.label) == (family, label))
+	assert result.mark[0] == kind
+	assert bench.exit_status() == 1
+	if kind == tb.TIMEOUT:
+		assert result.samples == []
+
+
+def test_an_implementation_without_a_handler(tmp_path):
+	bench, _ = run_suite(tmp_path, [('nos', fake(tmp_path, 'noserve'))], '--only', 'perop')
+	found = marks(bench, 'nos')
+	assert found[('perop', 'cli 100')][0] == tb.OK
+	assert found[('perop', 'cli via handler 100')][0] == tb.NA
+	assert found[('perop', 'socket 100')][0] == tb.NA
+	assert bench.exit_status() == 0
+
+
+def test_preflight_refuses_a_full_disk(tmp_path, monkeypatch):
+	Stat = collections.namedtuple('Stat', 'f_bavail f_frsize')
+	monkeypatch.setattr(tb.os, 'statvfs', lambda path: Stat(1, 1))
+	bench, problem = run_suite(tmp_path, [('ref', REF_COMMAND)])
+	assert 'free' in problem and bench.results == []
+
+
+def test_work_directory_lifecycle(tmp_path, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	bench = tb.Bench(tb.parse_args(['--impl', 'ref=' + REF_COMMAND, '--suite', 'smoke']), out=io.StringIO())
+	bench.setup()
+	assert os.path.dirname(os.path.realpath(bench.work)) == os.path.realpath(str(tmp_path))
+	assert os.path.basename(bench.work).startswith('tsvzbench-')
+	bench.cleanup()
+	assert not os.path.exists(bench.work)
+	kept, _ = run_suite(tmp_path, [('ref', REF_COMMAND)], '--only', 'bulk', '--keep')
+	assert os.listdir(os.path.join(kept.work, 'runs', 'ref'))
+	again, _ = run_suite(tmp_path, [('ref', REF_COMMAND)], '--only', 'bulk')
+	assert not os.path.exists(os.path.join(again.work, 'runs')) and os.listdir(again.fixtures.directory)
+
+
+def test_a_work_directory_with_spaces_and_non_ascii(tmp_path):
+	work = str(tmp_path / 'my bench é')
+	bench = tb.Bench(tb.parse_args(['--impl', 'ref=' + REF_COMMAND, '--suite', 'smoke', '--only', 'cold,maint',
+		'--work-dir', work]), out=io.StringIO())
+	try:
+		assert bench.prepare() is None
+		bench.run_cases(tb.build_cases(bench.params, bench.opts.families))
+	finally:
+		bench.cleanup()
+	assert all(r.mark[0] in (tb.OK, tb.REFUSED) for r in bench.results)
+
+
+def test_fs_warning():
+	assert 'mergerfs' in tb.fs_warning('fuse.mergerfs')
+	assert tb.fs_warning('ext4') is None
+	assert set(tb.environment(os.getcwd())) == {'host', 'cpu', 'cpus', 'python', 'kernel', 'fs'}
+
+
