@@ -66,11 +66,11 @@ separator is needed. The first `--impl` is the **baseline**.
 
 1.3 **Environment.** Children inherit the harness's environment unchanged
 (Python bytecode caches and the like are each implementation's business). Each
-child gets its own session (`start_new_session=True`) so a timeout can kill its
-whole process group.
+child runs under the measuring launcher (section 4.1) in a session of its own
+(`start_new_session=True`), so a timeout can kill its whole process group.
 
 1.4 **Isolation.** Each measured run works on a fresh copy of its fixture in
-`WORK/impl/NAME/`, made outside the timed region and removed after the run
+`WORK/runs/NAME/CASE/`, made outside the timed region and removed after the run
 (section 6.4). CLI workloads use store paths that never have a pointer file, so an
 implementation's §20.8 forwarding cannot turn a direct measurement into a
 handler one.
@@ -89,9 +89,12 @@ suite's values; `--only` selects families (`cold`, `bulk`, `perop`, `maint`).
 | Requests per concurrent client | 50 | 1,000 | 5,000 | 5,000 |
 | Timed repetitions R | 1 | 3 | 5 | 3 |
 | Timeout per run | 30 s | 60 s | 300 s | 1800 s |
-| Rough time, reference impl | seconds | ~1 min | ~5 min | 20+ min |
+| Rough time, reference impl | ~5 s | ~50 s | ~5 min | 20+ min |
 
 `smoke` exists to check a setup (and to test the harness) before a long run.
+While it checks a store, the harness holds its replay model: about 470 bytes per
+live row, so `large` needs roughly 5 GB of free memory for the harness on top of
+what the implementations use.
 
 1.6 **Conventions.** One file, standard library only, Python ≥ 3.8, POSIX only.
 `version = '1.0'` and `__version__ = version` near the top; `-V` prints it. The
@@ -143,9 +146,12 @@ harness's tests (section 7.3).
 a fixture is computed by replaying **the bytes it wrote** through the model, so
 expectation and file cannot drift apart.
 
-2.2.2 Common row form: keys are 12 random characters from `[a-z0-9]` (unsorted,
-unique by construction); values are 5 columns of 8–16 random characters from
-`[A-Za-z0-9]`; about 70 bytes per row. Every fixture starts with a header comment
+2.2.2 Common row form: key number *i* is the 12 lowercase hex digits of *i* under
+an odd-multiplier permutation of [0, 2^48), so keys are unique by construction
+and unsorted; values are 5 columns of 8–15 random characters from
+`[A-Za-z0-9]`; about 76 bytes per row. Fixture keys use indices from 0, new keys
+(bulk inputs, socket `set`) from 2^40, the `.rotated` part's rows from 2^45, and
+the missing key of `get` is 2^47 − 1. Every fixture starts with a header comment
 line `#key<TAB>c1<TAB>…<TAB>c5`.
 
 2.2.3 Shapes, N = the fixture's live rows:
@@ -158,7 +164,7 @@ line `#key<TAB>c1<TAB>…<TAB>c5`.
 | `markers` | `#_version_#` `1`, `#_defaults_#` with 5 values, `#_fill_empty_with_default_#` `true`; rows of random width 1–5 value columns with some present-empty cells and some trailing spaces; at the halfway line a second `#_defaults_#` with different values; for the last quarter `#_strip_trailing_whites_#` `false`; some early keys rewritten after the defaults change, others left bound to the first defaults | §14 resolution; §19.4 snapshot fidelity |
 | `checksum` | as `plain`, with `#_checksum_crc32_#` every 1,000 lines and `#_checksum_sha256_#` every 1,500 lines, the first of each empty (arming), the rest carrying the correct lowercase hex digest of their segment (§15.4); crc32 is 8 zero-padded hex digits | integrity overhead; `verify` |
 | `gz` | `plain` written as `STORE.tsvz.gz` | decompression |
-| `multipart` | `plain` rows split across the unnumbered part 0 and 7 numbered parts with 32-hex-digit ordinals (UUIDv7-style, §17.6) whose lexical order differs from numeric order where possible; plus one `.rotated` part holding rows that must not appear | §17 assembly |
+| `multipart` | `plain` rows split across the unnumbered part 0 and 7 numbered parts with ordinals `f`, `10`, `ff`, `100` and three 32-digit UUIDv7-style values (§17.6), so lexical order differs from numeric order (§17.3); plus one `.11.rotated` part holding 10 rows that must not appear | §17 assembly |
 
 2.2.4 **Bulk inputs** are generated alongside: `bulk-new-N` (N `plain`-form
 records with keys not in any fixture), `bulk-add-mid` (mid/100 new records),
@@ -211,7 +217,9 @@ work directory. Nothing is piped through the harness.
 | `verify` | `checksum` at mid size | exit 0, no output |
 
 `startup` is the per-implementation process floor; its median is subtracted to
-give the *net* time of every other CLI workload.
+give the *net* time of every other CLI workload. It runs at least 5 timed
+repetitions whatever the suite, so the floor is stable; a net time at or below
+zero is within that floor's noise and shows as `≈0`.
 
 ### 3.2 `bulk`: standard-input batches (§20.3)
 
@@ -261,7 +269,7 @@ Its row shows where the harness client, not the handler, is the limit.
 3.3.5 **Handler footprint.** For each handler run: load time (spawn until the
 first `len` answer), RSS after load (`VmRSS` from `/proc/PID/status`, where PID is
 the pointer file's `pid`, so a wrapper command does not hide the real process),
-and after `stop` the total CPU and peak RSS from `wait4` on the spawned child.
+and after `stop` the total CPU and peak RSS the launcher reports (section 4.1).
 
 ### 3.4 `maint`: compaction
 
@@ -274,14 +282,27 @@ and after `stop` the total CPU and peak RSS from `wait4` on the spawned child.
 
 ## 4. Measurement
 
-4.1 **One run.** The harness starts the child with `subprocess.Popen` and reaps
-it with `os.wait4(pid, 0)` (never `Popen.wait`), then sets the `Popen`'s
-`returncode` itself. From the rusage it records `ru_utime`, `ru_stime`,
-`ru_maxrss` (KiB on Linux, bytes on macOS; stored in bytes), `ru_inblock`,
-`ru_oublock`, `ru_nvcsw`, `ru_nivcsw`. Wall time is `time.perf_counter()` from just
-before `Popen` to just after `wait4`. Store growth is the change in the summed
-sizes of the store's parts. On timeout the harness kills the child's process
-group (SIGKILL) and records `⏱`.
+4.1 **One run.** Every command, handlers included, runs as the child of a small
+**launcher**: a fresh `python -S -I` that the harness starts in a new session.
+The launcher forks and execs the command, reaps it with `os.wait4`, and reports
+on a pipe: wall time (`perf_counter` from fork to reaping), `ru_utime`,
+`ru_stime`, `ru_maxrss` (KiB on Linux, bytes on macOS; stored in bytes),
+`ru_inblock`, `ru_oublock`, `ru_nvcsw`, `ru_nivcsw`, the exit status, and its own
+size before the fork (`VmHWM`, or its own `ru_maxrss` where there is no `/proc`),
+the **RSS floor**. The launcher's own start-up is outside the measured window.
+
+The launcher exists because of a Linux behaviour: on exec, the kernel folds the
+old memory map's high-water mark into the new program's `ru_maxrss`, and a forked
+child's map is a copy of its parent's. Started directly from the harness, a
+child reports the harness's size instead of its own (measured: `true` reports
+512 MiB under a 500 MB parent, and 12 MiB under a fresh one). Started from the
+launcher, a child reports its own peak, or about the launcher's floor (~8 MiB)
+when its peak is lower. A peak within 256 KiB of the floor, or below it, is
+shown as `≤floor`: the true peak is no higher.
+
+The harness reaps the launcher with `os.wait4` and kills the launcher's process
+group on timeout (SIGKILL), recording `⏱`. Store growth is the change in the
+summed sizes of the store's parts.
 
 4.2 **Repetitions.** For each (workload, implementation): one untimed warm-up run,
 which is the run the gate checks, then R timed runs. A timed run only has to repeat
@@ -296,25 +317,34 @@ percentiles over all per-request timings of all timed repetitions.
 4.4 **Derived figures.**
 
 - *net wall* = wall − the implementation's median `startup` wall;
-- *rows/s* = rows / net wall for `cold` and `bulk` (shown as `—` when net wall is
-  not positive);
 - *memory per live row* = (peak RSS at the largest size − at the smallest) /
   (difference in rows), for `read` and for `len` on `plain`;
 - *disk bytes per record* = store size / N for `set - new` at the largest size.
+
+Memory per live row is shown as `—` when the largest size's peak is within
+1 MiB of the RSS floor. A rows/s figure is left out: net wall at each size
+carries the same information, and the right row count differs per workload.
 
 ## 5. Output
 
 5.1 **Header.** Harness version, date, host name, CPU model, logical CPUs, kernel,
 Python version of the harness, file system type of the work directory, the note
 "warm page cache", seed, suite, and for each implementation its name, command,
-version string and handler support.
+version string, handler support and median `startup` time. When the work
+directory is on a FUSE file system (mergerfs and the like) a warning line says
+so: file operations there cost more than on the disk below, which can hide
+differences.
 
 5.2 **Tables**, one per family. Rows are workloads with their size; for each
 implementation the columns are median wall (and net wall for CLI workloads),
 spread, CPU (user + sys), peak RSS and the gate mark; every implementation after
 the first also gets a `×ratio` of its median wall to the baseline's. Socket rows
-show p50/p95/p99 and ops/s instead. The harness's own table formatter fits the
-terminal width and uses colour only when standard output is a terminal.
+show p50/p95/p99 and ops/s instead, and the dummy server's ops/s as a `ceiling`
+column. Each implementation's gate mark carries a `*` when a timed run's exit
+status differed from its warm-up's. On a terminal the table fits its width by
+dropping whole column kinds, for every implementation at once, in the order
+spread, CPU, net, disk, p99, p95, ceiling; colour marks failed cells. Written to
+a file or a pipe it is full width and plain.
 
 5.3 **Footprint block**: memory per live row, disk bytes per record, handler RSS
 after load and load time, for each implementation.
@@ -327,24 +357,31 @@ for every failed cell, the last 5 lines of the run's standard error.
 
 ```json
 {"schema": 1,
- "harness": {"version": "1.0", "suite": "standard", "seed": 1, "started": "…"},
+ "harness": {"version": "1.0", "suite": "standard", "seed": 1, "started": "…", "params": {"…": "…"}},
  "env": {"host": "…", "cpu": "…", "cpus": 32, "kernel": "…", "python": "…", "fs": "…"},
- "impls": [{"name": "ref", "command": "python3 TSVZ.py", "version": "…", "handler": true}],
+ "impls": [{"name": "ref", "command": "python3 TSVZ.py", "version": "…", "handler": true, "problem": null}],
  "results": [{"family": "cold", "workload": "read", "shape": "plain", "rows": 100000,
-              "impl": "ref", "gate": {"mark": "✓", "detail": ""},
-              "samples": [{"wall": 0.0, "utime": 0.0, "stime": 0.0, "maxrss": 0,
+              "impl": "ref", "gate": {"mark": "ok", "detail": ""},
+              "samples": [{"wall": 0.0, "utime": 0.0, "stime": 0.0, "maxrss": 0, "rss_floor": 0,
                            "inblock": 0, "oublock": 0, "nvcsw": 0, "nivcsw": 0,
-                           "exit": 0, "store_bytes": 0}],
-              "latency": null}]}
+                           "exit": 0, "timed_out": false, "store_bytes": 0}],
+              "latency": null, "extra": {}}],
+ "ceiling": {"get": {"ops_s": 0.0, "p50_us": 0.0}}}
 ```
 
-`latency`, on socket rows, is `{"p50_us", "p95_us", "p99_us", "ops_s", "requests"}`.
+`gate.mark` is one of `ok`, `wrong`, `exit`, `timeout`, `n/a`, `refused`.
+`latency`, on `perop` rows, maps each series (`set`, `get`, `--sync set`,
+`mix ×4`, …) to `{"p50_us", "p95_us", "p99_us", "ops_s", "requests",
+"latencies_us"}`; `extra` holds per-run figures such as the handler's
+`load_time`, `rss_after_load`, `handler_cpu` and `handler_maxrss`.
 
 ## 6. Error handling
 
 6.1 One failure never aborts the run: a crash, unexpected exit or timeout marks
-the cell and the harness moves on. Each failed run's standard error is kept in the
-work directory.
+the cell and the harness moves on. The last 5 lines of a failed gate run's
+standard error are kept with its result and printed under the summary; `--keep`
+also keeps the run directory with the whole of it. A timed-out implementation
+gets no timed repetitions of that workload.
 
 6.2 **Exit status of the harness**: 0 when every cell is `✓`, `n/a` or `refused`;
 1 when any cell is `✗`, `!` or `⏱`, or an implementation failed the `-V` probe;
@@ -356,11 +393,13 @@ process group, then after 5 s SIGKILL. The same cleanup runs for every live
 handler from an `atexit` hook and on SIGINT/SIGTERM. Ctrl-C also prints the
 results collected so far.
 
-6.4 **Work directory.** The default is a fresh temporary directory, removed at
-exit. `--work-dir DIR` uses DIR, and its `fixtures/` cache survives between runs.
-Per-run store copies are removed after each run; `--keep` keeps the work
-directory with the last copy of each (workload, implementation) and all standard
-error logs.
+6.4 **Work directory.** The default is a fresh `tsvzbench-*` directory under
+the current directory, removed at exit. It is not the system temporary
+directory, which is often a RAM-backed tmpfs: that would hide `fsync` costs and
+spend memory the implementations need. `--work-dir DIR` uses DIR (created if
+missing), and its `fixtures/` cache survives between runs. Each run starts from
+an empty run directory; at exit the run and probe directories are removed, and
+`--keep` keeps them, with the last run of each (workload, implementation).
 
 6.5 **Preflight.** Before running, the harness estimates the space the suite needs
 (fixtures, bulk inputs, and the largest concurrent per-run copy) and checks it
@@ -391,17 +430,27 @@ expected rows. A disagreement is investigated before either side is changed: the
 reference may be the one that is wrong.
 
 7.4 **Gate negatives.** Fake implementations written by the test as small Python
-scripts, each run through the real harness path: one drops a row (`✗`), one omits
-a resolved default (`✗`), one exits 1 (`! 1`), one sleeps past the timeout (`⏱`),
-one writes a corrupted record on `set -` (`✗` post-state), one refuses
-`scrub` of `multipart` without touching it (`refused`).
+scripts that wrap the reference, each run through the real harness path: one
+drops a row (`✗`), one exits 1 (`! 1`), one sleeps past the timeout (`⏱`, and no
+timed runs), one corrupts a record on `set -` (`✗` post-state), and one whose
+`serve` exits 1 (handler workloads `n/a`, exit status 0). A row that omits a
+resolved default is a unit test of the comparison. `refused` comes from the
+reference itself, which refuses to scrub a multi-part store.
 
-7.5 **§21 client** against the built-in dummy server: framing, status lines,
-diagnostic lines (`#!`), and bulk `set -` termination.
+7.4.1 **Measurement.** A child's peak RSS does not include the harness's: with a
+300 MB ballast in the harness, `python -c pass` still reports under 100 MiB, and
+a child that allocates 200 MB reports more than that.
+
+7.5 **§21 client.** Against a scripted test server: framing, status lines,
+diagnostic lines (`#!`), and bulk `set -` termination; against the dummy server:
+concurrent clients; against the reference: a handler's start, requests, `stop`
+and the post-state.
 
 7.6 **End to end.** `--suite smoke` against `--impl ref='python3 TSVZ.py'`
-completes with every cell `✓` or `n/a`/`refused` as allowed, exit status 0, and
-a `--json` file that parses with `"schema": 1`.
+completes with every cell `✓` or `refused` as allowed, exit status 0, and a
+`--json` file that parses with `"schema": 1`; two implementations get ratio
+columns; `main` returns 2 for a usage error and 130, with a partial report,
+after an interrupt. The tests pass on Python 3.8 and on the current Python.
 
 ## 8. Packaging and documentation
 
