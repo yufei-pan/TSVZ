@@ -13,6 +13,9 @@ from different implementations and different runs on one machine are
 comparable. It is not a published leaderboard and not a conformance suite; its
 correctness gate only makes sure a fast result did the work.
 
+In this document `§N` refers to tsvz-spec-v1; "section N" refers to this
+design's own sections.
+
 The existing `benchTSVZ.py` stays: it is the in-process `TSVZed` throughput
 benchmark of the Python implementation. `tsvzbench.py` treats every
 implementation, the Python reference included, as a black box.
@@ -57,7 +60,7 @@ separator is needed. The first `--impl` is the **baseline**.
 - `COMMAND serve STORE` on a scratch store: the handler counts as supported when
   the pointer file `STORE.serve` appears within 10 s, is valid (§21.2: first line
   `tsvz-handler<TAB>1`, an `address` of `unix:PATH`) and a `len` request over its
-  socket returns `#0`. The probe handler is then stopped (§6.3). An exit status 1
+  socket returns `#0`. The probe handler is then stopped (section 6.3). An exit status 1
   (§20.2.6), a timeout or an invalid pointer marks the handler unsupported, and
   every handler workload shows `n/a` for that implementation.
 
@@ -68,7 +71,7 @@ whole process group.
 
 1.4 **Isolation.** Each measured run works on a fresh copy of its fixture in
 `WORK/impl/NAME/`, made outside the timed region and removed after the run
-(§6.4). CLI workloads use store paths that never have a pointer file, so an
+(section 6.4). CLI workloads use store paths that never have a pointer file, so an
 implementation's §20.8 forwarding cannot turn a direct measurement into a
 handler one.
 
@@ -112,10 +115,9 @@ time following §7, for the strict TSVZ variant (TAB delimiter, version 1):
 - tombstones decided on the raw row (§9), empty keys ignored (§8.4), trailing
   space/tab stripping (§10), §13 token decoding with unknown tokens passed
   through;
-- last-wins in an ordered map whose delete removes the key's position, as
-  Appendix B's `store.delete` does: a key deleted and then written again moves to
-  the end. (§3.4's "first appearance" can be read otherwise; the reference
-  implementation agrees with Appendix B, and the model follows both.)
+- last-wins in an ordered map whose delete removes the key's position (§3.4,
+  §9.3, Appendix B's `store.delete`): a key deleted and then written again moves
+  to the end.
 - §14 resolution: each live row keeps the defaults in force at its position; a
   present-empty cell takes the default when fill-empty was on at that row.
 
@@ -126,11 +128,11 @@ concatenation.
 
 2.1.3 The **resolved row** of a live key is its key followed by
 `max(written width, width of its bound defaults)` resolved cells, with trailing
-empty cells removed. This trimmed form is what the gate compares (§2.3).
+empty cells removed. This trimmed form is what the gate compares (section 2.3).
 
 2.1.4 The model covers only what fixtures and workloads produce. It does not
 verify checksums. It is checked against the reference implementation by the
-harness's tests (§7.3).
+harness's tests (section 7.3).
 
 ### 2.2 Fixtures
 
@@ -165,7 +167,7 @@ records with keys not in any fixture), `bulk-add-mid` (mid/100 new records),
 ### 2.3 The gate
 
 2.3.1 Each (workload, implementation) gets one gate result, from its warm-up run
-(§4.2):
+(section 4.2):
 
 | Mark | Meaning |
 |---|---|
@@ -174,16 +176,16 @@ records with keys not in any fixture), `bulk-add-mid` (mid/100 new records),
 | `! N` | unexpected exit status N |
 | `⏱` | timed out |
 | `n/a` | not run: handler unsupported, or the family was not selected |
-| `refused` | an allowed refusal (only `scrub` of `multipart`, §3.4) |
+| `refused` | an allowed refusal (only `scrub` of `multipart`, section 3.4) |
 
 2.3.2 **Comparing output.** Each output line is split on TAB and each field is
 §13-decoded; the row is the decoded key plus its value cells with trailing empty
 cells removed. Output rows are compared in order with the model's resolved rows
-(§2.1.3). This accepts the padding §3.6 allows (`b⇥3⇥` equals `b⇥3`) but not a
+(section 2.1.3). This accepts the padding §3.6 allows (`b⇥3⇥` equals `b⇥3`) but not a
 row that omits a resolved default value. `len` output must be the exact integer.
 
 2.3.3 **Comparing post-state.** After a mutating run the model reads the files the
-implementation left (§2.1.2) and compares the resulting store, order included,
+implementation left (section 2.1.2) and compares the resulting store, order included,
 with the expected one. The bytes on disk are checked, not the implementation's
 own report of them.
 
@@ -204,7 +206,7 @@ work directory. Nothing is piped through the harness.
 | `startup` | none: `COMMAND -V` | exit 0 |
 | `read` | `plain` at every size | all rows |
 | `len` | `plain` at every size | N |
-| `get` | `plain` at every size, one live key and one missing key | exit 3; the live row, then the missing key with the (empty) active defaults, §14.5 (`nope` and `nope⇥` are equal under §2.3.2) |
+| `get` | `plain` at every size, one live key and one missing key | exit 3; the live row, then the missing key with the (empty) active defaults, §14.5 (`nope` and `nope⇥` are equal under section 2.3.2) |
 | `read` | `churn`, `escaped`, `markers`, `checksum`, `gz`, `multipart` at mid size | all rows |
 | `verify` | `checksum` at mid size | exit 0, no output |
 
