@@ -654,3 +654,188 @@ def check_scrub_parts(ctx):
 	return EXIT, str(ctx.sample.exit)
 
 
+# ---------------------------------------------------------------------------
+# Running children
+# ---------------------------------------------------------------------------
+
+_RSS_SCALE = 1 if sys.platform == 'darwin' else 1024
+LIVE_GROUPS = set()
+
+# Every command runs as the child of this launcher, a fresh `python -S -I`. On
+# exec, Linux folds the old memory map's high-water mark into the new program's
+# ru_maxrss, and a forked child's map is a copy of its parent's: started from
+# the harness, a child would report the harness's own size. Started from the
+# launcher it reports at least the launcher's small map (its `floor`, VmHWM:
+# the launcher's own ru_maxrss carries the harness's size the same way), and
+# its own peak above that. The launcher also times the child, so its own
+# start-up is not measured.
+_LAUNCHER = '''
+import os, sys, time
+fd = int(sys.argv[1])
+argv = sys.argv[2:]
+try:
+	with open('/proc/self/status') as status:
+		floor = [int(line.split()[1]) for line in status if line.startswith('VmHWM:')][0]
+except (OSError, IndexError):
+	import resource
+	floor = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+start = time.perf_counter()
+pid = os.fork()
+if pid == 0:
+	os.close(fd)
+	try:
+		os.execvp(argv[0], argv)
+	except OSError as error:
+		os.write(2, ('cannot run %s: %s\\n' % (argv[0], error)).encode())
+	os._exit(127)
+_, status, usage = os.wait4(pid, 0)
+wall = time.perf_counter() - start
+code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
+os.write(fd, ('%r %r %r %d %d %d %d %d %d %d' % (wall, usage.ru_utime, usage.ru_stime, usage.ru_maxrss,
+	usage.ru_inblock, usage.ru_oublock, usage.ru_nvcsw, usage.ru_nivcsw, code, floor)).encode())
+'''
+
+
+class Sample(object):
+	"""What one child run cost: wall seconds, rusage, exit status.
+
+	rss_floor is the launcher's own size; a maxrss near it (or a little below)
+	only says the child's true peak is no higher than that.
+	"""
+	FIELDS = ('wall', 'utime', 'stime', 'maxrss', 'rss_floor', 'inblock', 'oublock', 'nvcsw', 'nivcsw', 'exit',
+		'timed_out', 'store_bytes')
+
+	def __init__(self, **values):
+		for name in self.FIELDS:
+			setattr(self, name, values.get(name))
+
+	@property
+	def cpu(self):
+		return (self.utime or 0.0) + (self.stime or 0.0)
+
+	def as_dict(self):
+		return {name: getattr(self, name) for name in self.FIELDS}
+
+
+def exit_code(status):
+	if os.WIFEXITED(status):
+		return os.WEXITSTATUS(status)
+	if os.WIFSIGNALED(status):
+		return -os.WTERMSIG(status)
+	return -1
+
+
+def kill_group(pid, sig=signal.SIGKILL):
+	try:
+		os.killpg(pid, sig)
+	except (ProcessLookupError, PermissionError):
+		pass
+
+
+def _read_all(fd):
+	chunks = []
+	while True:
+		chunk = os.read(fd, 65536)
+		if not chunk:
+			return b''.join(chunks)
+		chunks.append(chunk)
+
+
+class Child(object):
+	"""A command started through the launcher in a session of its own; `sample` is set once it is reaped."""
+
+	def __init__(self, argv, cwd, stdin_path=None, stdout_path=None, stderr_path=None):
+		self.read_fd, write_fd = os.pipe()
+		stdin = open(stdin_path or os.devnull, 'rb')
+		stdout = open(stdout_path or os.devnull, 'wb')
+		stderr = open(stderr_path or os.devnull, 'wb')
+		try:
+			self.started = time.perf_counter()
+			self.proc = subprocess.Popen([sys.executable, '-S', '-I', '-c', _LAUNCHER, str(write_fd)] + list(argv),
+				cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, pass_fds=(write_fd,), start_new_session=True)
+		except BaseException:
+			os.close(self.read_fd)
+			raise
+		finally:
+			os.close(write_fd)
+			stdin.close()
+			stdout.close()
+			stderr.close()
+		LIVE_GROUPS.add(self.proc.pid)
+		self.sample = None
+
+	@property
+	def pid(self):
+		return self.proc.pid
+
+	def poll(self):
+		"""True once the launcher has exited (and the sample is set)."""
+		if self.sample is None:
+			pid, status, _ = os.wait4(self.proc.pid, os.WNOHANG)
+			if pid:
+				self._finish(status, False)
+		return self.sample is not None
+
+	def wait(self, timeout, first_signal=signal.SIGKILL):
+		"""Reap the launcher; after `timeout` signal the group (SIGTERM first means SIGKILL 5 s later)."""
+		if self.sample is not None:
+			return self.sample
+		fired = threading.Event()
+
+		def expire(sig):
+			fired.set()
+			kill_group(self.proc.pid, sig)
+
+		timers = [threading.Timer(timeout, expire, (first_signal,))]
+		if first_signal != signal.SIGKILL:
+			timers.append(threading.Timer(timeout + 5.0, expire, (signal.SIGKILL,)))
+		for timer in timers:
+			timer.daemon = True
+			timer.start()
+		try:
+			_, status, _ = os.wait4(self.proc.pid, 0)
+		except BaseException:
+			kill_group(self.proc.pid)
+			os.wait4(self.proc.pid, 0)
+			self.proc.returncode = -signal.SIGKILL
+			LIVE_GROUPS.discard(self.proc.pid)
+			os.close(self.read_fd)
+			raise
+		finally:
+			for timer in timers:
+				timer.cancel()
+		return self._finish(status, fired.is_set())
+
+	def _finish(self, status, timed_out):
+		self.proc.returncode = exit_code(status)
+		LIVE_GROUPS.discard(self.proc.pid)
+		fields = _read_all(self.read_fd).split()
+		os.close(self.read_fd)
+		if len(fields) != 10:
+			self.sample = Sample(wall=time.perf_counter() - self.started, exit=self.proc.returncode, timed_out=timed_out)
+			return self.sample
+		wall, utime, stime = (float(f) for f in fields[:3])
+		maxrss, inblock, oublock, nvcsw, nivcsw, code, floor = (int(f) for f in fields[3:])
+		self.sample = Sample(wall=wall, utime=utime, stime=stime, maxrss=maxrss * _RSS_SCALE, rss_floor=floor * _RSS_SCALE,
+			inblock=inblock, oublock=oublock, nvcsw=nvcsw, nivcsw=nivcsw, exit=code, timed_out=timed_out)
+		return self.sample
+
+
+def run_child(argv, cwd, timeout, stdin_path=None, stdout_path=None, stderr_path=None):
+	"""Run one command to completion and measure it."""
+	return Child(argv, cwd, stdin_path, stdout_path, stderr_path).wait(timeout)
+
+
+def kill_live_groups():
+	for pid in list(LIVE_GROUPS):
+		kill_group(pid)
+		try:
+			os.waitpid(pid, 0)
+		except ChildProcessError:
+			pass
+		LIVE_GROUPS.discard(pid)
+
+
+atexit.register(kill_live_groups)
+
+

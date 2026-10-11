@@ -217,3 +217,30 @@ def test_output_rows_stream_from_a_file(tmp_path):
 	assert count == 200000 and peak < 5 * 1024 * 1024
 
 
+# --- children --------------------------------------------------------------------------
+
+def test_run_child_measures_exit_output_and_timeout(tmp_path):
+	stdin, out, err = str(tmp_path / 'in'), str(tmp_path / 'out'), str(tmp_path / 'err')
+	open(stdin, 'w').write('hello')
+	sample = tb.run_child([sys.executable, '-c', 'import sys; sys.stdout.write(sys.stdin.read().upper()); sys.exit(3)'],
+		str(tmp_path), 30, stdin_path=stdin, stdout_path=out)
+	assert sample.exit == 3 and not sample.timed_out and open(out).read() == 'HELLO'
+	assert sample.maxrss > 1024 * 1024 and sample.wall > 0 and sample.cpu > 0
+	slow = tb.run_child([sys.executable, '-c', 'import time; time.sleep(30)'], str(tmp_path), 0.5)
+	assert slow.timed_out and slow.wall < 5 and slow.exit == -9
+	missing = tb.run_child([str(tmp_path / 'no-such-tool')], str(tmp_path), 5, stderr_path=err)
+	assert missing.exit == 127 and 'cannot run' in open(err).read()
+	assert not tb.LIVE_GROUPS
+
+
+def test_child_rss_does_not_include_the_harness(tmp_path):
+	ballast = bytearray(300 * 1024 * 1024)
+	for at in range(0, len(ballast), 4096):
+		ballast[at] = 1
+	sample = tb.run_child([sys.executable, '-c', 'pass'], str(tmp_path), 30)
+	assert sample.rss_floor - 1024 * 1024 < sample.maxrss < 100 * 1024 * 1024
+	big = tb.run_child([sys.executable, '-c', 'x = bytearray(200 * 1024 * 1024); x[::4096] = b"1" * len(x[::4096])'],
+		str(tmp_path), 30)
+	assert big.maxrss > 200 * 1024 * 1024
+
+
