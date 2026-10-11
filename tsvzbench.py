@@ -1138,3 +1138,144 @@ def stop_dummy(pid):
 	LIVE_GROUPS.discard(pid)
 
 
+# ---------------------------------------------------------------------------
+# Statistics and formatting
+# ---------------------------------------------------------------------------
+
+def median(values):
+	values = [v for v in values if v is not None]
+	return statistics.median(values) if values else None
+
+
+def spread_pct(values):
+	"""Median absolute deviation as a percentage of the median."""
+	values = [v for v in values if v is not None]
+	if len(values) < 2:
+		return None
+	middle = statistics.median(values)
+	if not middle:
+		return None
+	return 100.0 * statistics.median([abs(v - middle) for v in values]) / middle
+
+
+def percentile(values, q):
+	if not values:
+		return None
+	ordered = sorted(values)
+	return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
+
+
+def geomean(values):
+	logs = [math.log(v) for v in values if v and v > 0]
+	return math.exp(sum(logs) / len(logs)) if logs else None
+
+
+def fmt_time(seconds):
+	if seconds is None:
+		return '—'
+	if abs(seconds) >= 1:
+		return '%.2f s' % seconds
+	if abs(seconds) >= 1e-3:
+		return '%.1f ms' % (seconds * 1e3)
+	return '%.0f µs' % (seconds * 1e6)
+
+
+def fmt_net(seconds):
+	"""Net wall time; a negative one is within the startup's noise."""
+	if seconds is None:
+		return ''
+	return '≈0' if seconds <= 0 else fmt_time(seconds)
+
+
+def fmt_bytes(count):
+	if count is None:
+		return '—'
+	value = float(count)
+	for unit in ('B', 'KiB', 'MiB', 'GiB'):
+		if abs(value) < 1024 or unit == 'GiB':
+			return ('%.0f %s' if unit == 'B' else '%.1f %s') % (value, unit)
+		value /= 1024
+
+
+def fmt_rss(value, floor):
+	"""Peak RSS; one at the launcher's floor only says the true peak is no higher."""
+	if value is None:
+		return '—'
+	if floor and value <= floor + 256 * 1024:
+		return '≤' + fmt_bytes(floor)
+	return fmt_bytes(value)
+
+
+def fmt_rows(rows):
+	for size, suffix in ((1000000, 'M'), (1000, 'k')):
+		if rows >= size and rows % size == 0:
+			return '%d%s' % (rows // size, suffix)
+	return str(rows)
+
+
+def fmt_rate(rate):
+	if rate is None:
+		return '—'
+	if rate >= 1e6:
+		return '%.2fM/s' % (rate / 1e6)
+	if rate >= 1e3:
+		return '%.1fk/s' % (rate / 1e3)
+	return '%.0f/s' % rate
+
+
+def fmt_ratio(value):
+	return '—' if value is None else '×%.2f' % value
+
+
+def mark_text(mark):
+	kind, detail = mark
+	if kind == OK:
+		return '✓'
+	if kind == WRONG:
+		return '✗'
+	if kind == EXIT:
+		return '! ' + detail
+	if kind == TIMEOUT:
+		return '⏱'
+	return kind
+
+
+class Style(object):
+	def __init__(self, enabled):
+		self.enabled = enabled
+
+	def wrap(self, text, code):
+		return '\x1b[%sm%s\x1b[0m' % (code, text) if self.enabled else text
+
+
+DROP_ORDER = ('±', 'cpu', 'net', 'disk', 'p99', 'rss', 'p95', 'ceiling')
+
+
+def render_table(columns, rows, width=None, style=None):
+	"""columns: [(title, group)]; rows: lists of (text, ansi code or None).
+
+	When the table is wider than `width`, whole column groups go in DROP_ORDER,
+	for every implementation at once; a None group always stays.
+	"""
+	keep = list(range(len(columns)))
+
+	def widths():
+		return [max([len(columns[i][0])] + [len(row[i][0]) for row in rows]) for i in keep]
+
+	for group in DROP_ORDER:
+		if width is None or sum(widths()) + 3 * (len(keep) - 1) <= width:
+			break
+		keep = [i for i in keep if columns[i][1] != group]
+	sizes = widths()
+	lines = [' | '.join(columns[i][0].ljust(size) for i, size in zip(keep, sizes)).rstrip(),
+		'-+-'.join('-' * size for size in sizes)]
+	for row in rows:
+		cells = []
+		for i, size in zip(keep, sizes):
+			text, code = row[i]
+			padded = text.ljust(size)
+			cells.append(style.wrap(padded, code) if style and code else padded)
+		lines.append(' | '.join(cells).rstrip())
+	return '\n'.join(lines)
+
+

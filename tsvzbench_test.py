@@ -390,3 +390,36 @@ def test_a_handler_that_ignores_stop_is_killed(tmp_path):
 		pytest.fail('the stuck handler survived')
 
 
+# --- statistics and formatting -----------------------------------------------------------------
+
+def test_statistics():
+	assert tb.median([3, 1, 2]) == 2 and tb.median([]) is None and tb.median([None, 4]) == 4
+	assert tb.spread_pct([10]) is None and tb.spread_pct([9, 10, 11]) == 10.0
+	assert tb.percentile([5, 1, 3, 2, 4], 0.5) == 3 and tb.percentile([], 0.5) is None
+	assert tb.percentile(list(range(101)), 0.95) == 95
+	assert abs(tb.geomean([2, 8]) - 4) < 1e-9 and tb.geomean([]) is None
+
+
+def test_formatting():
+	assert [tb.fmt_time(v) for v in (1.5, 0.0123, 42e-6, None)] == ['1.50 s', '12.3 ms', '42 µs', '—']
+	assert tb.fmt_net(-0.001) == '≈0' and tb.fmt_net(None) == '' and tb.fmt_net(0.002) == '2.0 ms'
+	assert [tb.fmt_bytes(v) for v in (512, 1536, 3 * 1024 ** 3, None)] == ['512 B', '1.5 KiB', '3.0 GiB', '—']
+	assert tb.fmt_rss(9 * 2 ** 20, 9 * 2 ** 20) == '≤9.0 MiB' and tb.fmt_rss(40 * 2 ** 20, 9 * 2 ** 20) == '40.0 MiB'
+	assert [tb.fmt_rows(n) for n in (100, 1000, 10000, 1000000, 1500)] == ['100', '1k', '10k', '1M', '1500']
+	assert [tb.fmt_rate(v) for v in (52200, 2.5e6, 28.4, None)] == ['52.2k/s', '2.50M/s', '28/s', '—']
+	assert tb.fmt_ratio(0.5) == '×0.50' and tb.fmt_ratio(None) == '—'
+	marks = [(tb.OK, ''), (tb.WRONG, 'x'), (tb.EXIT, '1'), (tb.TIMEOUT, ''), (tb.REFUSED, ''), (tb.NA, '')]
+	assert [tb.mark_text(m) for m in marks] == ['✓', '✗', '! 1', '⏱', 'refused', 'n/a']
+
+
+def test_tables_drop_whole_column_groups():
+	columns = [('name', None), ('cpu', 'cpu'), ('a disk', 'disk'), ('b disk', 'disk')]
+	rows = [[('a' * 10, None), ('c' * 10, None), ('d' * 10, None), ('e' * 10, '31')]]
+	assert 'b disk' in tb.render_table(columns, rows)
+	narrow = tb.render_table(columns, rows, 40).split('\n')[0]
+	assert 'cpu' not in narrow and 'a disk' in narrow and 'b disk' in narrow
+	assert 'disk' not in tb.render_table(columns, rows, 15)
+	assert '\x1b[31m' in tb.render_table(columns, rows, style=tb.Style(True))
+	assert '\x1b[' not in tb.render_table(columns, rows, style=tb.Style(False))
+
+
