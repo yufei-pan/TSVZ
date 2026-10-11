@@ -839,3 +839,302 @@ def kill_live_groups():
 atexit.register(kill_live_groups)
 
 
+# ---------------------------------------------------------------------------
+# The handler protocol (§21)
+# ---------------------------------------------------------------------------
+
+class HandlerError(Exception):
+	pass
+
+
+def read_pointer(store):
+	"""(socket path, pid) from the store's pointer file (§21.2), or None when it is absent or unusable."""
+	try:
+		with open(store + '.serve', 'rb') as f:
+			lines = f.read().decode('utf-8').split('\n')
+	except (OSError, UnicodeDecodeError):
+		return None
+	if lines[0] != 'tsvz-handler\t1':
+		return None
+	values = {}
+	for line in lines[1:]:
+		name, sep, value = line.partition('\t')
+		if sep:
+			values[name] = decode_field(value)
+	address = values.get('address', '')
+	if not address.startswith('unix:'):
+		return None
+	pid = values.get('pid', '')
+	return address[5:], int(pid) if pid.isdigit() else None
+
+
+def request(op, args=(), options=()):
+	"""One §21.5 request line: options, the operation, the key (with <#>) and its values."""
+	fields = list(options) + [op]
+	if args:
+		fields.append(encode_field(args[0], is_key=True))
+		fields.extend(encode_field(arg) for arg in args[1:])
+	return ('\t'.join(fields) + '\n').encode('utf-8')
+
+
+def response_status(lines):
+	text = lines[-1][1:].split(b'\t', 1)[0].strip()
+	return int(text) if text.isdigit() else -1
+
+
+def response_rows(lines):
+	return output_rows(b''.join(line for line in lines[:-1] if not line.startswith(b'#!')))
+
+
+class Client(object):
+	"""One connection to a handler: send a request, read its whole response (§21.3.2)."""
+
+	def __init__(self, path, timeout=30.0):
+		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			self.sock.settimeout(timeout)
+			self.sock.connect(path)
+		except BaseException:
+			self.sock.close()
+			raise
+		self.rfile = self.sock.makefile('rb')
+
+	def roundtrip(self, payload):
+		self.sock.sendall(payload)
+		lines = []
+		while True:
+			line = self.rfile.readline()
+			if not line:
+				raise ConnectionError('the handler closed the connection')
+			lines.append(line)
+			if line[:1] == b'#' and line[:2] != b'#!':
+				return lines
+
+	def close(self):
+		self.rfile.close()
+		self.sock.close()
+
+
+def proc_rss(pid):
+	"""Current resident set of `pid` in bytes from /proc, or None where there is no /proc."""
+	try:
+		with open('/proc/%d/status' % pid) as f:
+			for line in f:
+				if line.startswith('VmRSS:'):
+					return int(line.split()[1]) * 1024
+	except (OSError, ValueError, TypeError):
+		pass
+	return None
+
+
+class Impl(object):
+	"""An implementation under test: a name and the command that runs its tsvz tool.
+
+	Its commands run in `cwd`, the directory tsvzbench was started from, so a
+	relative COMMAND resolves as it would in the user's shell; stores are
+	always given as absolute paths.
+	"""
+
+	def __init__(self, name, command, cwd=None):
+		self.name = name
+		self.command = command
+		self.argv = shlex.split(command)
+		self.cwd = cwd or os.getcwd()
+		self.version = ''
+		self.handler = False
+		self.problem = None
+		self.handler_problem = None
+
+	def cli(self, op, store, *args):
+		"""The canonical §20.1 command line for one operation."""
+		return self.argv + ['--format', 'records', '-q', op, store] + list(args)
+
+
+class Handler(object):
+	"""An implementation's own `serve STORE` (§21.13), started and stopped by the harness."""
+
+	def __init__(self, impl, store, run_dir, wait):
+		self.impl = impl
+		self.store = store
+		self.run_dir = run_dir
+		self.wait = wait
+		self.child = None
+		self.path = None
+		self.pid = None
+		self.load_time = None
+		self.rss_after_load = None
+		self.sample = None
+
+	def start(self):
+		"""Spawn the handler and wait for its first `len` answer; raise HandlerError when it never answers."""
+		self.child = Child(self.impl.cli('serve', self.store), self.impl.cwd,
+			stdout_path=os.path.join(self.run_dir, 'serve.out'), stderr_path=os.path.join(self.run_dir, 'serve.err'))
+		start = self.child.started
+		while True:
+			if self.child.poll():
+				self.sample = self.child.sample
+				raise HandlerError('serve exited with status %d' % self.sample.exit)
+			pointer = read_pointer(self.store)
+			if pointer:
+				try:
+					client = Client(pointer[0], timeout=self.wait)
+					try:
+						lines = client.roundtrip(b'len\n')
+					finally:
+						client.close()
+					if response_status(lines) == 0:
+						self.path, self.pid = pointer
+						self.load_time = time.perf_counter() - start
+						self.rss_after_load = proc_rss(self.pid) if self.pid else None
+						return
+				except OSError:
+					pass
+			if time.perf_counter() - start > self.wait:
+				raise HandlerError('no handler answered within %.0f s' % self.wait)
+			time.sleep(0.005)
+
+	def stop(self, wait=10.0):
+		"""Send `stop`, then reap the handler (SIGTERM after `wait` s, SIGKILL 5 s later); return its Sample."""
+		if self.child is None or self.child.sample is not None:
+			return self.sample
+		if self.path:
+			try:
+				client = Client(self.path, timeout=wait)
+				try:
+					client.roundtrip(b'stop\n')
+				finally:
+					client.close()
+			except OSError:
+				pass
+		else:
+			kill_group(self.child.pid, signal.SIGTERM)
+		self.sample = self.child.wait(wait, signal.SIGTERM)
+		return self.sample
+
+def client_loop(client, payloads):
+	"""Send each payload in turn; return (latencies, responses, start, end)."""
+	latencies = []
+	responses = []
+	start = time.perf_counter()
+	for payload in payloads:
+		began = time.perf_counter()
+		lines = client.roundtrip(payload)
+		latencies.append(time.perf_counter() - began)
+		responses.append(lines)
+	return latencies, responses, start, time.perf_counter()
+
+
+def check_responses(responses, expected):
+	"""None when every status is #0 and every expected row matches, else the first problem."""
+	for index, (lines, want) in enumerate(zip(responses, expected), 1):
+		status = response_status(lines)
+		if status != 0:
+			return 'request %d: status %d' % (index, status)
+		if want is not None:
+			difference = compare_rows(response_rows(lines), [want])
+			if difference:
+				return 'request %d: %s' % (index, difference)
+	return None
+
+
+def _write_all(fd, data):
+	while data:
+		data = data[os.write(fd, data):]
+
+
+def run_clients(path, plans, timeout):
+	"""Run one forked client per plan, all released together; each plan is a list of (payload, expected row).
+
+	Returns (latencies, span seconds, problem or None).
+	"""
+	ready_r, ready_w = os.pipe()
+	go_r, go_w = os.pipe()
+	children = []
+	for plan in plans:
+		result_r, result_w = os.pipe()
+		pid = os.fork()
+		if pid == 0:
+			code = 1
+			try:
+				os.close(ready_r)
+				os.close(go_w)
+				os.close(result_r)
+				try:
+					client = Client(path, timeout)
+				except OSError as error:
+					os.write(ready_w, b'x')
+					_write_all(result_w, json.dumps({'problem': 'connect: %s' % error}).encode())
+					raise
+				os.write(ready_w, b'r')
+				os.read(go_r, 1)
+				latencies, responses, start, end = client_loop(client, [payload for payload, _ in plan])
+				problem = check_responses(responses, [want for _, want in plan])
+				_write_all(result_w, json.dumps({'lat': latencies, 'start': start, 'end': end, 'problem': problem}).encode())
+				code = 0
+			except BaseException as error:
+				try:
+					_write_all(result_w, json.dumps({'problem': repr(error)}).encode())
+				except OSError:
+					pass
+			finally:
+				os._exit(code)
+		os.close(result_w)
+		children.append((pid, result_r))
+	os.close(ready_w)
+	os.close(go_r)
+	for _ in plans:
+		if os.read(ready_r, 1) != b'r':
+			break
+	os.close(ready_r)
+	_write_all(go_w, b'g' * len(plans))
+	os.close(go_w)
+	latencies, starts, ends, problem = [], [], [], None
+	for pid, result_r in children:
+		data = _read_all(result_r)
+		os.close(result_r)
+		os.waitpid(pid, 0)
+		try:
+			result = json.loads(data.decode('utf-8'))
+		except ValueError:
+			result = {'problem': 'a client died without a result'}
+		problem = problem or result.get('problem')
+		latencies.extend(result.get('lat', []))
+		if 'start' in result:
+			starts.append(result['start'])
+			ends.append(result['end'])
+	span = max(ends) - min(starts) if starts else 0.0
+	return latencies, span, problem
+
+
+def start_dummy(path):
+	"""Fork a server that answers `#0` to every request line (one process per connection); return its pid."""
+	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	server.bind(path)
+	server.listen(128)
+	pid = os.fork()
+	if pid == 0:
+		try:
+			os.setsid()
+			signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+			while True:
+				conn, _ = server.accept()
+				if os.fork() == 0:
+					server.close()
+					rfile = conn.makefile('rb')
+					for _ in rfile:
+						conn.sendall(b'#0\n')
+					os._exit(0)
+				conn.close()
+		finally:
+			os._exit(0)
+	server.close()
+	LIVE_GROUPS.add(pid)
+	return pid
+
+
+def stop_dummy(pid):
+	kill_group(pid)
+	os.waitpid(pid, 0)
+	LIVE_GROUPS.discard(pid)
+
+

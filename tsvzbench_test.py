@@ -244,3 +244,149 @@ def test_child_rss_does_not_include_the_harness(tmp_path):
 	assert big.maxrss > 200 * 1024 * 1024
 
 
+# --- the handler protocol --------------------------------------------------------------------
+
+def _short_socket_dir():
+	return tempfile.mkdtemp(prefix='tsvzb-')
+
+
+def test_request_encoding_and_response_parsing():
+	assert tb.request('set', ['#k', 'a\tb'], ('--sync',)) == b'--sync\tset\t<#>k\ta<sep>b\n'
+	assert tb.request('len') == b'len\n'
+	lines = [b'#!\tnote\n', b'k\tv\t\n', b'#3\tmissing\n']
+	assert tb.response_status(lines) == 3
+	assert tb.response_rows(lines) == [['k', 'v']]
+
+
+def test_read_pointer(tmp_path):
+	store = str(tmp_path / 'p.tsvz')
+	assert tb.read_pointer(store) is None
+	open(store + '.serve', 'w').write('tsvz-handler\t1\naddress\tunix:/run/x/s\nhost\th\npid\t42\nx-extra\t1\n')
+	assert tb.read_pointer(store) == ('/run/x/s', 42)
+	open(store + '.serve', 'w').write('tsvz-handler\t1\naddress\ttcp:1.2.3.4:5\n')
+	assert tb.read_pointer(store) is None
+	open(store + '.serve', 'w').write('something-else\t1\naddress\tunix:/s\n')
+	assert tb.read_pointer(store) is None
+
+
+def test_client_reads_diagnostics_and_bulk_requests():
+	path = os.path.join(_short_socket_dir(), 's')
+	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	server.bind(path)
+	server.listen(1)
+
+	def serve():
+		conn, _ = server.accept()
+		rfile = conn.makefile('rb')
+		for line in rfile:
+			if line == b'get\tk\n':
+				conn.sendall(b'#!\twarning\nk\tv\n#0\n')
+			elif line == b'set\t-\n':
+				body = []
+				for record in rfile:
+					if record == b'#\n':
+						break
+					body.append(record)
+				conn.sendall(b'#0\t%d records\n' % len(body))
+		conn.close()
+
+	thread = threading.Thread(target=serve, daemon=True)
+	thread.start()
+	client = tb.Client(path)
+	assert client.roundtrip(b'get\tk\n') == [b'#!\twarning\n', b'k\tv\n', b'#0\n']
+	assert client.roundtrip(b'set\t-\na\t1\nb\t2\n#\n') == [b'#0\t2 records\n']
+	client.close()
+	thread.join(5)
+	server.close()
+
+
+def test_check_responses():
+	assert tb.check_responses([[b'k\tv\n', b'#0\n']], [['k', 'v']]) is None
+	assert tb.check_responses([[b'#1\tboom\n']], [None]) == 'request 1: status 1'
+	assert tb.check_responses([[b'k\tw\n', b'#0\n']], [['k', 'v']]).startswith('request 1: row 1')
+
+
+def test_concurrent_clients_against_the_dummy_server():
+	path = os.path.join(_short_socket_dir(), 's')
+	pid = tb.start_dummy(path)
+	try:
+		plans = [[(b'get\tk\n', None)] * 20 for _ in range(3)]
+		latencies, span, problem = tb.run_clients(path, plans, 10)
+		wrong, _, trouble = tb.run_clients(path, [[(b'get\tk\n', ['k', 'v'])]], 10)
+	finally:
+		tb.stop_dummy(pid)
+	assert problem is None and len(latencies) == 60 and span > 0
+	assert trouble.startswith('request 1: row 1 missing')
+
+
+def test_impl_command_line():
+	impl = tb.Impl('x', "python3 'my tool.py' --x-fast")
+	assert impl.argv == ['python3', 'my tool.py', '--x-fast']
+	assert impl.cli('get', 's.tsvz', 'k') == ['python3', 'my tool.py', '--x-fast', '--format', 'records', '-q', 'get', 's.tsvz', 'k']
+
+
+def test_handler_lifecycle_with_the_reference(tmp_path):
+	store = str(tmp_path / 'h.tsvz')
+	handler = tb.Handler(tb.Impl('ref', REF_COMMAND), store, str(tmp_path), 10.0)
+	handler.start()
+	try:
+		assert handler.load_time > 0 and handler.pid
+		client = tb.Client(handler.path)
+		assert tb.response_status(client.roundtrip(tb.request('set', ['k', 'v']))) == 0
+		assert tb.response_rows(client.roundtrip(tb.request('get', ['k']))) == [['k', 'v']]
+		assert tb.response_status(client.roundtrip(b'set\t-\na\t1\nb\t2\n#\n')) == 0
+		client.close()
+	finally:
+		sample = handler.stop()
+	assert sample.exit == 0 and sample.maxrss > 0 and not os.path.exists(store + '.serve')
+	assert list(tb.read_store(store).iter_rows()) == [['k', 'v'], ['a', '1'], ['b', '2']]
+
+
+def test_handler_that_never_starts(tmp_path):
+	impl = tb.Impl('bad', '%s -c "import sys; sys.exit(1)"' % shlex.quote(sys.executable))
+	handler = tb.Handler(impl, str(tmp_path / 'h.tsvz'), str(tmp_path), 10.0)
+	with pytest.raises(tb.HandlerError):
+		handler.start()
+	assert handler.stop().exit == 1
+
+
+STUCK = r'''
+import os, socket, sys, tempfile
+args = sys.argv[1:]
+store = args[-1]
+path = os.path.join(tempfile.mkdtemp(prefix='tsvzb-'), 's')
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(4)
+with open(store + '.serve', 'w') as f:
+	f.write('tsvz-handler\t1\naddress\tunix:%s\npid\t%d\n' % (path, os.getpid()))
+while True:
+	conn, _ = server.accept()
+	for line in conn.makefile('rb'):
+		conn.sendall(b'#0\n')
+	conn.close()
+'''
+
+
+def test_a_handler_that_ignores_stop_is_killed(tmp_path):
+	import time
+	script = tmp_path / 'stuck.py'
+	script.write_text(STUCK)
+	impl = tb.Impl('stuck', '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	handler = tb.Handler(impl, str(tmp_path / 'h.tsvz'), str(tmp_path), 10.0)
+	handler.start()
+	began = time.perf_counter()
+	sample = handler.stop(wait=0.5)
+	assert sample.timed_out and time.perf_counter() - began < 5
+	assert not tb.LIVE_GROUPS
+	deadline = time.perf_counter() + 5
+	while time.perf_counter() < deadline:
+		try:
+			os.kill(handler.pid, 0)
+		except ProcessLookupError:
+			break
+		time.sleep(0.05)
+	else:
+		pytest.fail('the stuck handler survived')
+
+
