@@ -423,3 +423,60 @@ def test_tables_drop_whole_column_groups():
 	assert '\x1b[' not in tb.render_table(columns, rows, style=tb.Style(False))
 
 
+# --- implementations and workloads --------------------------------------------------------------
+
+def test_probe_the_reference(tmp_path):
+	impl = tb.Impl('ref', REF_COMMAND)
+	tb.probe(impl, str(tmp_path / 'probe'), 30)
+	assert impl.problem is None and impl.version and impl.handler
+
+
+def test_probe_a_broken_command(tmp_path):
+	impl = tb.Impl('bad', '%s -c "import sys; sys.exit(2)"' % shlex.quote(sys.executable))
+	tb.probe(impl, str(tmp_path / 'probe'), 30)
+	assert impl.problem == '-V failed: exit 2' and not impl.handler
+
+
+def test_a_relative_command_runs_from_the_starting_directory(tmp_path, monkeypatch):
+	import shutil
+	shutil.copyfile(REFERENCE, str(tmp_path / 'ref.py'))
+	monkeypatch.chdir(tmp_path)
+	impl = tb.Impl('rel', '%s ref.py' % shlex.quote(sys.executable))
+	tb.probe(impl, str(tmp_path / 'probe'), 30)
+	assert impl.problem is None and impl.version and impl.handler
+
+
+def test_build_cases():
+	params = tb.SUITES['standard']
+	cases = tb.build_cases(params, tb.FAMILIES)
+	assert cases[0].name == 'startup' and cases[0].min_repeat == 5
+	labels = [(case.family, case.label) for case in cases]
+	for wanted in (('cold', 'read 1M'), ('cold', 'read gz 100k'), ('bulk', 'set - new 1M'),
+			('maint', 'scrub multipart 100k'), ('perop', 'socket 100k'), ('perop', 'cli via handler 100k')):
+		assert wanted in labels
+	assert len({case.ident for case in cases}) == len(cases)
+	assert [case.family for case in tb.build_cases(params, ('bulk',))] == ['cold'] + ['bulk'] * 5
+	get = next(case for case in cases if case.name == 'get')
+	assert get.expect_exit == 3 and get.args == (tb.key_of(0), tb.key_of(tb.MISSING_INDEX))
+	mid_reads = [case.optional for case in cases if case.name == 'read' and case.rows == params['mid']]
+	assert mid_reads == [False, False, False, False, False, True, True]
+
+
+def test_socket_plan_is_deterministic_and_tracks_the_final_state(tmp_path):
+	params = tb.SUITES['smoke']
+	fixture = tb.Fixtures(str(tmp_path), 1).get('plain', params['mid'])
+	first, second = tb.SocketPlan(fixture, params), tb.SocketPlan(fixture, params)
+	assert first.gets == second.gets and first.mix == second.mix
+	assert len(first.gets) == len(first.sets) == params['seq'] and len(first.syncs) == params['sync']
+	assert [len(plans) for plans in first.mix.values()] == list(params['clients'])
+	assert all(payload.startswith(b'--sync\tset\t') for payload, _ in first.syncs)
+	known = fixture.model().rows
+	new_keys = sum(1 for payload, _ in first.sets if payload.split(b'\t')[1].decode() not in known)
+	assert len(first.final.rows) == params['mid'] + new_keys
+	for plans in first.mix.values():
+		owned = [set(payload.split(b'\t')[1] for payload, _ in plan) for plan in plans]
+		assert all(not (a & b) for i, a in enumerate(owned) for b in owned[i + 1:])
+	blind = tb._BlindPlan(first)
+	assert all(want is None for _, want in blind.gets) and len(blind.mix[4]) == 4
+
+

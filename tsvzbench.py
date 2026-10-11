@@ -1279,3 +1279,190 @@ def render_table(columns, rows, width=None, style=None):
 	return '\n'.join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Implementations and workloads
+# ---------------------------------------------------------------------------
+
+def probe(impl, directory, timeout):
+	"""Record the implementation's -V version and whether its `serve` answers (§21.13)."""
+	os.makedirs(directory, exist_ok=True)
+	out = os.path.join(directory, 'version.out')
+	sample = run_child(impl.argv + ['-V'], impl.cwd, min(timeout, 30.0), stdout_path=out,
+		stderr_path=os.path.join(directory, 'version.err'))
+	if sample.timed_out or sample.exit != 0:
+		impl.problem = '-V failed: %s' % ('timed out' if sample.timed_out else 'exit %d' % sample.exit)
+		return
+	impl.version = _read(out).decode('utf-8', 'replace').strip().split('\n')[0]
+	handler = Handler(impl, os.path.join(directory, 'probe.tsvz'), directory, HANDLER_WAIT)
+	try:
+		handler.start()
+		impl.handler = True
+	except HandlerError as error:
+		impl.handler_problem = str(error)
+	finally:
+		handler.stop()
+
+
+class Case(object):
+	"""One workload. kind is 'cli' (one command per run), 'calls' (single-op CLI calls) or 'socket' (§21 loads)."""
+
+	def __init__(self, family, name, kind, shape=None, rows=None, op=None, args=(), stdin=None,
+			expect_exit=0, check=check_exit_only, via_handler=False, min_repeat=1):
+		self.family = family
+		self.name = name
+		self.kind = kind
+		self.shape = shape
+		self.rows = rows
+		self.op = op
+		self.args = tuple(args)
+		self.stdin = stdin
+		self.expect_exit = expect_exit
+		self.check = check
+		self.via_handler = via_handler
+		self.min_repeat = min_repeat
+
+	@property
+	def optional(self):
+		return self.shape in OPTIONAL_SHAPES
+
+	@property
+	def ident(self):
+		return '%s-%s-%s-%s' % (self.family, re.sub(r'[^A-Za-z0-9]+', '_', self.name), self.shape or 'new', self.rows or 0)
+
+	@property
+	def label(self):
+		parts = [self.name]
+		if self.shape and self.shape != 'plain':
+			parts.append(self.shape)
+		if self.rows:
+			parts.append(fmt_rows(self.rows))
+		return ' '.join(parts)
+
+
+def build_cases(params, families):
+	"""Every workload of the selected families, in run order; `startup` always runs first."""
+	sizes, mid = params['sizes'], params['mid']
+	get_args = (key_of(0), key_of(MISSING_INDEX))
+	cases = [Case('cold', 'startup', 'cli', min_repeat=5)]
+	if 'cold' in families:
+		for rows in sizes:
+			cases.append(Case('cold', 'read', 'cli', 'plain', rows, 'read', check=check_read))
+			cases.append(Case('cold', 'len', 'cli', 'plain', rows, 'len', check=check_len))
+			cases.append(Case('cold', 'get', 'cli', 'plain', rows, 'get', get_args, expect_exit=3, check=check_get))
+		for shape in FEATURE_SHAPES:
+			cases.append(Case('cold', 'read', 'cli', shape, mid, 'read', check=check_read))
+		cases.append(Case('cold', 'verify', 'cli', 'checksum', mid, 'verify', check=check_no_output))
+	if 'bulk' in families:
+		for rows in sizes:
+			cases.append(Case('bulk', 'set - new', 'cli', None, rows, 'set', ('-',), ('bulk-new', rows), check=check_post))
+		cases.append(Case('bulk', 'set - add', 'cli', 'plain', mid, 'set', ('-',), ('bulk-add', mid), check=check_post))
+		cases.append(Case('bulk', 'delete -', 'cli', 'plain', mid, 'delete', ('-',), ('bulk-del', mid), check=check_post))
+	if 'perop' in families:
+		cases.append(Case('perop', 'cli', 'calls', 'plain', mid))
+		cases.append(Case('perop', 'cli via handler', 'calls', 'plain', mid, via_handler=True))
+		cases.append(Case('perop', 'socket', 'socket', 'plain', mid))
+	if 'maint' in families:
+		cases.append(Case('maint', 'scrub', 'cli', 'churn', mid, 'scrub', check=check_scrub))
+		cases.append(Case('maint', 'scrub', 'cli', 'markers', mid, 'scrub', check=check_post))
+		cases.append(Case('maint', 'clear', 'cli', 'plain', mid, 'clear', check=check_clear))
+		cases.append(Case('maint', 'scrub', 'cli', 'multipart', mid, 'scrub', check=check_scrub_parts))
+	return cases
+
+
+class Result(object):
+	"""What one (workload, implementation) produced: the gate mark, timed samples and latency series."""
+
+	def __init__(self, case, impl):
+		self.case = case
+		self.impl = impl
+		self.mark = (NA, '')
+		self.samples = []
+		self.series = {}
+		self.extra = {}
+		self.log = ''
+		self.drift = False
+
+	def add_series(self, name, latencies, ops=None, rss=None, floors=None):
+		entry = self.series.setdefault(name, {'lat': [], 'ops': [], 'rss': [], 'floor': []})
+		entry['lat'].extend(latencies)
+		if ops is not None:
+			entry['ops'].append(ops)
+		if rss:
+			entry['rss'].extend(rss)
+		if floors:
+			entry['floor'].extend(floors)
+
+	def add_extra(self, name, value):
+		if value is not None:
+			self.extra.setdefault(name, []).append(value)
+
+
+class RunContext(object):
+	"""What a gate check sees of one run."""
+
+	def __init__(self, case, sample, run_dir, store, stdout, fixture, stdin):
+		self.case = case
+		self.sample = sample
+		self.run_dir = run_dir
+		self.store = store
+		self.stdout = stdout
+		self.fixture = fixture
+		self.stdin = stdin
+		self.before_bytes = 0
+		self.before_hashes = {}
+
+
+class SocketPlan(object):
+	"""Deterministic §21 request lists for a mid-size plain store, with the rows each `get` must return."""
+
+	def __init__(self, fixture, params):
+		model = fixture.model()
+		rng = random.Random('socket-%d' % fixture.rows)
+		rows = fixture.rows
+		self.gets = []
+		for _ in range(params['seq']):
+			key = key_of(rng.randrange(rows))
+			self.gets.append((request('get', (key,)), [key] + model.resolve(key)))
+		self.sets = []
+		for j in range(params['seq']):
+			key = key_of(NEW_KEY_BASE + j) if rng.random() < 0.1 else key_of(rng.randrange(rows))
+			cells = random_values(rng)
+			self.sets.append((request('set', [key] + cells), None))
+			model.apply_line(record(key, cells)[:-1])
+		self.syncs = []
+		for _ in range(params['sync']):
+			key = key_of(rng.randrange(rows))
+			cells = random_values(rng)
+			self.syncs.append((request('set', [key] + cells, ('--sync',)), None))
+			model.apply_line(record(key, cells)[:-1])
+		owned = max(1, rows // max(params['clients']))
+		self.mix = {}
+		for count in params['clients']:
+			plans = []
+			for client in range(count):
+				keys = [key_of(client * owned + k) for k in range(owned)]
+				plan = []
+				for j in range(params['per_client']):
+					key = keys[(j // 2) % owned]
+					if j % 2 == 0:
+						cells = random_values(rng)
+						plan.append((request('set', [key] + cells), None))
+						model.apply_line(record(key, cells)[:-1])
+					else:
+						plan.append((request('get', (key,)), [key] + model.resolve(key)))
+				plans.append(plan)
+			self.mix[count] = plans
+		self.final = model
+
+
+class _BlindPlan(object):
+	"""A SocketPlan without expected rows: the dummy server's answers carry none."""
+
+	def __init__(self, plan):
+		strip = lambda requests: [(payload, None) for payload, _ in requests]
+		self.gets = strip(plan.gets)
+		self.sets = strip(plan.sets)
+		self.syncs = strip(plan.syncs)
+		self.mix = {count: [strip(p) for p in plans] for count, plans in plan.mix.items()}
+
+
