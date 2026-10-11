@@ -233,7 +233,7 @@ zero is within that floor's noise and shows as `≈0`.
 
 3.3.1 **CLI, direct.** On a `plain` mid store: M calls `set STORE KEY V1…V5`
 (existing keys, new values), then M calls `get STORE KEY` (live keys). Reported
-per call: median and p95 latency, peak RSS. Gate: every `get` row, and the
+per call: p50, p95 and p99 latency, calls per second, and peak RSS. Gate: every `get` row, and the
 post-state.
 
 3.3.2 **CLI, through the handler.** The same calls while the implementation's
@@ -270,6 +270,8 @@ Its row shows where the harness client, not the handler, is the limit.
 first `len` answer), RSS after load (`VmRSS` from `/proc/PID/status`, where PID is
 the pointer file's `pid`, so a wrapper command does not hide the real process),
 and after `stop` the total CPU and peak RSS the launcher reports (section 4.1).
+The peak shown is never below the RSS after load: rusage peaks are approximate
+(see section 4.1) while the true peak is at least any RSS already observed.
 
 ### 3.4 `maint`: compaction
 
@@ -298,7 +300,10 @@ child reports the harness's size instead of its own (measured: `true` reports
 512 MiB under a 500 MB parent, and 12 MiB under a fresh one). Started from the
 launcher, a child reports its own peak, or about the launcher's floor (~8 MiB)
 when its peak is lower. A peak within 256 KiB of the floor, or below it, is
-shown as `≤floor`: the true peak is no higher.
+shown as `≤floor`: the true peak is no higher. On recent Linux, rusage peaks
+are approximate to about 1 MiB (the kernel keeps RSS in per-CPU counters):
+measured, a handler's reported peak came out 0.7 MiB below the `VmHWM` read
+during its run. Peak RSS is for comparing footprints, not exact to the page.
 
 The harness reaps the launcher with `os.wait4` and kills the launcher's process
 group on timeout (SIGKILL), recording `⏱`. Store growth is the change in the
