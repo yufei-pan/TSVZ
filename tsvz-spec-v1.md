@@ -84,9 +84,12 @@ only under exclusive access (§18.6, §19.8).
 **last** record in file order determines its current value (**last-wins**).
 
 3.4 A key's **logical position** is the position of its first appearance. Later
-records for that key change its value, not its order. First-appearance order is
-the iteration order a reader SHOULD expose and the order a snapshot MUST emit
-(§19).
+records for that key change its value, not its order. A tombstone (§9) ends the
+key's position: a record that writes the key again after its tombstone is a new
+first appearance, so the key moves to the end of the order. For example, the
+records `a`, `b`, tombstone `a`, `c`, `a` read back in the order `b`, `c`, `a`.
+First-appearance order is the iteration order a reader SHOULD expose and the
+order a snapshot MUST emit (§19).
 
 3.5 Deletion is represented by a **tombstone** (§9), never by physical removal of
 prior bytes.
@@ -301,7 +304,8 @@ delimiter — that is, it consists of the key alone, with **zero** value fields.
      `mykey` to a value whose written columns are present and empty (≥ one value
      field exists). See §14.
 
-9.3 A tombstone deletes its resolved key if present and is a no-op if absent. An
+9.3 A tombstone deletes its resolved key if present, ending its logical position
+(§3.4), and is a no-op if absent. An
 empty-key row is ignored rather than treated as a deletion (§7.7, §8.4).
 
 9.4 Active defaults never resurrect a tombstoned key, because tombstone detection
