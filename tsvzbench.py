@@ -531,3 +531,126 @@ def planned_fixtures(params, families):
 	return seen
 
 
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
+
+def _output_row(line):
+	cells = [decode_field(cell) for cell in line.split(DELIM)]
+	return [cells[0]] + trim(cells[1:])
+
+
+def output_rows(data):
+	"""Rows of records-format output (§20.4.1): decoded, trailing empty cells trimmed."""
+	text = data.decode('utf-8', 'surrogateescape')
+	if text.endswith('\n'):
+		text = text[:-1]
+	if not text:
+		return []
+	return [_output_row(line) for line in text.split('\n')]
+
+
+def iter_output_rows(path):
+	"""output_rows of a file, one line at a time, so a large `read` is never held whole."""
+	with open(path, 'rb') as f:
+		for raw in f:
+			line = raw.decode('utf-8', 'surrogateescape')
+			yield _output_row(line[:-1] if line.endswith('\n') else line)
+
+
+def _show(row):
+	text = repr(row)
+	return text if len(text) <= 80 else text[:77] + '...'
+
+
+def compare_rows(got, expected):
+	"""None when the two row sequences are equal, else a description of the first difference."""
+	for index, (have, want) in enumerate(itertools.zip_longest(got, expected), 1):
+		if have == want:
+			continue
+		if have is None:
+			return 'row %d missing: expected %s' % (index, _show(want))
+		if want is None:
+			return 'extra row %d: %s' % (index, _show(have))
+		return 'row %d: got %s, expected %s' % (index, _show(have), _show(want))
+	return None
+
+
+def _rows_mark(difference):
+	return (WRONG, difference) if difference else (OK, '')
+
+
+def _read(path):
+	with open(path, 'rb') as f:
+		return f.read()
+
+
+def check_exit_only(ctx):
+	return OK, ''
+
+
+def check_read(ctx):
+	return _rows_mark(compare_rows(iter_output_rows(ctx.stdout), ctx.fixture.model().iter_rows()))
+
+
+def check_len(ctx):
+	got = _read(ctx.stdout).decode('utf-8', 'replace').strip()
+	want = str(len(ctx.fixture.model().rows))
+	return (OK, '') if got == want else (WRONG, 'len printed %r, expected %s' % (got[:40], want))
+
+
+def check_get(ctx):
+	model = ctx.fixture.model()
+	live, missing = ctx.case.args
+	want = [[live] + model.resolve(live)]
+	if model.missing() is not None:
+		want.append([missing] + model.missing())
+	return _rows_mark(compare_rows(output_rows(_read(ctx.stdout)), want))
+
+
+def check_no_output(ctx):
+	data = _read(ctx.stdout)
+	return (OK, '') if not data else (WRONG, 'unexpected output: %r' % data[:60])
+
+
+def expected_post(ctx):
+	model = ctx.fixture.model() if ctx.fixture else Model()
+	if ctx.stdin:
+		model.replay_file(ctx.stdin)
+	return model
+
+
+def check_post(ctx):
+	return _rows_mark(compare_rows(read_store(ctx.store).iter_rows(), expected_post(ctx).iter_rows()))
+
+
+def check_scrub(ctx):
+	mark = check_post(ctx)
+	if mark[0] != OK:
+		return mark
+	after = store_bytes(ctx.store)
+	if after >= ctx.before_bytes:
+		return WRONG, 'not smaller: %d bytes before, %d after' % (ctx.before_bytes, after)
+	return OK, ''
+
+
+def check_clear(ctx):
+	return _rows_mark(compare_rows(read_store(ctx.store).iter_rows(), []))
+
+
+def _hashes(run_dir, names):
+	return {name: hashlib.sha256(_read(os.path.join(run_dir, name))).hexdigest()
+		for name in names if os.path.exists(os.path.join(run_dir, name))}
+
+
+def check_scrub_parts(ctx):
+	"""scrub of a multi-part store: compacting it or refusing it untouched (§20.2.1) are both allowed."""
+	if ctx.sample.exit == 0:
+		return check_post(ctx)
+	if ctx.sample.exit == 1:
+		if _hashes(ctx.run_dir, ctx.fixture.files) == ctx.before_hashes:
+			return REFUSED, 'exit 1, parts unchanged'
+		return WRONG, 'exit 1 but the parts changed'
+	return EXIT, str(ctx.sample.exit)
+
+

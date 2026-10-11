@@ -178,3 +178,42 @@ def test_planned_fixtures():
 	assert ('bulk-new', 1000) in planned and ('multipart', 10000) in planned
 
 
+# --- gate ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('shape', SHAPES)
+def test_model_agrees_with_the_reference(tmp_path, shape):
+	fixture = tb.Fixtures(str(tmp_path), 1).get(shape, 1000)
+	done = subprocess.run([sys.executable, REFERENCE, '--format', 'records', '-q', 'read', fixture.path],
+		stdout=subprocess.PIPE, check=True)
+	assert tb.compare_rows(tb.output_rows(done.stdout), fixture.model().iter_rows()) is None
+
+
+def test_gate_accepts_padding_but_not_a_missing_default():
+	expected = list(replay_text('#_defaults_#\tx\ty\nk\tv\n').iter_rows())
+	assert expected == [['k', 'v', 'y']]
+	assert tb.compare_rows(tb.output_rows(b'k\tv\ty\t\t\n'), expected) is None
+	assert tb.compare_rows(tb.output_rows(b'k\tv\ty'), expected) is None
+	assert tb.compare_rows(tb.output_rows(b'k\tv\n'), expected).startswith('row 1:')
+	assert tb.compare_rows([], expected).startswith('row 1 missing')
+	assert tb.compare_rows(expected + [['z']], expected).startswith('extra row 2')
+	assert tb.output_rows(b'') == [] and tb.output_rows(b'<#>k\ta<sep>b\n') == [['#k', 'a\tb']]
+
+
+def test_output_rows_stream_from_a_file(tmp_path):
+	import tracemalloc
+	path = str(tmp_path / 'out')
+	sample = b'a\t1\t\n<#>b\tx<sep>y\n\nc'
+	open(path, 'wb').write(sample)
+	assert list(tb.iter_output_rows(path)) == tb.output_rows(sample)
+	with open(path, 'wb') as f:
+		for i in range(200000):
+			f.write(b'key%06d\tvalue\tmore\n' % i)
+	tracemalloc.start()
+	try:
+		count = sum(1 for _ in tb.iter_output_rows(path))
+		peak = tracemalloc.get_traced_memory()[1]
+	finally:
+		tracemalloc.stop()
+	assert count == 200000 and peak < 5 * 1024 * 1024
+
+
