@@ -111,3 +111,178 @@ def parse_args(argv=None):
 		work_dir=args.work_dir, keep=args.keep, json=args.json)
 
 
+# ---------------------------------------------------------------------------
+# Spec §13 field codec and the replay model (§7)
+# ---------------------------------------------------------------------------
+
+DELIM = '\t'
+_TOKEN_RE = re.compile(r'<(sep|LF|lt|#)>')
+_TOKEN_MAP = {'LF': '\n', 'lt': '<', '#': '#'}
+_RESERVED_RE = re.compile(r'#_[A-Za-z0-9_-]+_#\Z')
+_COMPRESSION = ('.gz', '.gzip', '.bz2', '.bzip2', '.xz', '.lzma', '.zst', '.zstd')
+
+
+def decode_field(text, delimiter=DELIM):
+	"""Decode §13 tokens; any other <...> passes through literally."""
+	if '<' not in text:
+		return text
+	return _TOKEN_RE.sub(lambda m: delimiter if m.group(1) == 'sep' else _TOKEN_MAP[m.group(1)], text)
+
+
+def encode_field(value, delimiter=DELIM, is_key=False):
+	"""Encode one field per §13.3; a key also gets <#> for a leading '#'."""
+	value = value.replace('<', '<lt>').replace(delimiter, '<sep>').replace('\n', '<LF>')
+	if is_key and value.startswith('#'):
+		value = '<#>' + value[1:]
+	return value
+
+
+def record(key, cells):
+	"""One record line (with its '\\n') for key and value cells."""
+	return DELIM.join([encode_field(key, is_key=True)] + [encode_field(c) for c in cells]) + '\n'
+
+
+def trim(cells):
+	"""Drop trailing empty cells: the gate's normal form of a row (§3.6)."""
+	end = len(cells)
+	while end and cells[end - 1] == '':
+		end -= 1
+	return cells[:end]
+
+
+def _bool(value, default):
+	value = value.lower()
+	if value == 'true':
+		return True
+	if value == 'false':
+		return False
+	return default
+
+
+class Model(object):
+	"""Replay of strict TSVZ lines (§7, version 1).
+
+	Each live key keeps its raw value fields and the index of the marker state
+	in force at its row, so §14 resolution happens when a row is read.
+	"""
+
+	def __init__(self):
+		self.rows = {}
+		self.defaults = ()
+		self.strip = True
+		self.fill_empty = False
+		self.return_defaults = True
+		self.states = []
+		self._state = None
+
+	def _state_index(self):
+		if self._state is None:
+			self.states.append((self.defaults, self.strip, self.fill_empty))
+			self._state = len(self.states) - 1
+		return self._state
+
+	def apply_line(self, raw):
+		"""Apply one committed record, given without its '\\n'."""
+		if raw.endswith('\r'):
+			raw = raw[:-1]
+		first, sep, rest = raw.partition(DELIM)
+		if first.startswith('#'):
+			if _RESERVED_RE.match(first):
+				self._marker(first.lower(), rest.split(DELIM) if sep else [])
+			return
+		if self.strip:
+			first = first.rstrip(' \t')
+		key = decode_field(first)
+		if key == '':
+			return
+		if not sep:
+			self.rows.pop(key, None)
+			return
+		self.rows[key] = (rest, self._state_index())
+
+	def _marker(self, key, values):
+		value = decode_field(values[0]) if values else ''
+		if key == '#_defaults_#':
+			self.defaults = tuple(decode_field(v) for v in values)
+		elif key == '#_strip_trailing_whites_#':
+			self.strip = _bool(value, True)
+		elif key == '#_fill_empty_with_default_#':
+			self.fill_empty = _bool(value, False)
+		elif key == '#_return_defaults_when_missing_#':
+			self.return_defaults = _bool(value, True)
+			return
+		else:
+			return
+		self._state = None
+
+	def replay(self, data):
+		"""Apply every committed line of one part's bytes (§4.3: bytes after the last '\\n' are dropped)."""
+		end = data.rfind(b'\n')
+		if end < 0:
+			return self
+		for line in data[:end].decode('utf-8', 'surrogateescape').split('\n'):
+			self.apply_line(line)
+		return self
+
+	def replay_file(self, path):
+		opener = gzip.open if path.endswith(('.gz', '.gzip')) else open
+		with opener(path, 'rb') as f:
+			return self.replay(f.read())
+
+	def resolve(self, key):
+		"""The resolved value cells of a live key, trimmed (§14.2, §14.3)."""
+		rest, index = self.rows[key]
+		defaults, strip, fill_empty = self.states[index]
+		cells = []
+		for j, field in enumerate(rest.split(DELIM)):
+			if strip:
+				field = field.rstrip(' \t')
+			cell = decode_field(field)
+			if cell == '' and fill_empty and j < len(defaults):
+				cell = defaults[j]
+			cells.append(cell)
+		cells.extend(defaults[len(cells):])
+		return trim(cells)
+
+	def missing(self):
+		"""What a read of a missing key returns (§14.5): the current defaults, or None."""
+		return trim(list(self.defaults)) if self.return_defaults else None
+
+	def iter_rows(self):
+		for key in self.rows:
+			yield [key] + self.resolve(key)
+
+
+def store_parts(store):
+	"""The parts of a store in replay order (§17): the unnumbered file, then numbered parts by hex ordinal; .rotated skipped."""
+	base = store
+	for suffix in _COMPRESSION:
+		if base.endswith(suffix):
+			base = base[:-len(suffix)]
+			break
+	directory = os.path.dirname(base) or '.'
+	prefix = os.path.basename(base) + '.'
+	numbered = []
+	for name in os.listdir(directory):
+		if not name.startswith(prefix):
+			continue
+		match = re.match(r'([0-9A-Fa-f]+)(\.rotated)?(\.[A-Za-z0-9]+)?\Z', name[len(prefix):])
+		if not match or match.group(2) or (match.group(3) and match.group(3) not in _COMPRESSION):
+			continue
+		numbered.append((int(match.group(1), 16), os.path.join(directory, name)))
+	parts = [store] if os.path.exists(store) else []
+	return parts + [path for _, path in sorted(numbered)]
+
+
+def read_store(store):
+	"""The model of a store as its files are now."""
+	model = Model()
+	for part in store_parts(store):
+		model.replay_file(part)
+	return model
+
+
+def store_bytes(store):
+	return sum(os.path.getsize(part) for part in store_parts(store))
+
+
