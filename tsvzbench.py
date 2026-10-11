@@ -1827,3 +1827,271 @@ class Bench(object):
 				return median([s.wall for s in result.samples])
 		return None
 
+	def run(self):
+		"""The whole benchmark: prepare, every case, the report; returns the exit status."""
+		problem = self.prepare()
+		if problem:
+			eprint('tsvzbench: ' + problem)
+			return 1
+		self.run_cases(build_cases(self.params, self.opts.families))
+		self.report()
+		return self.exit_status()
+
+	def report(self, partial=False):
+		write = lambda text='': print(text, file=self.out)
+		tty = self.out.isatty() if hasattr(self.out, 'isatty') else False
+		style = Style(tty)
+		width = shutil.get_terminal_size((160, 40)).columns if tty else None
+		env = environment(self.work)
+		write('tsvzbench %s  %s  suite %s  seed %d%s' % (version, self.started, self.opts.suite, self.opts.seed,
+			'  (interrupted: partial results)' if partial else ''))
+		write('host %s  cpu %s ×%s  %s  python %s  fs %s  warm page cache' % (env['host'], env['cpu'], env['cpus'],
+			env['kernel'], env['python'], env['fs']))
+		warning = fs_warning(env['fs'])
+		if warning:
+			write('warning: ' + warning)
+		for impl in self.impls:
+			state = impl.problem or ('handler: yes' if impl.handler else 'handler: no (%s)' % (impl.handler_problem or 'not probed'))
+			write('  %-12s %s  [%s]  %s  startup %s' % (impl.name, impl.command, impl.version or '?', state, fmt_time(self._startup(impl))))
+		for family in FAMILIES:
+			if family not in self.opts.families:
+				continue
+			family_results = [r for r in self.results if r.case.family == family and r.case.name != 'startup']
+			if family == 'cold':
+				family_results = [r for r in self.results if r.case.family == 'cold']
+			if not family_results:
+				continue
+			write()
+			write('[%s]' % family)
+			if family == 'perop':
+				write(self.perop_table(family_results, width, style))
+			else:
+				write(self.cli_table(family_results, width, style, disk=family in ('bulk', 'maint')))
+		write()
+		write(self.footprint())
+		write()
+		write(self.summary())
+		if self.opts.json:
+			self.write_json(env)
+
+	def _by_case(self, results):
+		cases = []
+		for result in results:
+			if result.case not in cases:
+				cases.append(result.case)
+		return [(case, {r.impl.name: r for r in results if r.case is case}) for case in cases]
+
+	def cli_table(self, results, width, style, disk=False):
+		names = [impl.name for impl in self.impls]
+		columns = [('workload', None)]
+		for index, name in enumerate(names):
+			columns += [('%s wall' % name, None), ('±', '±'), ('net', 'net'), ('cpu', 'cpu'), ('rss', None)]
+			if disk:
+				columns.append(('disk', 'disk'))
+			columns.append(('ok', None))
+			if index:
+				columns.append(('×', None))
+		rows = []
+		for case, by_impl in self._by_case(results):
+			base = by_impl[names[0]]
+			base_wall = median([s.wall for s in base.samples]) if base.mark[0] == OK else None
+			row = [(case.label, None)]
+			for index, name in enumerate(names):
+				result = by_impl[name]
+				samples = result.samples
+				wall = median([s.wall for s in samples])
+				failed = result.mark[0] in FAILED
+				dim = '2' if failed else None
+				startup = self._startup(result.impl)
+				net = wall - startup if wall is not None and startup is not None and case.op else None
+				spread = spread_pct([s.wall for s in samples])
+				row += [(fmt_time(wall), dim), ('%.0f%%' % spread if spread is not None else '', dim),
+					(fmt_net(net), dim), (fmt_time(median([s.cpu for s in samples])), dim),
+					(fmt_rss(median([s.maxrss for s in samples]), median([s.rss_floor for s in samples])), dim)]
+				if disk:
+					after = fmt_bytes(median([s.store_bytes for s in samples]))
+					before = result.extra.get('before_bytes')
+					if case.family == 'maint' and before and samples:
+						after = '%s→%s' % (fmt_bytes(before), after)
+					row.append((after, dim))
+				gate = mark_text(result.mark) + ('*' if result.drift else '')
+				row.append((gate, '31' if failed else None))
+				if index:
+					ratio = wall / base_wall if wall and base_wall and result.mark[0] == OK else None
+					row.append((fmt_ratio(ratio), None))
+			rows.append(row)
+		return render_table(columns, rows, width, style)
+
+	def perop_table(self, results, width, style):
+		names = [impl.name for impl in self.impls]
+		columns = [('workload', None)]
+		for index, name in enumerate(names):
+			columns += [('%s p50' % name, None), ('p95', 'p95'), ('p99', 'p99'), ('ops/s', None), ('rss', 'rss'), ('ok', None)]
+			if index:
+				columns.append(('×', None))
+		columns.append(('ceiling ops/s', 'ceiling'))
+		rows = []
+		for case, by_impl in self._by_case(results):
+			series_names = []
+			for result in by_impl.values():
+				for name in result.series:
+					if name not in series_names:
+						series_names.append(name)
+			if not series_names:
+				series_names = ['set', 'get'] if case.kind == 'calls' else ['get', 'set', '--sync set'] + ['mix ×%d' % c for c in self.params['clients']]
+			for series in series_names:
+				row = [('%s %s' % (case.name, series), None)]
+				base = by_impl[names[0]].series.get(series)
+				base_p50 = percentile(base['lat'], 0.5) if base and by_impl[names[0]].mark[0] == OK else None
+				for index, name in enumerate(names):
+					result = by_impl[name]
+					entry = result.series.get(series, {'lat': [], 'ops': [], 'rss': [], 'floor': []})
+					failed = result.mark[0] in FAILED
+					dim = '2' if failed else None
+					p50 = percentile(entry['lat'], 0.5)
+					row += [(fmt_time(p50), dim), (fmt_time(percentile(entry['lat'], 0.95)), dim),
+						(fmt_time(percentile(entry['lat'], 0.99)), dim), (fmt_rate(median(entry['ops'])), dim),
+						(fmt_rss(median(entry['rss']), median(entry['floor'])) if entry['rss'] else '', dim),
+						(mark_text(result.mark) + ('*' if result.drift else ''), '31' if failed else None)]
+					if index:
+						ratio = p50 / base_p50 if p50 and base_p50 and result.mark[0] == OK else None
+						row.append((fmt_ratio(ratio), None))
+				ceiling = self.ceiling.series.get(series) if self.ceiling and case.kind == 'socket' else None
+				row.append((fmt_rate(median(ceiling['ops'])) if ceiling else '', None))
+				rows.append(row)
+		return render_table(columns, rows, width, style)
+
+	def _cold_slope(self, impl, op):
+		points = []
+		for result in self.results:
+			case = result.case
+			if result.impl is impl and case.family == 'cold' and case.name == op and case.shape == 'plain' and result.mark[0] == OK:
+				points.append((case.rows, median([s.maxrss for s in result.samples]),
+					median([s.rss_floor for s in result.samples])))
+		points = sorted(p for p in points if p[1] is not None)
+		if len(points) < 2 or points[-1][0] == points[0][0]:
+			return None
+		if points[-1][2] and points[-1][1] <= points[-1][2] + 1024 * 1024:
+			return None
+		return (points[-1][1] - points[0][1]) / float(points[-1][0] - points[0][0])
+
+	def footprint(self):
+		lines = ['[footprint]']
+		for impl in self.impls:
+			parts = []
+			for op in ('read', 'len'):
+				slope = self._cold_slope(impl, op)
+				parts.append('memory/row (%s) %s' % (op, fmt_bytes(slope) if slope is not None else '—'))
+			disk = None
+			for result in self.results:
+				if result.impl is impl and result.case.name == 'set - new' and result.mark[0] == OK:
+					if result.case.rows == max(self.params['sizes']):
+						disk = median([s.store_bytes for s in result.samples])
+						disk = disk / float(result.case.rows) if disk is not None else None
+			parts.append('disk/record %s' % (fmt_bytes(disk) if disk is not None else '—'))
+			for result in self.results:
+				if result.impl is impl and result.case.kind == 'socket':
+					extra = result.extra
+					parts.append('handler load %s, rss after load %s, peak rss %s, cpu %s' % (
+						fmt_time(median(extra.get('load_time', []))), fmt_bytes(median(extra.get('rss_after_load', []))),
+						fmt_rss(median(extra.get('handler_maxrss', [])), median(extra.get('handler_rss_floor', []))),
+						fmt_time(median(extra.get('handler_cpu', [])))))
+			lines.append('  %-12s %s' % (impl.name, '; '.join(parts)))
+		return '\n'.join(lines)
+
+	def summary(self):
+		lines = ['[summary] ratio = time against %s, geometric mean per family (lower is faster)' % self.impls[0].name]
+		baseline = self.impls[0]
+		for impl in self.impls:
+			ratios = []
+			for family in self.opts.families:
+				values = []
+				for case, by_impl in self._by_case([r for r in self.results if r.case.family == family]):
+					mine, base = by_impl[impl.name], by_impl[baseline.name]
+					if mine.mark[0] != OK or base.mark[0] != OK:
+						continue
+					if case.kind == 'cli':
+						a, b = median([s.wall for s in mine.samples]), median([s.wall for s in base.samples])
+						if a and b:
+							values.append(a / b)
+					else:
+						for name, entry in mine.series.items():
+							other = base.series.get(name)
+							if other:
+								a, b = percentile(entry['lat'], 0.5), percentile(other['lat'], 0.5)
+								if a and b:
+									values.append(a / b)
+				ratios.append('%s %s' % (family, fmt_ratio(geomean(values))))
+			marks = [r.mark[0] for r in self.results if r.impl is impl]
+			lines.append('  %-12s %s   ✗ %d  ! %d  ⏱ %d' % (impl.name, '  '.join(ratios),
+				marks.count(WRONG), marks.count(EXIT), marks.count(TIMEOUT)))
+		failures = [r for r in self.results if r.mark[0] in FAILED]
+		for result in failures:
+			lines.append('  %s %s %s: %s' % (mark_text(result.mark), result.impl.name, result.case.label, result.mark[1]))
+			for log_line in result.log.split('\n') if result.log else []:
+				lines.append('      ' + log_line)
+		return '\n'.join(lines)
+
+	def write_json(self, env):
+		document = {
+			'schema': 1,
+			'harness': {'version': version, 'suite': self.opts.suite, 'seed': self.opts.seed, 'started': self.started,
+				'params': self.params},
+			'env': env,
+			'impls': [{'name': i.name, 'command': i.command, 'version': i.version, 'handler': i.handler,
+				'problem': i.problem} for i in self.impls],
+			'results': [],
+		}
+		for result in self.results:
+			entry = {'family': result.case.family, 'workload': result.case.name, 'shape': result.case.shape,
+				'rows': result.case.rows, 'impl': result.impl.name,
+				'gate': {'mark': result.mark[0], 'detail': result.mark[1]},
+				'samples': [s.as_dict() for s in result.samples], 'latency': None, 'extra': result.extra}
+			if result.series:
+				entry['latency'] = {name: {'p50_us': _us(percentile(s['lat'], 0.5)), 'p95_us': _us(percentile(s['lat'], 0.95)),
+					'p99_us': _us(percentile(s['lat'], 0.99)), 'ops_s': median(s['ops']), 'requests': len(s['lat']),
+					'latencies_us': [_us(v) for v in s['lat']]} for name, s in result.series.items()}
+			document['results'].append(entry)
+		if self.ceiling:
+			document['ceiling'] = {name: {'ops_s': median(s['ops']), 'p50_us': _us(percentile(s['lat'], 0.5))}
+				for name, s in self.ceiling.series.items()}
+		with open(self.opts.json, 'w') as f:
+			json.dump(document, f, indent=1, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _us(seconds):
+	return None if seconds is None else round(seconds * 1e6, 1)
+
+
+def _interrupt(signum, frame):
+	raise KeyboardInterrupt
+
+
+def main(argv=None):
+	opts = parse_args(argv)
+	if not hasattr(os, 'wait4') or not hasattr(socket, 'AF_UNIX'):
+		eprint('tsvzbench: needs os.wait4 and Unix-domain sockets (Linux or macOS)')
+		return 1
+	bench = Bench(opts)
+	previous = signal.signal(signal.SIGTERM, _interrupt)
+	try:
+		return bench.run()
+	except KeyboardInterrupt:
+		kill_live_groups()
+		eprint('tsvzbench: interrupted')
+		try:
+			bench.report(partial=True)
+		except Exception as error:
+			eprint('tsvzbench: no partial report: %r' % error)
+		return 130
+	finally:
+		bench.cleanup()
+		signal.signal(signal.SIGTERM, previous)
+
+
+if __name__ == '__main__':
+	sys.exit(main())

@@ -264,11 +264,48 @@ python3 website/tsvz_site.py build /tmp/site   # static files for any host
 
 `deploy/tsvz-site.service` runs it under systemd; restart it to publish an edit.
 
+## Benchmarking implementations
+
+`tsvzbench.py` compares implementations of tsvz-spec-v1, in any language, side
+by side on one machine. It drives each one only through the spec's command
+line (§20) and, when it has one, its handler socket (§21), so any conformant
+`tsvz` tool can be measured as it is.
+
+```bash
+python3 tsvzbench.py --impl ref='python3 TSVZ.py' --impl new='../tsvz-rs/target/release/tsvz' \
+                     --suite quick --work-dir /mnt/fast-disk/tsvzbench
+```
+
+- `--impl NAME=COMMAND`, repeatable: the first is the baseline, and every other
+  implementation gets a `×` ratio against it (below 1 is faster). A relative
+  COMMAND runs from the directory you start tsvzbench in.
+- `--suite smoke|quick|standard|large`: `smoke` checks a setup in seconds,
+  `quick` takes about a minute, `standard` (the default, up to 1M rows) about
+  five, and `large` (up to 10M rows) twenty or more and ~5 GB of memory for the
+  harness itself.
+- `--only cold,bulk,perop,maint` picks families: one-shot replays, `set -` and
+  `delete -` batches, single operations (CLI and handler), and scrub/clear.
+- `--work-dir DIR` keeps the generated fixtures between runs. Put it on the disk
+  you mean to measure: not a tmpfs, and not a FUSE file system such as mergerfs
+  (the harness warns about those). The default is a `tsvzbench-*` directory here.
+- `--json PATH` also writes every raw sample.
+
+The harness writes its own input stores, so every implementation reads the same
+bytes, and checks every result against its own replay model: `✓` right, `✗`
+wrong output or files, `! N` an unexpected exit status, `⏱` timed out, `refused`
+an allowed refusal. It exits 1 when any cell failed. Each command runs under a
+small launcher that measures it with `wait4`; a peak RSS shown as `≤8.0 MiB` is
+the launcher's own size, so the true peak is no higher. Compare an
+implementation with itself to see the noise: a few percent per cell, but the
+socket rows, whose latencies are tens of microseconds, can move 10–20% between
+runs, because a single run can land in a slower mode as a whole.
+
 ## Tests
 
 ```bash
 python3 -m pytest TSVZ_test.py -q                         # everything, incl. 3.39 differential tests
 python3 -m pytest website/tsvz_site_test.py -q            # the tsvz.org site
+python3 -m pytest tsvzbench_test.py -q                    # the benchmark harness
 python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a test)
 ```
 

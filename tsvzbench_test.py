@@ -613,3 +613,88 @@ def test_fs_warning():
 	assert set(tb.environment(os.getcwd())) == {'host', 'cpu', 'cpus', 'python', 'kernel', 'fs'}
 
 
+# --- report and entry point --------------------------------------------------------------------
+
+def run_bench(tmp_path, impls, *extra):
+	out = io.StringIO()
+	bench = tb.Bench(tb.parse_args(bench_argv(tmp_path, impls, extra)), out=out)
+	try:
+		code = bench.run()
+	finally:
+		bench.cleanup()
+	return bench, code, out.getvalue()
+
+
+def test_smoke_report_and_json(tmp_path):
+	report = str(tmp_path / 'r.json')
+	bench, code, out = run_bench(tmp_path, [('ref', REF_COMMAND)], '--json', report)
+	assert code == 0
+	assert out.startswith('tsvzbench %s' % tb.version)
+	for section in ('[cold]', '[bulk]', '[perop]', '[maint]', '[footprint]', '[summary]', 'ceiling ops/s', 'refused'):
+		assert section in out
+	perop = out[out.index('[perop]'):out.index('[maint]')]
+	assert ' rss ' in perop.split('\n')[1] and 'MiB' in perop
+	assert '→' in out[out.index('[maint]'):out.index('[footprint]')]
+	document = json.load(open(report))
+	assert document['schema'] == 1 and document['impls'][0]['handler'] is True
+	assert document['harness']['suite'] == 'smoke' and 'get' in document['ceiling']
+	read = next(e for e in document['results'] if e['workload'] == 'read' and e['shape'] == 'plain')
+	assert read['gate']['mark'] == 'ok' and read['samples'][0]['rss_floor'] > 0
+	socket_entry = next(e for e in document['results'] if e['workload'] == 'socket')
+	assert len(socket_entry['latency']['get']['latencies_us']) == socket_entry['latency']['get']['requests']
+
+
+def test_report_compares_two_implementations(tmp_path):
+	bench, code, out = run_bench(tmp_path, [('ref', REF_COMMAND), ('ref2', REF_COMMAND)], '--only', 'cold')
+	assert code == 0 and 'ref2 wall' in out and '×' in out
+	summary = out[out.index('[summary]'):]
+	assert 'ref2' in summary and 'cold ×' in summary
+
+
+def test_report_lists_failures_with_their_stderr(tmp_path):
+	bench, code, out = run_bench(tmp_path, [('bad', fake(tmp_path, 'exit1'))], '--only', 'cold')
+	summary = out[out.index('[summary]'):]
+	assert code == 1 and '! 1 bad read 100' in summary
+
+
+def test_main_exit_statuses(tmp_path, monkeypatch, capsys):
+	argv = bench_argv(tmp_path, [('ref', REF_COMMAND)], ['--only', 'cold'])
+	assert tb.main(argv) == 0
+	with pytest.raises(SystemExit) as info:
+		tb.main(['--suite', 'nope'])
+	assert info.value.code == 2
+
+	def interrupted(self, cases):
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(tb.Bench, 'run_cases', interrupted)
+	capsys.readouterr()
+	assert tb.main(argv) == 130
+	assert 'partial results' in capsys.readouterr().out
+
+
+def test_an_interrupt_during_a_handler_workload_leaves_no_process(tmp_path, monkeypatch):
+	dummies, handlers = [], []
+	real_dummy, real_loop, real_start = tb.start_dummy, tb.client_loop, tb.Handler.start
+
+	def spy_dummy(path):
+		dummies.append(path)
+		return real_dummy(path)
+
+	def spy_start(self):
+		real_start(self)
+		handlers.append(self.pid)
+
+	def interrupting(client, payloads):
+		if client.sock.getpeername() in dummies:
+			return real_loop(client, payloads)
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(tb, 'start_dummy', spy_dummy)
+	monkeypatch.setattr(tb, 'client_loop', interrupting)
+	monkeypatch.setattr(tb.Handler, 'start', spy_start)
+	assert tb.main(bench_argv(tmp_path, [('ref', REF_COMMAND)], ['--only', 'perop'])) == 130
+	assert handlers and not tb.LIVE_GROUPS
+	for pid in handlers:
+		with pytest.raises(ProcessLookupError):
+			os.kill(pid, 0)
