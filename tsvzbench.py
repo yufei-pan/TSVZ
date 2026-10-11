@@ -638,9 +638,26 @@ def check_clear(ctx):
 	return _rows_mark(compare_rows(read_store(ctx.store).iter_rows(), []))
 
 
-def _hashes(run_dir, names):
-	return {name: hashlib.sha256(_read(os.path.join(run_dir, name))).hexdigest()
-		for name in names if os.path.exists(os.path.join(run_dir, name))}
+def part_hashes(store):
+	"""Part name → SHA-256 for every part of a store (§17): adding, removing or rewriting a part changes it."""
+	return {os.path.basename(part): hashlib.sha256(_read(part)).hexdigest() for part in store_parts(store)}
+
+
+def try_store_bytes(store):
+	"""store_bytes, or None when the parts cannot be listed or measured."""
+	try:
+		return store_bytes(store)
+	except OSError:
+		return None
+
+
+def post_state_mark(store, expected):
+	"""The post-state gate outside judge(): a store that cannot be read fails its cell, not the run."""
+	try:
+		difference = compare_rows(read_store(store).iter_rows(), expected.iter_rows())
+	except Exception as error:
+		return WRONG, 'could not check: %r' % error
+	return (WRONG, 'post-state: %s' % difference) if difference else (OK, '')
 
 
 def check_scrub_parts(ctx):
@@ -648,7 +665,7 @@ def check_scrub_parts(ctx):
 	if ctx.sample.exit == 0:
 		return check_post(ctx)
 	if ctx.sample.exit == 1:
-		if _hashes(ctx.run_dir, ctx.fixture.files) == ctx.before_hashes:
+		if part_hashes(ctx.store) == ctx.before_hashes:
 			return REFUSED, 'exit 1, parts unchanged'
 		return WRONG, 'exit 1 but the parts changed'
 	return EXIT, str(ctx.sample.exit)
@@ -668,11 +685,16 @@ LIVE_GROUPS = set()
 # launcher it reports at least the launcher's small map (its `floor`, VmHWM:
 # the launcher's own ru_maxrss carries the harness's size the same way), and
 # its own peak above that. The launcher also times the child, so its own
-# start-up is not measured.
+# start-up is not measured. It ignores SIGTERM itself (exec gives its child the
+# default action back), so a group SIGTERM reaches only the command: the
+# harness's SIGKILL that follows still finds a command that ignores SIGTERM,
+# and one that exits on it still has its rusage reported. (It uses the C module
+# _signal: the `signal` wrapper imports enum and would raise the floor ~0.9 MiB.)
 _LAUNCHER = '''
-import os, sys, time
+import _signal, os, sys, time
 fd = int(sys.argv[1])
 argv = sys.argv[2:]
+_signal.signal(_signal.SIGTERM, lambda signum, frame: None)
 try:
 	with open('/proc/self/status') as status:
 		floor = [int(line.split()[1]) for line in status if line.startswith('VmHWM:')][0]
@@ -768,11 +790,29 @@ class Child(object):
 	def pid(self):
 		return self.proc.pid
 
+	def _reap(self, block):
+		"""Reap the exited launcher after killing whatever is left in its process group; None while it runs.
+
+		Where os.waitid exists the group is killed while the launcher is still a zombie,
+		so its id cannot have been reused yet.
+		"""
+		pid = self.proc.pid
+		if hasattr(os, 'waitid'):
+			if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)) is None:
+				return None
+			kill_group(pid)
+			return os.wait4(pid, 0)[1]
+		got, status, _ = os.wait4(pid, 0 if block else os.WNOHANG)
+		if not got:
+			return None
+		kill_group(pid)
+		return status
+
 	def poll(self):
 		"""True once the launcher has exited (and the sample is set)."""
 		if self.sample is None:
-			pid, status, _ = os.wait4(self.proc.pid, os.WNOHANG)
-			if pid:
+			status = self._reap(False)
+			if status is not None:
 				self._finish(status, False)
 		return self.sample is not None
 
@@ -793,7 +833,7 @@ class Child(object):
 			timer.daemon = True
 			timer.start()
 		try:
-			_, status, _ = os.wait4(self.proc.pid, 0)
+			status = self._reap(True)
 		except BaseException:
 			kill_group(self.proc.pid)
 			os.wait4(self.proc.pid, 0)
@@ -1626,16 +1666,18 @@ class Bench(object):
 				argv = impl.argv + ['-V']
 			ctx = RunContext(case, None, run_dir, store, os.path.join(run_dir, 'stdout'), fixture, stdin)
 			if case.op:
-				ctx.before_bytes = store_bytes(store)
+				ctx.before_bytes = try_store_bytes(store)
 			if case.check is check_scrub_parts:
-				ctx.before_hashes = _hashes(run_dir, fixture.files)
+				ctx.before_hashes = part_hashes(store)
 			sample = run_child(argv, impl.cwd, self.params['timeout'], stdin_path=stdin,
 				stdout_path=ctx.stdout, stderr_path=os.path.join(run_dir, 'stderr'))
 			if case.op:
-				sample.store_bytes = store_bytes(store)
+				sample.store_bytes = try_store_bytes(store)
 			ctx.sample = sample
 			if gate:
 				result.mark = self.judge(case, ctx)
+				if case.op == 'verify' and result.mark[0] == OK:
+					result.mark = self._verify_catches(impl, fixture, run_dir)
 				result.extra['exit'] = sample.exit
 				result.extra['before_bytes'] = ctx.before_bytes
 				if result.mark[0] in FAILED:
@@ -1657,6 +1699,28 @@ class Bench(object):
 			return case.check(ctx)
 		except Exception as error:
 			return WRONG, 'could not check: %r' % error
+
+	def _verify_catches(self, impl, fixture, run_dir):
+		"""Gate-only: verify must report a corrupted crc32 segment (exit 4 and a line), or checking nothing would pass as fastest."""
+		directory = os.path.join(run_dir, 'tampered')
+		os.makedirs(directory)
+		store = fixture.copy_to(directory)
+		lines = _read(store).split(b'\n')
+		for index in range(len(lines) - 1, -1, -1):
+			key, sep, value = lines[index].partition(b'\t')
+			if key == b'#_checksum_crc32_#' and value:
+				lines[index] = key + sep + (b'ffffffff' if value == b'00000000' else b'00000000')
+				break
+		with open(store, 'wb') as f:
+			f.write(b'\n'.join(lines))
+		out = os.path.join(directory, 'stdout')
+		sample = run_child(impl.cli('verify', store), impl.cwd, self.params['timeout'], stdout_path=out,
+			stderr_path=os.path.join(directory, 'stderr'))
+		if sample.timed_out:
+			return TIMEOUT, 'verify of a corrupted copy: after %.0f s' % self.params['timeout']
+		if sample.exit != 4 or not output_rows(_read(out)):
+			return WRONG, 'verify missed a corrupted crc32 segment (exit %d)' % sample.exit
+		return OK, ''
 
 	def run_calls_case(self, case):
 		results = self._new_results(case)
@@ -1694,7 +1758,11 @@ class Bench(object):
 					problem = problem or self._call_problem(sample, 0)
 					if expected is not None:
 						expected.apply_line(record(key, cells)[:-1])
+					if problem and problem[0] == TIMEOUT:
+						break
 				for key in keys:
+					if problem and problem[0] == TIMEOUT:
+						break
 					sample = run_child(impl.cli('get', store, key), impl.cwd, timeout, stdout_path=out, stderr_path=err)
 					gets.append(sample)
 					problem = problem or self._call_problem(sample, 0)
@@ -1707,8 +1775,8 @@ class Bench(object):
 					handler.stop()
 			if gate:
 				if not problem:
-					difference = compare_rows(read_store(store).iter_rows(), expected.iter_rows())
-					problem = (WRONG, 'post-state: %s' % difference) if difference else None
+					mark = post_state_mark(store, expected)
+					problem = None if mark[0] == OK else mark
 				result.mark = problem or (OK, '')
 				if problem:
 					self._fail_log(result, err)
@@ -1716,8 +1784,9 @@ class Bench(object):
 			if problem:
 				result.drift = True
 			for name, samples in (('set', sets), ('get', gets)):
-				result.add_series(name, [s.wall for s in samples], len(samples) / sum(s.wall for s in samples),
-					[s.maxrss for s in samples], [s.rss_floor for s in samples])
+				if samples:
+					result.add_series(name, [s.wall for s in samples], len(samples) / sum(s.wall for s in samples),
+						[s.maxrss for s in samples], [s.rss_floor for s in samples])
 
 		self._rounds(results, once)
 
@@ -1742,13 +1811,16 @@ class Bench(object):
 			for name, requests in (('get', plan.gets), ('set', plan.sets), ('--sync set', plan.syncs)):
 				latencies, responses, start, end = client_loop(client, [payload for payload, _ in requests])
 				series[name] = (latencies, end - start)
-				problem = problem or check_responses(responses, [want for _, want in requests])
+				problem = check_responses(responses, [want for _, want in requests])
+				if problem:
+					return series, problem
 		finally:
 			client.close()
 		for count in self.params['clients']:
-			latencies, span, trouble = run_clients(path, plan.mix[count], timeout)
+			latencies, span, problem = run_clients(path, plan.mix[count], timeout)
 			series['mix ×%d' % count] = (latencies, span)
-			problem = problem or trouble
+			if problem:
+				break
 		return series, problem
 
 	def run_socket_case(self, case):
@@ -1770,14 +1842,16 @@ class Bench(object):
 				handler.start()
 				series, trouble = self._socket_loads(handler.path, plan, timeout)
 				problem = (WRONG, trouble) if trouble else None
+			except socket.timeout:
+				series, problem = {}, (TIMEOUT, 'the handler did not answer within %.0f s' % timeout)
 			except (HandlerError, OSError) as error:
 				series, problem = {}, (WRONG, 'handler: %s' % error)
 			finally:
 				served = handler.stop()
 			if gate:
 				if not problem:
-					difference = compare_rows(read_store(store).iter_rows(), plan.final.iter_rows())
-					problem = (WRONG, 'post-state: %s' % difference) if difference else None
+					mark = post_state_mark(store, plan.final)
+					problem = None if mark[0] == OK else mark
 				result.mark = problem or (OK, '')
 				if problem:
 					self._fail_log(result, os.path.join(run_dir, 'serve.err'))

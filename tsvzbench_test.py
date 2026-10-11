@@ -244,6 +244,25 @@ def test_child_rss_does_not_include_the_harness(tmp_path):
 	assert big.maxrss > 200 * 1024 * 1024
 
 
+def test_processes_left_in_the_group_are_killed(tmp_path):
+	import time
+	out = str(tmp_path / 'out')
+	code = 'import subprocess; print(subprocess.Popen(["sleep", "300"]).pid)'
+	sample = tb.run_child([sys.executable, '-c', code], str(tmp_path), 30, stdout_path=out)
+	assert sample.exit == 0
+	pid = int(open(out).read())
+	deadline = time.perf_counter() + 5
+	while time.perf_counter() < deadline:
+		try:
+			os.kill(pid, 0)
+		except ProcessLookupError:
+			break
+		time.sleep(0.05)
+	else:
+		os.kill(pid, 9)
+		pytest.fail('a process the child left behind survived the run')
+
+
 # --- the handler protocol --------------------------------------------------------------------
 
 def _short_socket_dir():
@@ -390,6 +409,29 @@ def test_a_handler_that_ignores_stop_is_killed(tmp_path):
 		pytest.fail('the stuck handler survived')
 
 
+def test_a_handler_that_ignores_sigterm_is_killed(tmp_path):
+	import time
+	script = tmp_path / 'stubborn.py'
+	script.write_text('import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n' + STUCK)
+	impl = tb.Impl('stubborn', '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	handler = tb.Handler(impl, str(tmp_path / 'h.tsvz'), str(tmp_path), 10.0)
+	handler.start()
+	began = time.perf_counter()
+	sample = handler.stop(wait=0.5)
+	assert sample.timed_out and time.perf_counter() - began < 10
+	assert not tb.LIVE_GROUPS
+	deadline = time.perf_counter() + 5
+	while time.perf_counter() < deadline:
+		try:
+			os.kill(handler.pid, 0)
+		except ProcessLookupError:
+			break
+		time.sleep(0.05)
+	else:
+		os.kill(handler.pid, 9)
+		pytest.fail('the handler that ignores SIGTERM survived')
+
+
 # --- statistics and formatting -----------------------------------------------------------------
 
 def test_statistics():
@@ -483,7 +525,7 @@ def test_socket_plan_is_deterministic_and_tracks_the_final_state(tmp_path):
 # --- running a benchmark -----------------------------------------------------------------------
 
 FAKE = r'''
-import subprocess, sys, time
+import os, subprocess, sys, time
 mode, reference, args = sys.argv[1], sys.argv[2], sys.argv[3:]
 ops = ('read', 'len', 'get', 'set', 'delete', 'scrub', 'clear', 'verify', 'serve', 'stop')
 op = next((a for a in args if a in ops), None)
@@ -493,10 +535,23 @@ if mode == 'sleep' and op == 'len':
 	time.sleep(60)
 if mode == 'noserve' and op == 'serve':
 	sys.exit(1)
+if mode == 'hangset' and op == 'set' and args[-1] != '-':
+	with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'hung.log'), 'a') as log:
+		log.write('set\n')
+	time.sleep(60)
+if mode == 'noverify' and op == 'verify':
+	sys.exit(0)
+if mode == 'refusewrite' and op == 'scrub':
+	with open(args[-1] + '.fff', 'w') as part:
+		part.write('zz\tchanged\n')
+	sys.exit(1)
 data = sys.stdin.buffer.read() if args[-1:] == ['-'] else b''
 if mode == 'corrupt':
 	data = data.replace(b'\t', b'\tX', 1)
 done = subprocess.run([sys.executable, reference] + args, input=data, stdout=subprocess.PIPE)
+if mode == 'badpart' and op == 'serve':
+	with open(args[-1] + '.1.gz', 'wb') as part:
+		part.write(b'not gzip at all\n')
 out = done.stdout
 if mode == 'drop' and op == 'read':
 	out = b''.join(out.splitlines(True)[:-1])
@@ -563,6 +618,75 @@ def test_the_gate_catches_a_misbehaving_implementation(tmp_path, mode, family, l
 	assert bench.exit_status() == 1
 	if kind == tb.TIMEOUT:
 		assert result.samples == []
+
+
+def test_an_unreadable_part_fails_its_cell_without_stopping_the_run(tmp_path):
+	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, 'badpart'))], '--only', 'perop')
+	found = marks(bench, 'bad')
+	assert found[('perop', 'cli 100')][0] == tb.OK
+	for label in ('cli via handler 100', 'socket 100'):
+		assert found[('perop', label)][0] == tb.WRONG and 'could not check' in found[('perop', label)][1]
+	assert bench.exit_status() == 1
+
+
+def test_a_timed_out_call_ends_its_calls_workload(tmp_path):
+	bench, _ = run_suite(tmp_path, [('hang', fake(tmp_path, 'hangset'))], '--only', 'perop', '--timeout', '2')
+	found = marks(bench, 'hang')
+	assert found[('perop', 'cli 100')][0] == tb.TIMEOUT
+	assert found[('perop', 'cli via handler 100')][0] == tb.TIMEOUT
+	assert open(str(tmp_path / 'hung.log')).read().count('set') == 2
+
+
+def test_a_refusal_that_writes_a_part_is_wrong(tmp_path):
+	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, 'refusewrite'))], '--only', 'maint')
+	assert marks(bench, 'bad')[('maint', 'scrub multipart 100')][0] == tb.WRONG
+
+
+def test_a_verify_that_checks_nothing_is_wrong(tmp_path):
+	bench, _ = run_suite(tmp_path, [('lazy', fake(tmp_path, 'noverify'))], '--only', 'cold')
+	mark = marks(bench, 'lazy')[('cold', 'verify checksum 100')]
+	assert mark[0] == tb.WRONG and 'corrupted' in mark[1]
+
+
+MUTE = r'''
+import os, socket, sys, tempfile
+args = sys.argv[1:]
+if '-V' in args:
+	print('mute 0')
+	sys.exit(0)
+store = args[-1]
+path = os.path.join(tempfile.mkdtemp(prefix='tsvzb-'), 's')
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(4)
+with open(store + '.serve', 'w') as f:
+	f.write('tsvz-handler\t1\naddress\tunix:%s\npid\t%d\n' % (path, os.getpid()))
+while True:
+	conn, _ = server.accept()
+	for line in conn.makefile('rb'):
+		if line.startswith(b'len'):
+			conn.sendall(b'#0\n')
+		elif line.startswith(b'stop'):
+			conn.sendall(b'#0\n')
+			os.remove(store + '.serve')
+			sys.exit(0)
+	conn.close()
+'''
+
+
+def test_a_handler_that_stops_answering_times_out(tmp_path):
+	script = tmp_path / 'mute.py'
+	script.write_text(MUTE)
+	command = '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)))
+	bench = tb.Bench(tb.parse_args(bench_argv(tmp_path, [('mute', command)], ['--only', 'perop', '--timeout', '2'])),
+		out=io.StringIO())
+	try:
+		assert bench.prepare() is None
+		bench.run_cases([case for case in tb.build_cases(bench.params, bench.opts.families) if case.kind == 'socket'])
+	finally:
+		bench.cleanup()
+	result = next(r for r in bench.results if r.case.kind == 'socket')
+	assert result.mark[0] == tb.TIMEOUT and result.series == {}
 
 
 def test_an_implementation_without_a_handler(tmp_path):

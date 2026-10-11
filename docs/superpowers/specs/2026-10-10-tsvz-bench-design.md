@@ -214,7 +214,7 @@ work directory. Nothing is piped through the harness.
 | `len` | `plain` at every size | N |
 | `get` | `plain` at every size, one live key and one missing key | exit 3; the live row, then the missing key with the (empty) active defaults, §14.5 (`nope` and `nope⇥` are equal under section 2.3.2) |
 | `read` | `churn`, `escaped`, `markers`, `checksum`, `gz`, `multipart` at mid size | all rows |
-| `verify` | `checksum` at mid size | exit 0, no output |
+| `verify` | `checksum` at mid size | exit 0, no output; and, in the gated warm-up only, on a copy whose last crc32 digest is corrupted: exit 4 and a report line (a `verify` that checks nothing would otherwise pass as the fastest) |
 
 `startup` is the per-implementation process floor; its median is subtracted to
 give the *net* time of every other CLI workload. It runs at least 5 timed
@@ -280,7 +280,7 @@ The peak shown is never below the RSS after load: rusage peaks are approximate
 | `scrub churn` | `churn` mid | exit 0; same state; smaller file; sizes before/after reported |
 | `scrub markers` | `markers` mid | exit 0; same state (§19.4 fidelity) |
 | `clear` | `plain` mid | exit 0; empty store |
-| `scrub multipart` | `multipart` mid | exit 0 with the same state → `✓`; exit 1 with every part byte-identical → `refused` (§20.2.1); anything else → `✗` |
+| `scrub multipart` | `multipart` mid | exit 0 with the same state → `✓`; exit 1 with the same set of parts, each byte-identical (none added, removed or rotated) → `refused` (§20.2.1); anything else → `✗` |
 
 ## 4. Measurement
 
@@ -305,8 +305,13 @@ are approximate to about 1 MiB (the kernel keeps RSS in per-CPU counters):
 measured, a handler's reported peak came out 0.7 MiB below the `VmHWM` read
 during its run. Peak RSS is for comparing footprints, not exact to the page.
 
-The harness reaps the launcher with `os.wait4` and kills the launcher's process
-group on timeout (SIGKILL), recording `⏱`. Store growth is the change in the
+The launcher ignores SIGTERM itself (exec gives the command the default action
+back), so a group SIGTERM reaches only the command, and the SIGKILL that follows
+still finds a command that ignores SIGTERM. Once the launcher has exited, the
+harness kills its whole process group, so nothing a command left running
+survives the run or skews the next one; where `os.waitid` exists this happens
+while the launcher is still a zombie, so the group id cannot have been reused.
+The harness kills the group on timeout (SIGKILL), recording `⏱`. Store growth is the change in the
 summed sizes of the store's parts.
 
 4.2 **Repetitions.** For each (workload, implementation): one untimed warm-up run,
@@ -383,7 +388,10 @@ for every failed cell, the last 5 lines of the run's standard error.
 ## 6. Error handling
 
 6.1 One failure never aborts the run: a crash, unexpected exit or timeout marks
-the cell and the harness moves on. The last 5 lines of a failed gate run's
+the cell and the harness moves on. A store the gate cannot read fails its cell
+(`✗ could not check`). The first timeout ends its workload: a single-operation
+CLI workload stops calling, and a handler that stops answering is `⏱`; socket
+loads stop at their first problem. The last 5 lines of a failed gate run's
 standard error are kept with its result and printed under the summary; `--keep`
 also keeps the run directory with the whole of it. A timed-out implementation
 gets no timed repetitions of that workload.
