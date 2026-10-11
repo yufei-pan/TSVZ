@@ -286,3 +286,248 @@ def store_bytes(store):
 	return sum(os.path.getsize(part) for part in store_parts(store))
 
 
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+_B64_TABLE = bytes.maketrans(b'+/', b'xz')
+_KEY_MULT = 0x9E3779B97F4B
+_KEY_MASK = (1 << 48) - 1
+HEADER = '#key\tc1\tc2\tc3\tc4\tc5\n'
+MULTIPART_ORDINALS = ('f', '10', 'ff', '100', '0192a3b4c5d67e8f9a0b1c2d3e4f5061',
+	'0192a3b4c5d67e8f9a0b1c2d3e4f5062', '0192a3b4c5d67e8f9a0b1c2d3e4f5063')
+_SPECIALS = ('\t', '\n', '<', '<sep>', '#', 'é', 'ß', '漢字', '😀')
+
+
+def key_of(index):
+	"""Key number `index`: 12 hex digits of an odd-multiplier permutation of [0, 2**48), so unique and unsorted."""
+	return '%012x' % ((index * _KEY_MULT + 0x5DEECE66D) & _KEY_MASK)
+
+
+def random_values(rng, count=5):
+	"""`count` random [A-Za-z0-9] cells of 8 to 15 characters."""
+	text = base64.b64encode(rng.getrandbits(480).to_bytes(60, 'big')).translate(_B64_TABLE).decode('ascii')
+	return [text[16 * j:16 * j + 8 + rng.getrandbits(3)] for j in range(count)]
+
+
+def gen_plain(rng, rows, base=0):
+	yield HEADER
+	for i in range(rows):
+		yield record(key_of(base + i), random_values(rng))
+
+
+def gen_churn(rng, rows):
+	"""About 4*rows data lines leaving exactly `rows` live keys: overwrites, 20% tombstones, re-inserts."""
+	pool = rows + (3 * rows) // 5
+	reinsert = rows // 5
+	tomb = (pool - rows) + reinsert
+	overwrites = 4 * rows - pool - tomb - reinsert
+	early = overwrites - overwrites // 3
+	yield HEADER
+	for i in range(pool):
+		yield record(key_of(i), random_values(rng))
+	for _ in range(early):
+		yield record(key_of(rng.randrange(pool)), random_values(rng))
+	dead = rng.sample(range(pool), tomb)
+	for i in dead:
+		yield encode_field(key_of(i), is_key=True) + '\n'
+	for i in dead[:reinsert]:
+		yield record(key_of(i), random_values(rng))
+	gone = set(dead[reinsert:])
+	live = [i for i in range(pool) if i not in gone]
+	for _ in range(overwrites - early):
+		yield record(key_of(rng.choice(live)), random_values(rng))
+
+
+def gen_escaped(rng, rows):
+	"""Like plain, with §13 specials in ~30% of cells and a leading '#' in ~2% of keys."""
+	yield HEADER
+	for i in range(rows):
+		key = key_of(i)
+		if rng.random() < 0.02:
+			key = '#' + key[1:]
+		cells = random_values(rng)
+		for j, cell in enumerate(cells):
+			if rng.random() < 0.3:
+				at = rng.randrange(len(cell) + 1)
+				cells[j] = cell[:at] + rng.choice(_SPECIALS) + cell[at:]
+		yield record(key, cells)
+
+
+def _sparse_row(rng, key):
+	cells = []
+	for value in random_values(rng)[:1 + rng.randrange(5)]:
+		roll = rng.random()
+		cells.append('' if roll < 0.2 else value + ' ' if roll < 0.3 else value)
+	return record(key, cells)
+
+
+def gen_markers(rng, rows):
+	"""Defaults, fill-empty and sparse rows; defaults change halfway, stripping stops for the last quarter."""
+	yield HEADER
+	yield '#_version_#\t1\n'
+	yield '#_defaults_#\t' + '\t'.join(random_values(rng)) + '\n'
+	yield '#_fill_empty_with_default_#\ttrue\n'
+	for i in range(rows):
+		if i == rows // 2:
+			yield '#_defaults_#\t' + '\t'.join(random_values(rng)) + '\n'
+			for _ in range(rows // 20):
+				yield _sparse_row(rng, key_of(rng.randrange(i)))
+		if i == (3 * rows) // 4:
+			yield '#_strip_trailing_whites_#\tfalse\n'
+		yield _sparse_row(rng, key_of(i))
+
+
+def gen_checksum(rng, rows, crc_every=1000, sha_every=1500, sha_offset=500):
+	"""Plain rows with staggered crc32 and sha256 segments carrying correct digests (§15)."""
+	accs = {'crc32': None, 'sha256': None}
+
+	def feed(line, skip):
+		data = line.encode('utf-8')
+		for algo, acc in accs.items():
+			if acc is None or algo == skip:
+				continue
+			if algo == 'crc32':
+				accs[algo] = zlib.crc32(data, acc)
+			else:
+				acc.update(data)
+
+	def marker(algo):
+		acc = accs[algo]
+		if acc is None:
+			value = ''
+		elif algo == 'crc32':
+			value = '%08x' % (acc & 0xffffffff)
+		else:
+			value = acc.hexdigest()
+		line = '#_checksum_%s_#\t%s\n' % (algo, value)
+		feed(line, algo)
+		accs[algo] = 0 if algo == 'crc32' else hashlib.sha256()
+		return line
+
+	yield HEADER
+	for i in range(rows):
+		if i % crc_every == 0:
+			yield marker('crc32')
+		if i >= sha_offset and (i - sha_offset) % sha_every == 0:
+			yield marker('sha256')
+		line = record(key_of(i), random_values(rng))
+		feed(line, None)
+		yield line
+	yield marker('crc32')
+	yield marker('sha256')
+
+
+def write_lines(path, lines, compress=False):
+	with open(path, 'wb') as raw:
+		out = gzip.GzipFile(filename='', mode='wb', fileobj=raw, compresslevel=6, mtime=0) if compress else raw
+		try:
+			for chunk in iter(lambda: list(itertools.islice(lines, 4096)), []):
+				out.write(''.join(chunk).encode('utf-8'))
+		finally:
+			if compress:
+				out.close()
+
+
+def _make_multipart(rng, rows, directory, store_name):
+	lines = gen_plain(rng, rows)
+	header = next(lines)
+	chunk = -(-rows // 8)
+	names = [store_name] + [store_name + '.' + ordinal for ordinal in MULTIPART_ORDINALS]
+	for index, name in enumerate(names):
+		write_lines(os.path.join(directory, name), itertools.chain([header] if index == 0 else [], itertools.islice(lines, chunk)))
+	rotated = (record(key_of(ROTATED_KEY_BASE + i), random_values(rng)) for i in range(10))
+	write_lines(os.path.join(directory, store_name + '.11.rotated'), rotated)
+
+
+_MAKERS = {
+	'plain': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_plain(rng, rows)),
+	'churn': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_churn(rng, rows)),
+	'escaped': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_escaped(rng, rows)),
+	'markers': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_markers(rng, rows)),
+	'checksum': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_checksum(rng, rows)),
+	'gz': lambda rng, rows, d, name: write_lines(os.path.join(d, name), gen_plain(rng, rows), compress=True),
+	'multipart': _make_multipart,
+	'bulk-new': lambda rng, rows, d, name: write_lines(os.path.join(d, name),
+		(record(key_of(NEW_KEY_BASE + i), random_values(rng)) for i in range(rows))),
+	'bulk-add': lambda rng, rows, d, name: write_lines(os.path.join(d, name),
+		(record(key_of(NEW_KEY_BASE + i), random_values(rng)) for i in range(max(1, rows // 100)))),
+	'bulk-del': lambda rng, rows, d, name: write_lines(os.path.join(d, name),
+		(encode_field(key_of(i), is_key=True) + '\n' for i in rng.sample(range(rows), max(1, rows // 10)))),
+}
+_SIZE_FACTOR = {'churn': 4.0, 'bulk-add': 0.01, 'bulk-del': 0.2}
+
+
+class Fixture(object):
+	"""One generated store or bulk input: `files` in `directory`; a tool is given `store_name`."""
+
+	def __init__(self, kind, rows, directory, store_name):
+		self.kind = kind
+		self.rows = rows
+		self.directory = directory
+		self.store_name = store_name
+		self.files = sorted(name for name in os.listdir(directory) if name != 'complete')
+
+	@property
+	def path(self):
+		return os.path.join(self.directory, self.store_name)
+
+	def copy_to(self, run_dir):
+		for name in self.files:
+			shutil.copyfile(os.path.join(self.directory, name), os.path.join(run_dir, name))
+		return os.path.join(run_dir, self.store_name)
+
+	def model(self):
+		return read_store(self.path)
+
+
+class Fixtures(object):
+	"""The fixture cache under `directory`, one subdirectory per (kind, rows, seed, generator version)."""
+
+	def __init__(self, directory, seed):
+		self.directory = directory
+		self.seed = seed
+
+	def _stem(self, kind, rows):
+		return '%s-%d-s%d-g%d' % (kind, rows, self.seed, GENERATOR_VERSION)
+
+	def cached(self, kind, rows):
+		return os.path.exists(os.path.join(self.directory, self._stem(kind, rows), 'complete'))
+
+	def get(self, kind, rows):
+		stem = self._stem(kind, rows)
+		directory = os.path.join(self.directory, stem)
+		store_name = 'gz.tsvz.gz' if kind == 'gz' else kind + '.tsvz'
+		if not self.cached(kind, rows):
+			shutil.rmtree(directory, ignore_errors=True)
+			os.makedirs(directory)
+			_MAKERS[kind](random.Random(stem), rows, directory, store_name)
+			open(os.path.join(directory, 'complete'), 'w').close()
+		return Fixture(kind, rows, directory, store_name)
+
+	def estimate(self, kind, rows):
+		"""Bytes a fixture not yet cached will take."""
+		if self.cached(kind, rows):
+			return 0
+		return int(rows * ROW_BYTES * _SIZE_FACTOR.get(kind, 1.0))
+
+
+def planned_fixtures(params, families):
+	"""Every (kind, rows) fixture the selected families use."""
+	sizes, mid = params['sizes'], params['mid']
+	planned = []
+	if 'cold' in families:
+		planned += [('plain', rows) for rows in sizes] + [(shape, mid) for shape in FEATURE_SHAPES]
+	if 'bulk' in families:
+		planned += [('bulk-new', rows) for rows in sizes] + [('plain', mid), ('bulk-add', mid), ('bulk-del', mid)]
+	if 'perop' in families:
+		planned.append(('plain', mid))
+	if 'maint' in families:
+		planned += [('churn', mid), ('markers', mid), ('plain', mid), ('multipart', mid)]
+	seen = []
+	for item in planned:
+		if item not in seen:
+			seen.append(item)
+	return seen
+
+

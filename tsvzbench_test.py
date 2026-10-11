@@ -112,3 +112,69 @@ def test_store_parts_order_and_bytes(tmp_path):
 	assert tb.store_bytes(str(tmp_path / 's.tsvz')) == 16
 
 
+# --- fixtures ------------------------------------------------------------------------
+
+SHAPES = ('plain', 'churn', 'escaped', 'markers', 'checksum', 'gz', 'multipart')
+
+
+def _files(fixture):
+	return {name: open(os.path.join(fixture.directory, name), 'rb').read() for name in fixture.files}
+
+
+@pytest.mark.parametrize('kind', sorted(tb._MAKERS))
+def test_fixtures_are_deterministic(tmp_path, kind):
+	first = tb.Fixtures(str(tmp_path / 'a'), 7).get(kind, 300)
+	second = tb.Fixtures(str(tmp_path / 'b'), 7).get(kind, 300)
+	other = tb.Fixtures(str(tmp_path / 'c'), 8).get(kind, 300)
+	assert _files(first) == _files(second)
+	assert _files(first) != _files(other)
+
+
+def test_fixture_shapes(tmp_path):
+	fixtures = tb.Fixtures(str(tmp_path), 1)
+	for shape in SHAPES:
+		assert len(fixtures.get(shape, 1000).model().rows) == 1000, shape
+	lines = open(fixtures.get('churn', 1000).path, 'rb').read().split(b'\n')[1:-1]
+	tombstones = [line for line in lines if b'\t' not in line]
+	assert 3900 <= len(lines) <= 4100 and len(tombstones) >= 0.2 * len(lines)
+	text = open(fixtures.get('escaped', 1000).path, encoding='utf-8').read()
+	for token in ('<sep>', '<LF>', '<lt>', '<#>', '漢字'):
+		assert token in text
+	multipart = fixtures.get('multipart', 1000)
+	ordinals = [name.split('.')[2] for name in multipart.files if name.count('.') == 2]
+	assert sorted(ordinals) != sorted(ordinals, key=lambda o: int(o, 16))
+	assert tb.key_of(tb.ROTATED_KEY_BASE) not in multipart.model().rows
+	assert fixtures.cached('plain', 1000) and not fixtures.cached('plain', 999)
+	assert fixtures.estimate('plain', 1000) == 0 and fixtures.estimate('churn', 10) == 4 * 10 * tb.ROW_BYTES
+
+
+def test_bulk_inputs(tmp_path):
+	fixtures = tb.Fixtures(str(tmp_path), 1)
+	plain = fixtures.get('plain', 1000).model().rows
+	new = tb.Model().replay_file(fixtures.get('bulk-new', 1000).path).rows
+	assert len(new) == 1000 and not set(new) & set(plain)
+	assert len(tb.Model().replay_file(fixtures.get('bulk-add', 1000).path).rows) == 10
+	deleted = open(fixtures.get('bulk-del', 1000).path).read().split()
+	assert len(deleted) == 100 and set(deleted) <= set(plain)
+
+
+def test_checksum_digests_are_correct(tmp_path):
+	lines = open(tb.Fixtures(str(tmp_path), 1).get('checksum', 3000).path, 'rb').read().split(b'\n')[:-1]
+	for algo, digest in (('crc32', lambda data: '%08x' % (zlib.crc32(data) & 0xffffffff)),
+			('sha256', lambda data: hashlib.sha256(data).hexdigest())):
+		marker = ('#_checksum_%s_#' % algo).encode()
+		at = [i for i, line in enumerate(lines) if line.split(b'\t')[0] == marker]
+		assert len(at) >= 3 and lines[at[0]] == marker + b'\t'
+		for previous, current in zip(at, at[1:]):
+			segment = b''.join(line + b'\n' for line in lines[previous + 1:current])
+			assert lines[current].split(b'\t')[1].decode() == digest(segment)
+
+
+def test_planned_fixtures():
+	params = tb.SUITES['quick']
+	assert tb.planned_fixtures(params, ('perop',)) == [('plain', 10000)]
+	planned = tb.planned_fixtures(params, tb.FAMILIES)
+	assert len(planned) == len(set(planned))
+	assert ('bulk-new', 1000) in planned and ('multipart', 10000) in planned
+
+
