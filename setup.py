@@ -15,9 +15,6 @@ setup(
 			'tsvz = TSVZ:__main__',
         ],
     },
-    install_requires=[
-        'argparse',
-    ],
     extras_require={
         'completion': [
             'argcomplete',
