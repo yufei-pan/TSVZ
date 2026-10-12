@@ -2007,9 +2007,10 @@ def _gzipUnpad(region):
 	try:
 		inflater.decompress(stripped[start:])
 		if not inflater.eof:  # its last bytes may be zero bytes of its own
-			# Fed only zeros, compressed data can end only inside a final stored block (65535 bytes, after a
-			# header of at most 5); anywhere else it fails or never ends. So 65544 zeros give the whole answer.
-			zeros = min(zeros, 65544)
+			# Fed only zeros, compressed data in a Huffman block ends within a few hundred bytes, fails or
+			# never ends; in a stored block it can end only if the block is final, after its NLEN (zero only
+			# when LEN is 65535) and up to 65535 bytes of data. So 65537 zeros give the whole answer.
+			zeros = min(zeros, 65537)
 			fed = 0
 			while fed < zeros:  # in pieces, with bounded output
 				piece = b'\0' * min(1 << 16, zeros - fed)

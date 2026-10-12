@@ -1710,6 +1710,16 @@ def test_spec_gzip_unpad_keeps_every_zero_byte_the_compressed_data_needs():
 	assert tsvzconform._gzip_unpad(region) == TSVZ._gzipUnpad(region)
 
 
+def test_spec_gzip_unpad_keeps_the_longest_zero_run_a_member_can_own():
+	# A final stored block of 65535 bytes has NLEN 0: its last 65537 bytes can all be zero, across two probe pieces.
+	header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff'
+	stored = b'\x01\xff\xff' + b'\0\0' + b'\0' * 65535
+	region = header + stored + b'\0' * 100  # no trailer: cut short, then padding
+	assert len(TSVZ._gzipUnpad(region)) == len(header + stored)
+	import tsvzconform
+	assert tsvzconform._gzip_unpad(region) == TSVZ._gzipUnpad(region)
+
+
 def test_spec_decode_alone_tells_a_cut_member_from_a_corrupt_one():
 	member = gzip.compress(b''.join(b'k%05d\tv\n' % i for i in range(3000)))
 	cutShort, out, error = TSVZ._decodeAlone(member[:-8], 'gz')
