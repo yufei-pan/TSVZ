@@ -569,6 +569,8 @@ if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
 if mode == 'ttyhang' and op == 'read' and os.isatty(1):
 	time.sleep(40)
+if mode == 'canon' and store:
+	args[args.index(store)] = os.path.realpath(store)
 if mode == 'freshpart' and op == 'serve':
 	open(store, 'ab').close()
 	open(store + '.0192a3b4c5d67e8f9a0b1c2d3e4f5099', 'ab').close()
@@ -873,6 +875,16 @@ def test_a_work_directory_with_spaces_and_non_ascii(small_corpus, tmp_path, caps
 	work = tmp_path / 'my work dïr'
 	code, results = run_main(work, REF_COMMAND, '--feature', 'handler', '--only', '9.2,20.2,21.2.4-refuse-symlink')
 	assert code == 0 and len(results) == 10 and all(r['result'] == 'pass' for r in results.values())
+
+
+def test_a_work_directory_reached_through_a_symlink(tmp_path, capsys):
+	"""An implementation may print canonical part paths; {store} must match them (macOS: /var is a symlink)."""
+	real = tmp_path / 'real'
+	real.mkdir()
+	link = tmp_path / 'link'
+	link.symlink_to(real)
+	code, results = run_main(link, fake(tmp_path, 'canon'), '--only', '20.2-parts-of-a-single-file', '--mode', 'files')
+	assert results[('20.2-parts-of-a-single-file', 'files')]['result'] == 'pass' and code == 0
 
 
 def test_a_reused_work_directory(small_corpus, tmp_path, capsys):

@@ -2121,6 +2121,7 @@ def main(argv=None):
 	own_work = opts.work_dir is None
 	work = tempfile.mkdtemp(prefix='tsvzconform-') if own_work else os.path.abspath(opts.work_dir)
 	os.makedirs(work, exist_ok=True)
+	work = os.path.realpath(work)
 	previous = signal.signal(signal.SIGTERM, _interrupt)
 	results = []
 	interrupted = False
