@@ -1,0 +1,14 @@
+{"format": 1, "class": "cli", "cases": [
+{"id": "20.2-parts-in-replay-order", "spec": ["20.2", "17.3", "17.7"], "level": "MUST",
+ "note": "parts lists index, ordinal, path and flags in replay order, skips .rotated parts, and flags the last part active with its codec.",
+ "files": {"s.tsvz": "a\t1\n", "s.tsvz.10.gz": {"b64": "H4sIAAAAAAAA/0vmNOYCAFAwuBMEAAAA"}, "s.tsvz.f": "b\t2\n", "s.tsvz.5.rotated": "r\t9\n"},
+ "steps": [{"op": ["parts"], "stdout": {"lines": [["0", "", "{store}", ""], ["1", "f", "{store}.f", ""], ["2", "10", "{store}.10.gz", "active,gzip"]]}}]},
+{"id": "20.2-parts-names-the-codec", "spec": ["20.2", "16.2"], "level": "MUST",
+ "note": "The codec flag is the codec name, gzip, whichever suffix spelling the file uses.",
+ "store": "s.tsvz.gzip", "files": {"s.tsvz.gzip": {"b64": "H4sIAAAAAAAA/0vkNOQCAFmah4sEAAAA"}},
+ "steps": [{"op": ["parts"], "stdout": {"lines": [["0", "", "{store}", "active,gzip"]]}}]},
+{"id": "20.2-parts-names-the-bzip2-codec", "spec": ["20.2", "16.2"], "level": "MUST", "requires": ["bzip2"],
+ "note": "A .bz2 part is flagged bzip2.",
+ "files": {"s.tsvz": "a\t1\n", "s.tsvz.1.bz2": {"b64": "QlpoOTFBWSZTWQ+M8aoAAAHJAAAwEAAQACAAIZpoM00XPF3JFOFCQD4zxqg="}},
+ "steps": [{"op": ["parts"], "stdout": {"lines": [["0", "", "{store}", ""], ["1", "1", "{store}.1.bz2", "active,bzip2"]]}}]}
+]}
