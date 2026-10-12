@@ -146,17 +146,18 @@ or as a whole gives the same text.
 4.9 **Zero-filled regions.** A crash or a storage failure can leave a run of zero
 bytes where records were, and a later append can follow it. Writers never put a
 zero byte in a record of a `.tsvz`, `.csvz` or `.psvz` part (§13 writes U+0000 as
-`<NUL>`), nor at the start of a record of a `.nsvz` part (a key is never empty). A
-committed line that has one — anywhere, or at its start for `.nsvz` — is
-**zero-fill damage**, handled by the store's corruption policy (§4.10): under
-`recover` the reader reads only the bytes after the last zero byte (for `.nsvz`,
-after the zero bytes the line starts with) as the line; under `skip` it ignores the
-line; under `stop` it stops there.
+`<NUL>`), so a committed line of such a part that has one is **zero-fill damage**,
+handled by the store's corruption policy (§4.10): under `recover` the reader reads
+only the bytes after the last zero byte as the line; under `skip` it ignores the
+line; under `stop` it stops there. Integrity digests (§15) cover the line's raw
+bytes, zero bytes included, whatever the policy does with it. In a `.nsvz` part the
+zero byte is the delimiter, so zero fill cannot be told from data there: it reads
+as empty-key rows, which are ignored (§7.7).
 
 4.10 **Corruption policy.** Damaged data a reader meets — a zero-filled line
 (§4.9), or a compressed member that fails to decode or fails its check (§16.6) —
-is handled as the stateful marker `#_on_corruption_#` (§12.4) in force at that
-point says:
+is handled as the stateful marker `#_on_corruption_#` (§12.4) says, as it is in
+force where the damaged data begins (for a compressed member, at its first byte):
 
    - `recover` (the default): use what can still be read — the bytes of §4.9, or
      what the member decoded before it failed (§16.6) — and warn;
@@ -166,7 +167,9 @@ point says:
      (§16.5): a command-line tool exits with status 1 (§20.6), a handler answers
      as §21.8.5 says, and a tool does not base changes on what it read (a clear,
      a pop). A snapshot (§19) may still rewrite a part from what was read; it
-     SHOULD keep the original bytes first.
+     SHOULD keep the original bytes first, and a command-line `scrub` that does
+     so still exits with status 1, since the data after the stop is then only in
+     that copy.
 
 Recovered data is not verified, and skipped data can hold deletions and marker
 changes, so under `recover` and `skip` the store read can be a state it never had.
@@ -518,7 +521,7 @@ represented by a token only where required by §8.3. Reading inverts writing.
 `<lt>`, every delimiter character as `<sep>`, every line feed as `<LF>`, every
 carriage return as `<CR>`, and every other zero byte as `<NUL>` (in `.nsvz` the
 zero byte is the delimiter, so it is written as `<sep>`); a raw zero byte in a
-record is damage (§4.9). A writer **MUST** encode a `#` as `<#>` when it is the first character of a data key
+`.tsvz`, `.csvz` or `.psvz` record is damage (§4.9). A writer **MUST** encode a `#` as `<#>` when it is the first character of a data key
 (§8.3); elsewhere `#` MAY be written literally. A writer **MUST NOT** emit a bare
 `<`.
 
@@ -748,12 +751,12 @@ in order, as one stream, by these rules:
       (§16.8). Its output is used. Whether a member is complete is known only at
       its end, so a reader holds the member's output until then (or decodes the
       member twice).
-   2. A member that is not complete is **damaged**. The reader looks for the next
-      complete member: the first offset after the damaged member's start where a
-      member of the part's codec begins (gzip `1F 8B 08`, bzip2 `42 5A 68` "BZh",
-      xz `FD 37 7A 58 5A 00`, Zstandard `28 B5 2F FD`) and is complete. It then
-      decodes the damaged member's bytes up to that offset (to the end of the part
-      when there is none) on their own:
+   2. A member that is not complete is **damaged**. Its bytes run to the next
+      offset after its start where a member of the part's codec begins, whether
+      that member is complete or not, or to the end of the part. A member begins
+      with gzip `1F 8B 08`, bzip2 `42 5A 68` ("BZh"), xz `FD 37 7A 58 5A 00` or
+      Zstandard `28 B5 2F FD`. For gzip, zero bytes that end those bytes are
+      padding and are left out. The reader decodes those bytes on their own:
       - when they merely end before the member does, the member is **cut short**,
         as a crash during a write leaves it: its output is used;
       - otherwise the member is **corrupt**: it fails to decode or fails its check.
@@ -763,7 +766,7 @@ in order, as one stream, by these rules:
 
       Unless the reading stops, bytes after the last `\n` before the next member
       are then discarded, as at the end of a part (§4.3), and the reading goes on
-      at the next complete member, if there is one. A writer appends after a
+      at the next member, which may be damaged too. A writer appends after a
       damaged member without repairing it (§16.4).
 
 Zero bytes before a gzip member are padding, as gzip tools treat them: the reader
@@ -1160,7 +1163,7 @@ to standard error. The text of diagnostics is implementation-defined.
 | Status | Meaning |
 |---|---|
 | 0 | The operation completed. Tolerance warnings may have been printed. |
-| 1 | The operation failed or was refused, or its read stopped at damaged data (§4.10). When `clear` or `scrub` is refused, nothing was written. |
+| 1 | The operation failed or was refused, or its read stopped at damaged data (§4.10), a `scrub` that rewrote such a store included. When `clear` or `scrub` is refused, nothing was written. |
 | 2 | Usage error: invalid arguments, unknown operation, unknown option. |
 | 3 | `get`: at least one requested key is missing. |
 | 4 | `verify`: at least one checksum mismatch. |

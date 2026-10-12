@@ -1,0 +1,7 @@
+{"format": 1, "class": "writer", "cases": [
+{"id": "4.10-scrub-of-a-stopped-store-rewrites-and-exits-1", "spec": ["4.10", "19.2", "20.6"], "level": "MUST",
+ "note": "Under stop, scrub rewrites what was read but exits 1: what followed the stop is then only in the copy it kept.",
+ "files": {"s.tsvz": "#_on_corruption_#\tstop\na\t1\n\u0000\u0000c\t3\nd\t4\n"},
+ "steps": [{"op": ["scrub"], "exit": 1}],
+ "after": {"rows": [["a", "1"]]}}
+]}

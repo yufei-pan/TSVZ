@@ -33,7 +33,7 @@
  "expect": {"read": [["a", "x"], ["b", "y"], ["c", "z"]], "len": 3}},
 {"id": "16.6-bzip2-corrupt-member-is-recovered", "spec": ["16.6", "4.10"], "level": "MUST", "requires": ["bzip2"],
  "note": "A bzip2 member that fails its check is recovered by default: what it decoded before the failure is used.",
- "store": "s.tsvz.bz2", "files": {"s.tsvz.bz2": {"b64": "QlpoOTFBWSZTWQQH8tUAAAFBgAAwIAAAQCAAIZpoM00yvF3JFOFCQBAfy1RCWmg5MUFZJlNZtmmBZwAAAUGAADAQAAAgIAAhmmgzTTK8XckU4UJC2aYFnUJaaDkxQVkmU1kY70QDAAABQYAAMAgAABAgACGaaDNNMrxdyRThQkBjvRAM"}},
+ "store": "s.tsvz.bz2", "files": {"s.tsvz.bz2": {"b64": "QlpoOTFBWSZTWQQH8tUAAAFBgAAwIAAAQCAAIZpoM00yvF3JFOFCQBAfy1RCWmg5MUFZJlNZtmmBZwAAAUGAADAQAAAgIAAhmmgzTTK8XckU4UJC2aYEnEJaaDkxQVkmU1kY70QDAAABQYAAMAgAABAgACGaaDNNMrxdyRThQkBjvRAM"}},
  "expect": {"read": [["a", "x"], ["b", "y"], ["c", "z"]], "len": 3}},
 {"id": "16.6-xz-corrupt-member-is-recovered", "spec": ["16.6", "4.10"], "level": "MUST", "requires": ["xz"],
  "note": "A xz member that fails its check is recovered by default: what it decoded before the failure is used.",
@@ -62,5 +62,17 @@
 {"id": "16.6-unfinished-line-before-a-damaged-member-is-dropped", "spec": ["16.6", "4.3", "4.10"], "level": "MUST",
  "note": "When a damaged member is skipped, the line the member before it left unfinished is dropped, not joined to the next member.",
  "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i7MzC7gSOSu4kjgrAQXWKSQeAAAAH4sIAAAAAAAC/wvkLOQCAP0t1YsEAAABH4sIAAAAAAAC/0vmrOICABzEAzIEAAAA"}},
- "expect": {"read": [["a", "x"], ["c", "z"]], "len": 2}}
+ "expect": {"read": [["a", "x"], ["c", "z"]], "len": 2}},
+{"id": "16.6-cut-member-before-zero-padding-is-cut-not-corrupt", "spec": ["16.6", "4.10"], "level": "MUST",
+ "note": "A member cut short, then zero padding, then a member: the cut one keeps its lines and is not corrupt, so even stop reads on.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i0vyC7gSOSu4AEUimSkbAAAAH4sIAAAAAAAC/0virOQCAAAAAAAAAAAAAAAAAAAAAAAfiwgAAAAAAAL/S+as4gIAHMQDMgQAAAA="}},
+ "expect": {"read": [["a", "x"], ["b", "y"], ["c", "z"]], "len": 3}},
+{"id": "16.6-consecutive-cut-members-each-keep-their-lines", "spec": ["16.6", "4.10"], "level": "MUST",
+ "note": "Each damaged member is judged on its own, up to the next member start: two cut members in a row both keep their lines.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i7MzC7gSOSu4APg00u8bAAAAH4sIAAAAAAAC/0virOQCAB+LCAAAAAAAAv9L4SznAgAfiwgAAAAAAAL/S+as4gIAHMQDMgQAAAA="}},
+ "expect": {"read": [["a", "x"], ["b", "y"], ["d", "w"], ["c", "z"]], "len": 4}},
+{"id": "4.10-a-member-is-judged-by-the-policy-in-force-before-it", "spec": ["4.10", "16.6"], "level": "MUST",
+ "note": "A policy marker inside a corrupt member does not decide for that member: the policy in force at its first byte does.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0vkrOACABVuPKoEAAAAH4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i0vyC7iyOcu4AK/vp9gbAAABH4sIAAAAAAAC/0vmrOICABzEAzIEAAAA"}},
+ "expect": {"read": [["a", "x"], ["k", "v"], ["c", "z"]], "len": 3}}
 ]}

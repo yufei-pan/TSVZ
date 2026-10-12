@@ -293,14 +293,13 @@ class Replay(object):
 
 	def feed_line(self, raw):
 		"""Apply one committed line's bytes: zero-fill damage by the policy (§4.9-§4.10), U+FFFD for bad UTF-8 (§4.8)."""
-		damaged = raw.startswith(b'\0') if self.delimiter == '\0' else b'\0' in raw
-		if damaged:
+		if self.delimiter != '\0' and b'\0' in raw:  # in .nsvz the zero byte is the delimiter: no zero fill
 			if self.on_corruption == 'stop':
 				self.stopped = True
 				return
 			if self.on_corruption == 'skip':
 				return
-			raw = raw.lstrip(b'\0') if self.delimiter == '\0' else raw[raw.rfind(b'\0') + 1:]
+			raw = raw[raw.rfind(b'\0') + 1:]
 		self.feed_text(raw.decode('utf-8', 'replace'))
 
 	def feed_part(self, items):
@@ -410,18 +409,6 @@ def _member(data, start, codec):
 	return 'short', out, None
 
 
-def _next_complete(data, start, codec):
-	"""The first complete member at or after ``start`` (§16.6 rule 2): (offset, output, end), or None."""
-	magic = MEMBER_MAGIC[codec]
-	pos = data.find(magic, start)
-	while pos >= 0:
-		status, out, end = _member(data, pos, codec)
-		if status == 'complete':
-			return pos, out, end
-		pos = data.find(magic, pos + 1)
-	return None
-
-
 def _decode_alone(raw, codec):
 	"""A damaged member's bytes decoded on their own (§16.6 rule 2): ('short', output) when they merely end
 	before the member does, else ('corrupt', the output decoded before the failure), fed a byte at a time so
@@ -437,7 +424,7 @@ def _decode_alone(raw, codec):
 		raise
 	except Exception:
 		return CORRUPT, b''.join(out)
-	return ('short' if not decompressor.eof else CORRUPT), b''.join(out)
+	return 'short', b''.join(out)  # ended early, or decoded whole on its own: used either way
 
 
 def decompress_items(data, codec):
@@ -454,13 +441,17 @@ def decompress_items(data, codec):
 			items.append(chunk)
 			pos = end
 			continue
-		found = _next_complete(data, pos + 1, codec)
-		kind, out = _decode_alone(data[pos:found[0] if found else len(data)], codec)
+		# A damaged member's bytes run to the next member start, complete or not (§16.6 rule 2).
+		following = data.find(MEMBER_MAGIC[codec], pos + 1)
+		region = data[pos:following if following >= 0 else len(data)]
+		if codec == 'gzip':
+			region = region.rstrip(b'\0')  # zero padding before the next member
+		kind, out = _decode_alone(region, codec)
 		items.append(out if kind == 'short' else (CORRUPT, out))
-		if found is None:
+		if following < 0:
 			break
-		items.extend([BREAK, found[1]])
-		pos = found[2]
+		items.append(BREAK)
+		pos = following
 	return items
 
 

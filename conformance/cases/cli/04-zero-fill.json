@@ -1,0 +1,6 @@
+{"format": 1, "class": "cli", "cases": [
+{"id": "4.9-a-checksum-covers-the-zero-bytes", "spec": ["4.9", "15.4", "20.2"], "level": "MUST",
+ "note": "A digest covers a zero-filled line as written, zero bytes included, though recover reads only what follows them.",
+ "files": {"s.tsvz": "#_checksum_crc32_#\na\t1\n\u0000\u0000c\t3\n#_checksum_crc32_#\taee75282\n"},
+ "steps": [{"op": ["verify"], "stdout": "empty"}, {"op": ["read"], "stdout": {"rows": [["a", "1"], ["c", "3"]]}}]}
+]}
