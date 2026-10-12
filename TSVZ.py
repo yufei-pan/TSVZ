@@ -4459,6 +4459,10 @@ _SERVE_CHECK_BYTES = 64
 _SERVE_RACY_SECONDS = 2.0
 
 
+#: Compression suffix -> the codec name ``parts`` prints (spec §16.2, §20.2).
+_CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
+
+
 def _partRows(store, reporter):
 	"""Rows for ``parts`` (spec §20.2): index, ordinal as the file name spells it, path, flags."""
 	if _isSpecPath(store):
@@ -4474,7 +4478,7 @@ def _partRows(store, reporter):
 			if name.codec:
 				base = base[:-len(name.codec) - 1]
 			ordinal = base.rpartition('.')[2]
-		flags = (['active'] if path == active else []) + ([name.codec] if name.codec else [])
+		flags = (['active'] if path == active else []) + ([_CODEC_NAMES.get(name.codec, name.codec)] if name.codec else [])
 		rows.append([str(index), ordinal, path, ','.join(flags)])
 	return rows
 

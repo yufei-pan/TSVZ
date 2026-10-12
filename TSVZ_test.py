@@ -2588,7 +2588,7 @@ def test_cli_parts(tmp_path):
 	_touch(base + '.0190c3a1', b'b\t2\n')
 	_touch(base + '.0a.gz', gzip.compress(b'c\t3\n'))
 	_touch(base + '.2.rotated', b'')
-	assert _run('parts', base) == (0, '0\t\t{0}\t\n1\t0a\t{0}.0a.gz\tgz\n2\t0190c3a1\t{0}.0190c3a1\tactive\n'.format(base), '')
+	assert _run('parts', base) == (0, '0\t\t{0}\t\n1\t0a\t{0}.0a.gz\tgzip\n2\t0190c3a1\t{0}.0190c3a1\tactive\n'.format(base), '')
 	status, out, _ = _run('parts', base, '--format', 'table')
 	assert status == 0 and 'ordinal' in out and '|' in out
 	numbered = str(tmp_path / 'n.tsvz')
@@ -2599,7 +2599,7 @@ def test_cli_parts(tmp_path):
 	assert _run('parts', loose) == (0, '0\t\t{}\tactive\n'.format(loose), '')
 	packed = str(tmp_path / 'y.tsv.gz')
 	_touch(packed, gzip.compress(b'k\tv\n'))
-	assert _run('parts', packed) == (0, '0\t\t{}\tactive,gz\n'.format(packed), '')
+	assert _run('parts', packed) == (0, '0\t\t{}\tactive,gzip\n'.format(packed), '')
 	status, out, err = _run('parts', str(tmp_path / 'none.tsvz'))
 	assert (status, out) == (1, '') and 'no such store' in err
 

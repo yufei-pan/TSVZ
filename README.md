@@ -239,7 +239,6 @@ The conformance cases these deviations make fail are listed in
 - §13: `<CR>` is neither written nor read yet. A carriage return is written raw, so one that ends a row's last value is lost, and `<CR>` in a file reads as text.
 - §10.4: marker values have trailing whitespace stripped, so `#_strip_trailing_whites_#` with `false ` turns stripping off; the spec makes that value invalid (§12.4.5).
 - §16.5: before Python 3.14 a `.zst` part is read as plain bytes instead of failing.
-- §20.2: `parts` names a compressed part's codec by its suffix (`gz`), not the codec name (`gzip`).
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
