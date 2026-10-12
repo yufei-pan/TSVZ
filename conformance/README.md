@@ -84,7 +84,7 @@ FAIL 9.2-trailing-delimiter-is-not-a-tombstone   MUST §9.2 §14.2
   key<TAB> sets a present-empty cell; only a lone key deletes.
   files   s.tsvz = "a\tx\na\t\n"
   step 1  ./tsvz --format records -q read /tmp/tsvzconform-k3x9/9.2-…/s.tsvz
-          row 1 missing: expected ["a", ""] (got 0 rows, expected 1)
+          row 1 missing: expected ["a"] (got 0 rows, expected 1)
   kept    /tmp/tsvzconform-k3x9/9.2-trailing-delimiter-is-not-a-tombstone
   rerun   python3 tsvzconform.py --impl ./tsvz --only 9.2-trailing-delimiter-is-not-a-tombstone
 ```
