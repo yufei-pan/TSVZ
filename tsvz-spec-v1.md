@@ -747,13 +747,14 @@ scheme throughout.
 
 17.7 **Writer recommendations.**
 
-   - On startup, a long-running writer, such as a handler (§21), **SHOULD** open a
-     fresh part named with a new ordinal and leave existing parts untouched
-     (treating them as immutable).
-   - A command-line tool (§20) writes once per invocation, so it appends to the
-     store's last part in replay order (§17.3), which is the unnumbered file when
-     that is the only part. That part is the store's **active part** for `parts`
-     and `clear` (§20.2).
+   - A command-line tool (§20) and a handler (§21) append to the store's last part
+     in replay order (§17.3), which is the unnumbered file when that is the only
+     part, so a one-file store stays one file. That part is the store's **active
+     part** for `parts` and `clear` (§20.2). A tool starts a new part only when
+     asked to, through an option or an operation of its own (§20.7.2).
+   - On startup, another long-running writer, such as an application that embeds
+     a TSVZ writer, **SHOULD** open a fresh part named with a new ordinal and leave
+     existing parts untouched (treating them as immutable).
    - A writer that is not continuously running **SHOULD** keep the active part
      uncompressed; a long-running writer **MAY** stream-append to a compressed
      active part (§16.4).

@@ -1890,8 +1890,9 @@ def check_atomic_pop(cx):
 	statuses = sorted(r.status for r in results)
 	if statuses != [0] + [3] * 7:
 		problems.append('statuses %s, expected one 0 and seven 3' % statuses)
-	with open(store, 'rb') as f:
-		tombstones = f.read().split(b'\n').count(b'k')
+	tombstones = 0
+	for part in store_parts(store):
+		tombstones += read_part(part).split(b'\n').count(b'k')
 	if tombstones != 1:
 		problems.append('%d tombstones for k, expected 1' % tombstones)
 	return problems

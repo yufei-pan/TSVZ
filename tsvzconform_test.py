@@ -542,6 +542,9 @@ if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
 if mode == 'ttyhang' and op == 'read' and os.isatty(1):
 	time.sleep(40)
+if mode == 'freshpart' and op == 'serve':
+	open(store, 'ab').close()
+	open(store + '.0192a3b4c5d67e8f9a0b1c2d3e4f5099', 'ab').close()
 if mode == 'refuse' and store and os.path.lexists(store + '.serve'):
 	sys.stderr.write('refusing: there is a pointer file\n')
 	sys.exit(1)
@@ -951,6 +954,17 @@ def test_a_long_work_directory_path(tmp_path, capsys):
 	work = tmp_path / ('long' * 30)
 	code, results = run_main(work, REF_COMMAND, '--only', '21.2.4-refuse-wrong-first-line,21.13.1-clean-stop', '--feature', 'handler')
 	assert code == 0 and len(results) == 2 and all(r['result'] == 'pass' for r in results.values())
+
+
+def test_a_handler_that_opens_a_fresh_part_fails(tmp_path, capsys):
+	"""§17.7: a handler appends to the store's last part, so a one-file store stays one file."""
+	code, results = run_main(tmp_path, fake(tmp_path, 'freshpart'), '--class', 'handler',
+		'--only', '17.7,20.2-parts-of-a-single-file,21.8.2')
+	assert results[('17.7-a-handler-keeps-a-one-file-store-one-file', 'socket')]['result'] == 'FAIL'
+	assert results[('17.7-a-handler-appends-to-the-last-part', 'socket')]['result'] == 'FAIL'
+	assert results[('20.2-parts-of-a-single-file', 'socket')]['result'] == 'FAIL'
+	assert results[('21.8.2-concurrent-pop-is-atomic', 'files')]['result'] == 'pass'
+	assert code == 1
 
 
 def test_the_reference_matches_its_baseline(tmp_path, capsys):

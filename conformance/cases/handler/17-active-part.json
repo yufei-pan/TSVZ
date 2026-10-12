@@ -1,0 +1,12 @@
+{"format": 1, "class": "handler", "cases": [
+{"id": "17.7-a-handler-keeps-a-one-file-store-one-file", "spec": ["17.7", "21.8.4"], "level": "MUST",
+ "note": "A handler appends to the store's last part, here the file itself, and opens no new part.",
+ "files": {"s.tsvz": "a\tx\n"},
+ "steps": [{"request": ["set", "b", "y"]}, {"request": ["delete", "a"]}],
+ "after": {"rows": [["b", "y"]], "bytes": ["last-part-only", "encoded"]}},
+{"id": "17.7-a-handler-appends-to-the-last-part", "spec": ["17.7", "21.8.4"], "level": "MUST",
+ "note": "In a multi-part store a handler appends to the last part in replay order and changes no other part.",
+ "files": {"s.tsvz": "a\t1\n", "s.tsvz.f": "b\t2\n", "s.tsvz.10": "c\t3\n"},
+ "steps": [{"request": ["set", "d", "4"]}, {"request": ["delete", "a"]}],
+ "after": {"rows": [["b", "2"], ["c", "3"], ["d", "4"]], "bytes": ["last-part-only", "encoded"]}}
+]}
