@@ -849,7 +849,10 @@ append-only (§3.1).
       c. no tombstones and no superseded values, and no comments, except that the
          snapshot MAY begin with the store's header comment — the first committed
          line of its first part, when that line is a comment — placed before the
-         markers of (a).
+         markers of (a);
+      d. when the rows of (b) are written under marker state other than the final
+         state (§19.4), the final markers again, after the rows, so that the
+         store's final marker state is preserved.
    4. Once _S_ is durable, apply the `#_rotate_#` action (§19.5) to the subsumed
       prefix.
    5. The worker exits. No coordination with the live process is required: the live
@@ -863,7 +866,9 @@ recommended (§17.6). If the interval cannot be guaranteed, a producer MAY inste
 quiesce writes for the duration of the snapshot.
 
 19.4 **Fidelity (normative).** A snapshot **MUST** reproduce the exact observable
-read result of the store it replaces. When forward-only marker state
+read result of the store it replaces, and **MUST** leave the same final marker
+state, so that records appended after it are read as they would have been without
+it. When forward-only marker state
 (`#_defaults_#`, `#_strip_trailing_whites_#`, `#_fill_empty_with_default_#`) varied
 over the life of the subsumed prefix such that re-emitting only the final state
 would change any live key's resolved value, the snapshot **MUST** compensate — by
@@ -871,8 +876,9 @@ baking resolved values into the affected rows and/or by choosing marker state th
 preserves them. In the common case where this state is set once and never changed,
 the snapshot re-emits that state and keeps rows sparse. A simple always-correct
 strategy is to emit `#_strip_trailing_whites_#` `false` and
-`#_fill_empty_with_default_#` `false` and write fully resolved value cells, leaving
-`#_defaults_#` only as a fallback for absent trailing columns.
+`#_fill_empty_with_default_#` `false`, write fully resolved value cells, leaving
+`#_defaults_#` only as a fallback for absent trailing columns, and then emit the
+final markers after the rows (§19.2.3d).
 
 19.5 **`#_rotate_#` action** for the now-superseded prefix:
 
@@ -888,8 +894,8 @@ strategy is to emit `#_strip_trailing_whites_#` `false` and
 
 19.6 **Lossiness.** A snapshot is lossy with respect to history: comments (other
 than a header comment kept by §19.2), intermediate values, and tombstone records
-are discarded. The live data state and
-the active marker state are preserved exactly (subject to §19.4).
+are discarded. The live data state and the final marker state are preserved
+exactly (§19.4).
 
 19.7 **Lazy / offset-based readers.** Because the prefix is immutable, the live
 process and the snapshot worker MAY read it concurrently with no coordination.
