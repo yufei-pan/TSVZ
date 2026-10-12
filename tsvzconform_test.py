@@ -615,3 +615,151 @@ def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
 	check = next(c for c in tc.CHECKS if c.id == '21.2.4-refuse-wrong-first-line')
 	result = tc.run_case(check, 'files', context(tmp_path / 'work', fake(tmp_path, 'decoy')))
 	assert result.result == tc.FAIL and 'must not use' in result.detail[0]
+
+
+# --- selection, report and main --------------------------------------------------------------
+
+def test_matches_only():
+	assert tc.matches_only('9.2-lone-key-deletes', ())
+	assert tc.matches_only('9.2-lone-key-deletes', ('9.2',))
+	assert tc.matches_only('9.2.1-x', ('9.2',))
+	assert tc.matches_only('9.2-lone-key-deletes', ('9',))
+	assert not tc.matches_only('9.20-x', ('9.2',))
+	assert tc.matches_only('13.4-x', ('13.*',))
+	assert tc.matches_only('13.4-x', ('13.4-x',))
+	assert not tc.matches_only('13.4-x', ('14',))
+
+
+def test_select_applies_classes_modes_claims_and_level():
+	reader = tc.validate_case({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}}, 'reader', 'x')
+	needs = tc.validate_case({'id': '15.3-x', 'spec': ['15.3'], 'level': 'MUST', 'note': 'n', 'requires': ['crc32'], 'expect': {'len': 0}}, 'reader', 'x')
+	unless = tc.validate_case({'id': '15.3-y', 'spec': ['15.3'], 'level': 'MUST', 'note': 'n', 'requires': ['!crc32'], 'expect': {'len': 0}}, 'reader', 'x')
+	should = tc.validate_case({'id': '20.2-s', 'spec': ['20.2'], 'level': 'SHOULD', 'note': 'n', 'expect': {'len': 0}}, 'reader', 'x')
+	handler = tc.validate_case({'id': '21.8-x', 'spec': ['21.8'], 'level': 'MUST', 'note': 'n', 'steps': [{'raw': 'len\n'}]}, 'handler', 'x')
+	cases = [reader, needs, unless, should, handler]
+
+	def pick(**kw):
+		opts = argparse.Namespace(only=(), level='all', classes=tc.CLASSES, modes=tc.MODES, features=frozenset())
+		vars(opts).update(kw)
+		runs, skipped = tc.select(cases, opts)
+		return sorted((c.id, m) for c, m in runs), sorted((r.case.id, r.mode, r.detail[0]) for r in skipped)
+
+	runs, skipped = pick()
+	assert runs == [('15.3-y', 'files'), ('20.2-s', 'files'), ('9.2-x', 'files')]
+	assert skipped == [('15.3-x', 'files', 'crc32 not claimed'), ('21.8-x', 'socket', 'handler not claimed')]
+	runs, skipped = pick(features=frozenset(['crc32', 'handler']), level='must')
+	assert ('15.3-x', 'socket') in runs and ('9.2-x', 'forwarded') in runs and ('21.8-x', 'socket') in runs
+	assert ('15.3-y', 'files', 'applies when crc32 is not claimed') in skipped and not [r for r in runs if r[0] == '20.2-s']
+	runs, _ = pick(features=frozenset(['handler']), classes=('reader',))
+	assert runs == [('15.3-y', 'files'), ('20.2-s', 'files'), ('9.2-x', 'files')]
+
+
+SMALL_CORPUS = {
+	'reader': [DELETES,
+		{'id': '9.2-trailing-delimiter-is-not-a-tombstone', 'spec': ['9.2'], 'level': 'MUST', 'note': 'key<TAB> is a present-empty cell.',
+			'files': {'s.tsvz': 'a\tx\na\t\n'}, 'expect': {'read': [['a', '']]}}],
+	'writer': [{'id': '19.4-scrub-twice', 'spec': ['19.4'], 'level': 'MUST', 'note': 'Scrubbing twice changes nothing a reader sees.',
+			'files': {'s.tsvz': '#_defaults_#\td1\td2\na\tx\n#_strip_trailing_whites_#\tfalse\nb\ty \n'},
+			'steps': [{'op': ['scrub']}, {'op': ['scrub']}], 'after': {'fidelity': 'full', 'bytes': ['snapshot-layout', 'same-file']}}],
+	'cli': [{'id': '20.2-len', 'spec': ['20.2'], 'level': 'MUST', 'note': 'len prints the number of live keys.',
+			'files': {'s.tsvz': 'a\t1\nb\t2\na\nc\t3\n'}, 'steps': [{'op': ['len'], 'stdout': {'text': '2\n'}}]}],
+}
+
+
+@pytest.fixture
+def small_corpus(tmp_path, monkeypatch):
+	"""A few cases in a case directory of their own, used by main()."""
+	for cls, cases in SMALL_CORPUS.items():
+		folder = tmp_path / 'cases' / cls
+		folder.mkdir(parents=True)
+		(folder / '01.json').write_text(json.dumps({'format': 1, 'class': cls, 'cases': cases}))
+	monkeypatch.setattr(tc, 'CASES_DIR', str(tmp_path / 'cases'))
+
+
+def run_main(tmp_path, command, *extra):
+	out = tmp_path / 'report.json'
+	argv = ['--impl', command, '--work-dir', str(tmp_path / 'work'), '--json', str(out), '-j', '4'] + list(extra)
+	code = tc.main(argv)
+	with open(str(out), encoding='utf-8') as f:
+		results = json.load(f)['results']
+	return code, {(r['id'], r['mode']): r for r in results}
+
+
+@pytest.mark.parametrize('mode, case_id, words', [
+	('drop', '9.2-lone-key-deletes', 'missing'),
+	('nodelim', '9.2-trailing-delimiter-is-not-a-tombstone', 'tombstone'),
+	('exit0', '9.2-lone-key-deletes', 'exit status 0, expected 3'),
+	('crash', '20.2-len', 'exit status 1, expected 0'),
+	('rename', '19.4-scrub-twice', 'replaced by another file'),
+	('nomarkers', '19.4-scrub-twice', 'final marker state'),
+])
+def test_the_runner_catches_a_misbehaving_implementation(small_corpus, tmp_path, capsys, mode, case_id, words):
+	code, results = run_main(tmp_path, fake(tmp_path, mode), '--only', case_id, '--mode', 'files')
+	result = results[(case_id, 'files')]
+	assert result['result'] == 'FAIL' and words in ' '.join(result['detail'])
+	assert code == 1
+	out = capsys.readouterr().out
+	assert 'FAIL ' + case_id in out and 'rerun   python3' in out and 'kept    ' in out
+	assert 'conformant: ' in out and 'failed cases are kept in' in out
+
+
+def test_the_reference_passes_the_small_corpus(small_corpus, tmp_path, capsys):
+	code, results = run_main(tmp_path, REF_COMMAND, '--feature', 'handler')
+	assert code == 0 and {r['result'] for r in results.values()} <= {'pass', 'skip'}
+	assert ('9.2-lone-key-deletes', 'socket') in results and ('20.2-len', 'forwarded') in results
+	assert 'conformant: reader ✓   writer ✓   cli ✓   handler ✓' in capsys.readouterr().out
+	assert not os.path.exists(str(tmp_path / 'work' / '9.2-lone-key-deletes'))
+
+
+def test_a_hang_is_a_timeout_and_leaves_nothing_running(small_corpus, tmp_path, capsys, monkeypatch):
+	monkeypatch.setenv('FAKE_PIDFILE', str(tmp_path / 'pid'))
+	code, results = run_main(tmp_path, fake(tmp_path, 'hang'), '--only', '9.2-lone-key-deletes', '--mode', 'files', '--timeout', '2')
+	assert code == 1 and 'timed out' in ' '.join(results[('9.2-lone-key-deletes', 'files')]['detail'])
+	pid = int((tmp_path / 'pid').read_text())
+	time.sleep(0.2)
+	with pytest.raises(ProcessLookupError):
+		os.kill(pid, 0)
+
+
+def test_a_work_directory_with_spaces_and_non_ascii(small_corpus, tmp_path, capsys):
+	work = tmp_path / 'my work dïr'
+	code, results = run_main(work, REF_COMMAND, '--feature', 'handler', '--only', '9.2,20.2,21.2.4-refuse-symlink')
+	assert code == 0 and len(results) == 10 and all(r['result'] == 'pass' for r in results.values())
+
+
+def test_a_reused_work_directory(small_corpus, tmp_path, capsys):
+	first, _ = run_main(tmp_path, fake(tmp_path, 'drop'), '--only', '9.2-lone-key-deletes', '--mode', 'files')
+	assert first == 1 and os.path.isdir(str(tmp_path / 'work' / '9.2-lone-key-deletes'))
+	again, results = run_main(tmp_path, REF_COMMAND, '--only', '9.2-lone-key-deletes', '--mode', 'files')
+	assert again == 0 and results[('9.2-lone-key-deletes', 'files')]['result'] == 'pass'
+
+
+def test_main_usage_list_and_probe(small_corpus, tmp_path, capsys):
+	assert tc.main(['--impl', 'x', '--feature', 'nope']) == 2
+	capsys.readouterr()
+	assert tc.main(['--list', '--only', '9.2']) == 0
+	listed = [line.split('\t') for line in capsys.readouterr().out.splitlines()]
+	assert [row[0] for row in listed] == ['9.2-lone-key-deletes', '9.2-trailing-delimiter-is-not-a-tombstone']
+	assert tc.main(['--list', '--class', 'handler', '--level', 'must']) == 0
+	listed = [line.split('\t') for line in capsys.readouterr().out.splitlines()]
+	assert listed and all(row[1] == 'handler' and row[2] == 'MUST' for row in listed)
+	assert tc.main(['--impl', '%s -c "import sys; sys.exit(1)"' % shlex.quote(sys.executable), '--work-dir', str(tmp_path)]) == 1
+	assert 'failed its -V probe' in capsys.readouterr().err
+	assert tc.main(['--impl', '/nonexistent/tsvz']) == 1
+	assert 'cannot run' in capsys.readouterr().err
+
+
+def test_an_interrupt_prints_the_results_so_far(tmp_path):
+	env = dict(os.environ, FAKE_PIDFILE=str(tmp_path / 'pid'))
+	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'tsvzconform.py'), '--impl', fake(tmp_path, 'hang'),
+		'--only', '20.4.3', '--timeout', '60', '--work-dir', str(tmp_path / 'work')],
+		cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+	deadline = time.time() + 20
+	while not (tmp_path / 'pid').exists() and time.time() < deadline:
+		time.sleep(0.1)
+	proc.send_signal(signal.SIGINT)
+	out, _ = proc.communicate(timeout=30)
+	assert proc.returncode == 130
+	assert b'tsvzconform ' + tc.version.encode() in out
+	with pytest.raises(ProcessLookupError):
+		os.kill(int((tmp_path / 'pid').read_text()), 0)

@@ -1876,3 +1876,263 @@ def check_socket_access(cx):
 	if not closed:
 		problems.append('%s and every directory above it can be reached by others' % path)
 	return problems
+
+
+# ---------------------------------------------------------------------------
+# Selection, the run, and the report
+# ---------------------------------------------------------------------------
+
+def matches_only(case_id, patterns):
+	"""True when `case_id` matches one of the --only patterns (or there are none)."""
+	if not patterns:
+		return True
+	clause = case_id.split('-', 1)[0]
+	for pattern in patterns:
+		if pattern == case_id or fnmatch.fnmatchcase(case_id, pattern):
+			return True
+		if _CLAUSE_RE.match(pattern) and (clause == pattern or clause.startswith(pattern + '.')):
+			return True
+	return False
+
+
+def select(cases, opts):
+	"""(runs, skipped): the (case, mode) pairs to run, and Results for those skipped by claims."""
+	runs = []
+	skipped = []
+	for case in cases:
+		if not matches_only(case.id, opts.only):
+			continue
+		if opts.level == 'must' and case.level != 'MUST':
+			continue
+		for mode in case_modes(case):
+			cls = case.cls if mode == 'files' else 'handler'
+			if cls not in opts.classes or mode not in opts.modes:
+				continue
+			if mode != 'files' and 'handler' not in opts.features:
+				if case.cls == 'handler':
+					skipped.append(Result(case, mode, SKIP, ['handler not claimed']))
+				continue
+			reason = None
+			for need in case.requires:
+				if need.startswith('!') and need[1:] in opts.features:
+					reason = 'applies when %s is not claimed' % need[1:]
+				elif not need.startswith('!') and need not in opts.features:
+					reason = '%s not claimed' % need
+			if reason:
+				skipped.append(Result(case, mode, SKIP, [reason]))
+			else:
+				runs.append((case, mode))
+	return runs, skipped
+
+
+def run_all(runs, ctx, jobs, fail_fast=False, progress=None):
+	"""Run every (case, mode), `jobs` at a time; results come back in the order of `runs`."""
+	results = [None] * len(runs)
+	stop_early = threading.Event()
+
+	def one(index):
+		case, mode = runs[index]
+		if STOP.is_set() or stop_early.is_set():
+			return
+		result = run_case(case, mode, ctx)
+		results[index] = result
+		if fail_fast and result.result in (FAIL, ERROR):
+			stop_early.set()
+		if progress:
+			progress(result)
+
+	with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+		futures = [pool.submit(one, i) for i in range(len(runs))]
+		try:
+			for future in futures:
+				while True:
+					try:
+						future.result(timeout=0.2)
+						break
+					except concurrent.futures.TimeoutError:
+						continue
+		except KeyboardInterrupt:
+			STOP.set()
+			kill_live_groups()
+			for future in futures:
+				future.cancel()
+			raise
+	return [r for r in results if r is not None]
+
+
+def rerun_command(impl, result, features):
+	prog = os.path.relpath(os.path.abspath(__file__))
+	argv = ['python3', prog, '--impl', impl.command, '--only', result.case.id]
+	if result.mode != 'files' and not result.case.func:
+		argv += ['--mode', result.mode]
+	if features:
+		argv += ['--feature', ','.join(f for f in FEATURES if f in features)]
+	return quote(argv)
+
+
+def render_failure(result, impl, features):
+	case = result.case
+	label = result.result
+	lines = ['%s %s   %s %s' % (label, result.name, case.level, ' '.join('§' + c for c in case.spec)),
+		'  ' + case.note]
+	if case.files:
+		for rel, content in sorted(case.files.items()):
+			text = content_bytes(content)
+			lines.append('  files   %s = %s' % (rel, show(text) if not isinstance(content, dict) else 'b64 ' + show(content['b64'])))
+	for line in result.detail:
+		lines.append('  ' + line)
+	if result.kept:
+		lines.append('  kept    ' + result.kept)
+	lines.append('  rerun   ' + rerun_command(impl, result, features))
+	return '\n'.join(lines)
+
+
+def verdicts(results, classes):
+	"""Conformance per class (§2.1): no FAIL, and for cli and handler also reader and writer."""
+	counts = {cls: collections.Counter(r.result for r in results if r.cls == cls) for cls in CLASSES}
+	ran = {cls: bool(counts[cls]) and cls in classes for cls in CLASSES}
+	out = {}
+	for cls in CLASSES:
+		if not ran[cls]:
+			out[cls] = '–'
+		elif counts[cls][FAIL] or counts[cls][ERROR]:
+			out[cls] = '✗ (%d MUST%s)' % (counts[cls][FAIL], ', %d error' % counts[cls][ERROR] if counts[cls][ERROR] else '')
+		elif cls in ('cli', 'handler'):
+			bad = [c for c in ('reader', 'writer') if ran[c] and out[c] != '✓']
+			missing = [c for c in ('reader', 'writer') if not ran[c]]
+			if bad:
+				out[cls] = '✗ (needs %s)' % ' and '.join(bad)
+			elif missing:
+				out[cls] = '✓ alone (%s not run)' % ' and '.join(missing)
+			else:
+				out[cls] = '✓'
+		else:
+			out[cls] = '✓'
+	return out
+
+
+def render_summary(results, impl, features, classes):
+	lines = ['tsvzconform %s · cases format %d · impl: %s (%s)' % (version, CASES_FORMAT, impl.version or '?', impl.command),
+		'claimed: %s' % (', '.join(f for f in FEATURES if f in features) or 'nothing'),
+		'           pass  FAIL  warn  skip  error']
+	for cls in CLASSES:
+		c = collections.Counter(r.result for r in results if r.cls == cls)
+		if sum(c.values()):
+			lines.append('%-9s %6d %5d %5d %5d %6d' % (cls, c[PASS], c[FAIL], c[WARN], c[SKIP], c[ERROR]))
+	v = verdicts(results, classes)
+	lines.append('conformant: ' + '   '.join('%s %s' % (cls, v[cls]) for cls in CLASSES))
+	return '\n'.join(lines)
+
+
+def write_json(path, results, impl, features):
+	data = {'tsvzconform': version, 'cases_format': CASES_FORMAT, 'impl': impl.command, 'impl_version': impl.version,
+		'features': [f for f in FEATURES if f in features],
+		'results': [{'id': r.case.id, 'mode': r.mode, 'class': r.cls, 'spec': r.case.spec, 'level': r.case.level,
+			'result': r.result, 'detail': r.detail, 'seconds': round(r.seconds, 3)} for r in results]}
+	with open(path, 'w', encoding='utf-8') as f:
+		json.dump(data, f, ensure_ascii=False, indent=1)
+		f.write('\n')
+
+
+def probe_version(impl, timeout, work):
+	"""The first line of `COMMAND -V`, or raise RuntimeError (design section 2.2)."""
+	ran = run_command(impl.argv + ['-V'], impl.cwd, timeout, b'', work, 'version')
+	if ran.error:
+		raise RuntimeError(ran.error)
+	if ran.timed_out or ran.exit != 0:
+		raise RuntimeError('%s -V %s' % (impl.command, 'timed out' if ran.timed_out else 'exited %d' % ran.exit))
+	return ran.stdout.decode('utf-8', 'replace').split('\n')[0].strip()
+
+
+def _interrupt(signum, frame):
+	raise KeyboardInterrupt
+
+
+def main(argv=None):
+	try:
+		opts = parse_args(argv)
+	except SystemExit as e:
+		return e.code if isinstance(e.code, int) else 2
+	if not (hasattr(socket, 'AF_UNIX') and hasattr(os, 'setsid')):
+		eprint('tsvzconform: needs a POSIX system with Unix-domain sockets')
+		return 1
+	try:
+		cases = all_cases()
+	except CorpusError as e:
+		eprint('tsvzconform: bad case file: %s' % e)
+		return 1
+	if opts.list:
+		for case in cases:
+			if case.cls in opts.classes and matches_only(case.id, opts.only) and (opts.level == 'all' or case.level == 'MUST'):
+				print('%s\t%s\t%s\t%s\t%s' % (case.id, case.cls, case.level, ','.join(case.spec), ','.join(case.requires)))
+		return 0
+	impl = Impl(opts.impl)
+	own_work = opts.work_dir is None
+	work = tempfile.mkdtemp(prefix='tsvzconform-') if own_work else os.path.abspath(opts.work_dir)
+	os.makedirs(work, exist_ok=True)
+	previous = signal.signal(signal.SIGTERM, _interrupt)
+	results = []
+	interrupted = False
+	try:
+		try:
+			impl.version = probe_version(impl, opts.timeout, work)
+		except RuntimeError as e:
+			eprint('tsvzconform: the implementation failed its -V probe: %s' % e)
+			if own_work:
+				shutil.rmtree(work, ignore_errors=True)
+			return 1
+		ctx = Context(impl, work, opts.timeout, opts.features)
+		runs, skipped = select(cases, opts)
+		tty = sys.stderr.isatty()
+		done = [0]
+
+		def progress(result):
+			done[0] += 1
+			if tty:
+				sys.stderr.write('\r  %d/%d' % (done[0], len(runs)))
+				sys.stderr.flush()
+
+		try:
+			results = run_all(runs, ctx, opts.jobs, opts.fail_fast, progress)
+		except KeyboardInterrupt:
+			interrupted = True
+			results = []
+		if tty:
+			sys.stderr.write('\r' + ' ' * 20 + '\r')
+		results = results + skipped
+		order = {id(case): i for i, case in enumerate(cases)}
+		results.sort(key=lambda r: (order.get(id(r.case), 0), MODES.index(r.mode)))
+	except KeyboardInterrupt:
+		interrupted = True
+	finally:
+		signal.signal(signal.SIGTERM, previous)
+		kill_live_groups()
+	shown = [r for r in results if r.result in (FAIL, ERROR)]
+	for r in shown:
+		print(render_failure(r, impl, opts.features))
+		print()
+	for r in results:
+		if r.result == WARN:
+			print('warn %s   %s: %s' % (r.name, ' '.join('§' + c for c in r.case.spec), r.detail[-1] if r.detail else r.case.note))
+	reasons = collections.Counter(r.detail[0] for r in results if r.result == SKIP)
+	if reasons:
+		print('skipped: ' + '; '.join('%d %s' % (n, why) for why, n in sorted(reasons.items())))
+		if opts.verbose:
+			for r in results:
+				if r.result == SKIP:
+					print('  skip %s (%s)' % (r.name, r.detail[0]))
+	print(render_summary(results, impl, opts.features, opts.classes))
+	if opts.json:
+		write_json(opts.json, results, impl, opts.features)
+	failed = any(r.result in (FAIL, ERROR) for r in results)
+	if own_work and not failed:
+		shutil.rmtree(work, ignore_errors=True)
+	elif failed:
+		print('failed cases are kept in %s' % work)
+	if interrupted:
+		return 130
+	return 1 if failed else 0
+
+
+if __name__ == '__main__':
+	sys.exit(main())
