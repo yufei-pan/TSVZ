@@ -1,0 +1,6 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "13.2-nul-token-reads-as-a-zero-byte", "spec": ["13.2", "13.4"], "level": "MUST",
+ "note": "<NUL> reads back as a zero byte.",
+ "files": {"s.tsvz": "a\tx<NUL>y\n"},
+ "expect": {"read": [["a", "x\u0000y"]], "len": 1}}
+]}

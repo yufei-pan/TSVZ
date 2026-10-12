@@ -1,0 +1,11 @@
+{"format": 1, "class": "writer", "cases": [
+{"id": "13.3-set-encodes-zero-bytes", "spec": ["13.3", "4.9"], "level": "MUST",
+ "note": "A zero byte in a value is written <NUL>, so it is not taken for zero-fill damage.",
+ "steps": [{"op": ["set", "-"], "stdin": "k\tx<NUL>y\n"}],
+ "after": {"rows": [["k", "x\u0000y"]], "bytes": ["encoded"]}},
+{"id": "19.2-scrub-keeps-a-zero-byte", "spec": ["19.2", "13.3"], "level": "MUST",
+ "note": "A scrub writes a zero byte as <NUL>.",
+ "files": {"s.tsvz": "a\tx<NUL>y\n"},
+ "steps": [{"op": ["scrub"]}],
+ "after": {"rows": [["a", "x\u0000y"]], "fidelity": "full", "bytes": ["snapshot-layout", "same-file", "encoded"]}}
+]}

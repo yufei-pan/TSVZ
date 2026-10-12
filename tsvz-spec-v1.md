@@ -143,6 +143,35 @@ raw bytes, not the decoded text. Because the delimiters (§5) and `\n` are ASCII
 and an ASCII byte always ends a maximal subpart, decoding a part record by record
 or as a whole gives the same text.
 
+4.9 **Zero-filled regions.** A crash or a storage failure can leave a run of zero
+bytes where records were, and a later append can follow it. Writers never put a
+zero byte in a record of a `.tsvz`, `.csvz` or `.psvz` part (§13 writes U+0000 as
+`<NUL>`), nor at the start of a record of a `.nsvz` part (a key is never empty). A
+committed line that has one — anywhere, or at its start for `.nsvz` — is
+**zero-fill damage**, handled by the store's corruption policy (§4.10): under
+`recover` the reader reads only the bytes after the last zero byte (for `.nsvz`,
+after the zero bytes the line starts with) as the line; under `skip` it ignores the
+line; under `stop` it stops there.
+
+4.10 **Corruption policy.** Damaged data a reader meets — a zero-filled line
+(§4.9), or a compressed member that fails to decode or fails its check (§16.6) —
+is handled as the stateful marker `#_on_corruption_#` (§12.4) in force at that
+point says:
+
+   - `recover` (the default): use what can still be read — the bytes of §4.9, or
+     what the member decoded before it failed (§16.6) — and warn;
+   - `skip`: use none of it, and warn;
+   - `stop`: stop reading the store there; nothing after it, in that part or a
+     later one, is read. The read has failed, as when a part cannot be read
+     (§16.5): a command-line tool exits with status 1 (§20.6), a handler answers
+     as §21.8.5 says, and a tool does not base changes on what it read (a clear,
+     a pop). A snapshot (§19) may still rewrite a part from what was read; it
+     SHOULD keep the original bytes first.
+
+Recovered data is not verified, and skipped data can hold deletions and marker
+changes, so under `recover` and `skip` the store read can be a state it never had.
+A reader SHOULD say in its warning which part and offset it handled, and how.
+
 > Recovery at §4.3–§4.5 handles truncation at end-of-file. Avoiding torn records
 > in the *middle* of a part is the writer's responsibility; see §18.
 
@@ -429,6 +458,7 @@ those markers are inert.
 | `#_strip_trailing_whites_#` | stateful | trailing-whitespace stripping (§10) | `true` / `false` | `true` |
 | `#_fill_empty_with_default_#` | stateful | present-empty cells take the default (§14) | `true` / `false` | `false` |
 | `#_return_defaults_when_missing_#` | stateful | a missing-key read returns the defaults (§14) | `true` / `false` | `true` |
+| `#_on_corruption_#` | stateful | what a reader does with damaged data (§4.10) | `recover` / `skip` / `stop` | `recover` |
 | `#_rotate_#` | advisory | recommended action for superseded parts after a snapshot (§19) | `keep` / `rename` / `delete` | `keep` |
 | `#_write_ack_#` | advisory | when a writer/handler acknowledges a record (§18) | `memory` / `disk` | `memory` |
 | `#_member_size_#` | advisory | the most uncompressed data a writer puts in one compressed member (§16.7) | a single integer ≥ 1 | `1048576` |
@@ -444,7 +474,7 @@ without verification (§15.3).
 
 12.4.2 **`#_version_#`** — see §6. **`#_defaults_#`, `#_fill_empty_with_default_#`,
 `#_return_defaults_when_missing_#`** — see §14. **`#_strip_trailing_whites_#`** —
-see §10. **`#_rotate_#`** — see §19. **`#_write_ack_#`** — see §18.
+see §10. **`#_on_corruption_#`** — see §4.10. **`#_rotate_#`** — see §19. **`#_write_ack_#`** — see §18.
 **`#_member_size_#`** — see §16.7. **`#_checksum_<algo>_#`** — see §15.
 
 12.4.3 **Advisory** markers (`#_rotate_#`, `#_write_ack_#`, `#_member_size_#`) are
@@ -468,8 +498,8 @@ MAY warn about it.
 
 ## 13. Field escaping
 
-13.1 The variant delimiter, the line feed `\n`, the carriage return `\r`, and the
-escape introducer `<` cannot appear literally inside a field; they are represented
+13.1 The variant delimiter, the line feed `\n`, the carriage return `\r`, the zero
+byte `U+0000`, and the escape introducer `<` cannot appear literally inside a field; they are represented
 by reversible **control tokens** of the form `<...>`. The number sign `#` is
 represented by a token only where required by §8.3. Reading inverts writing.
 
@@ -480,13 +510,15 @@ represented by a token only where required by §8.3. Reading inverts writing.
 | the delimiter character | `<sep>` | the delimiter character |
 | line feed `U+000A`      | `<LF>`  | line feed |
 | carriage return `U+000D` | `<CR>` | carriage return |
+| zero byte `U+0000`      | `<NUL>` | zero byte |
 | less-than `<` `U+003C`  | `<lt>`  | `<` |
 | number sign `#` `U+0023`| `<#>`   | `#` |
 
 13.3 **Writer rules.** A conformant writer **MUST** encode every literal `<` as
-`<lt>`, every delimiter character as `<sep>`, every line feed as `<LF>`, and every
-carriage return as `<CR>`. A
-writer **MUST** encode a `#` as `<#>` when it is the first character of a data key
+`<lt>`, every delimiter character as `<sep>`, every line feed as `<LF>`, every
+carriage return as `<CR>`, and every other zero byte as `<NUL>` (in `.nsvz` the
+zero byte is the delimiter, so it is written as `<sep>`); a raw zero byte in a
+record is damage (§4.9). A writer **MUST** encode a `#` as `<#>` when it is the first character of a data key
 (§8.3); elsewhere `#` MAY be written literally. A writer **MUST NOT** emit a bare
 `<`.
 
@@ -694,15 +726,7 @@ Zstandard it flushes the codec (a gzip sync flush, a Zstandard block flush) and
 syncs the file; bzip2 and xz cannot be flushed within a member, so it ends the
 member instead and starts a new one for the next record.
 
-16.4.2 **Restarting after a crash.** A writer that crashes while it holds a member
-open leaves that member cut short (§16.6), and a reader keeps its whole lines only
-while it is the part's last member. A long-running writer — one that reads the
-store and then keeps appending to it — that finds the part's last member cut short
-**SHOULD** therefore put that member's whole lines again at the start of the first
-member it appends, provided the part has not grown since it read it. Readers then
-skip the cut member as debris and read the copy, so no acknowledged record is lost.
-
-16.4.3 **Compressed active parts.** Writing records directly into a compressed
+16.4.2 **Compressed active parts.** Writing records directly into a compressed
 part is **NOT RECOMMENDED** for important or sensitive data: one damaged member
 loses every record in it, and with `#_write_ack_#` `disk` each record costs a flush
 or a member of its own, which defeats compression. Such a store SHOULD keep its
@@ -721,30 +745,35 @@ in order, as one stream, by these rules:
    1. A member is **complete** when it decodes to its end and passes its codec's
       integrity check: the gzip CRC-32 and length, the bzip2 block and stream
       CRCs, the xz check, and the Zstandard content checksum when the frame has one
-      (§16.8). A reader uses a member's records only once the member is complete,
-      except as rule 3 allows; it holds the member's output until then.
-   2. A member that is not complete is **damaged**: it fails to decode, fails its
-      check, or its bytes end before it does. The reader then looks for the next
+      (§16.8). Its output is used. Whether a member is complete is known only at
+      its end, so a reader holds the member's output until then (or decodes the
+      member twice).
+   2. A member that is not complete is **damaged**. The reader looks for the next
       complete member: the first offset after the damaged member's start where a
       member of the part's codec begins (gzip `1F 8B 08`, bzip2 `42 5A 68` "BZh",
-      xz `FD 37 7A 58 5A 00`, Zstandard `28 B5 2F FD`) and is complete. If there is
-      one, the reader uses none of the damaged member's output and continues at
-      that offset; bytes after the last `\n` before the damaged member are
-      discarded, as at the end of a part (§4.3). A damaged member with more data
-      after it is debris from a write that never finished, or corrupted data; a
-      writer appends after it without repairing it (§16.4).
-   3. When no complete member follows, the damaged member is the part's last. If
-      its bytes merely end before it does, as a final member cut short by a crash
-      does, the reader keeps what it decoded before that point; §4.3 then discards
-      any bytes after the last `\n`. If it fails to decode or fails its check, none
-      of its output is used.
+      xz `FD 37 7A 58 5A 00`, Zstandard `28 B5 2F FD`) and is complete. It then
+      decodes the damaged member's bytes up to that offset (to the end of the part
+      when there is none) on their own:
+      - when they merely end before the member does, the member is **cut short**,
+        as a crash during a write leaves it: its output is used;
+      - otherwise the member is **corrupt**: it fails to decode or fails its check.
+        The corruption policy decides (§4.10): `recover` uses the output it decoded
+        before the failure, `skip` none of it, and `stop` stops the reading of the
+        store.
+
+      Unless the reading stops, bytes after the last `\n` before the next member
+      are then discarded, as at the end of a part (§4.3), and the reading goes on
+      at the next complete member, if there is one. A writer appends after a
+      damaged member without repairing it (§16.4).
 
 Zero bytes before a gzip member are padding, as gzip tools treat them: the reader
 skips them, and they are neither a member nor damage.
 
-A damaged member is not an error, though a reader MAY warn about it. A tool that
-rewrites a part with damaged members (a snapshot, §19) SHOULD keep the original
-bytes first, since the damaged members' data is not in what it writes.
+A member cut short is not an error, though a reader MAY warn about it; a corrupt
+member is handled and reported as §4.10 says. A tool that rewrites a part holding a
+corrupt member (a snapshot, §19) SHOULD keep the original bytes first: what it
+writes has none of that member's data, or, under `recover`, its unverified output
+under a valid checksum.
 
 16.7 **Member size.** A writer SHOULD keep each compressed member it writes to at
 most `#_member_size_#` bytes of uncompressed data (§12.4), ending members at record
@@ -1131,7 +1160,7 @@ to standard error. The text of diagnostics is implementation-defined.
 | Status | Meaning |
 |---|---|
 | 0 | The operation completed. Tolerance warnings may have been printed. |
-| 1 | The operation failed or was refused. When `clear` or `scrub` is refused, nothing was written. |
+| 1 | The operation failed or was refused, or its read stopped at damaged data (§4.10). When `clear` or `scrub` is refused, nothing was written. |
 | 2 | Usage error: invalid arguments, unknown operation, unknown option. |
 | 3 | `get`: at least one requested key is missing. |
 | 4 | `verify`: at least one checksum mismatch. |
@@ -1316,8 +1345,9 @@ store, the part its appends go to (§17, §17.7), using the same locks as any ot
 writer (§18.6).
 
 21.8.5 The handler's state is what a conformant reader returns for the store's
-files at that moment. When a part cannot be read, `read`, `get`, `has` and
-`verify` answer with status 1 and still return what could be read.
+files at that moment. When a part cannot be read, or the read stops at damaged
+data (§4.10), `read`, `get`, `has` and `verify` answer with status 1 and still
+return what could be read.
 
 ### 21.9 Acknowledgement
 
@@ -1394,7 +1424,7 @@ digests                  = {}        # armed per-algorithm accumulators (optiona
 
 # Parts are read in ordinal order as ONE concatenation; marker state and digest
 # accumulators persist across part boundaries (§17.4, §15.4). A compressed part
-# contributes the output of its complete members, skipping damaged ones (§16.6).
+# contributes its members' output by §16.6; damaged data follows §4.9-§4.10.
 for raw in split_records(concatenated_parts):   # split on '\n'; tolerate trailing
                                                  # '\r'; discard bytes after last '\n'
     fields = split(raw, DELIM)        # raw split; count = (#DELIM) + 1

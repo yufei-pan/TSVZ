@@ -127,9 +127,9 @@ LOOSE_VARIANTS = {'.tsv': '\t', '.csv': ',', '.nsv': '\0', '.psv': '|'}
 CODECS = {'.gz': 'gzip', '.gzip': 'gzip', '.bz2': 'bzip2', '.bzip2': 'bzip2', '.xz': 'xz', '.lzma': 'xz',
 	'.zst': 'zstd', '.zstd': 'zstd'}
 RESERVED_RE = re.compile(r'#_[A-Za-z0-9_-]+_#\Z')
-_TOKEN_RE = re.compile(r'<(sep|LF|CR|lt|#)>')
-_TOKENS = {'LF': '\n', 'CR': '\r', 'lt': '<', '#': '#'}
-_BARE_LT_RE = re.compile(r'<(?!(?:sep|LF|CR|lt|#)>)')
+_TOKEN_RE = re.compile(r'<(sep|LF|CR|NUL|lt|#)>')
+_TOKENS = {'LF': '\n', 'CR': '\r', 'NUL': '\0', 'lt': '<', '#': '#'}
+_BARE_LT_RE = re.compile(r'<(?!(?:sep|LF|CR|NUL|lt|#)>)')
 
 
 def decode_field(text, delimiter):
@@ -142,6 +142,7 @@ def decode_field(text, delimiter):
 def encode_field(value, delimiter, is_key=False):
 	"""Encode one field per §13.3; a key also gets <#> for a leading '#'."""
 	value = value.replace('<', '<lt>').replace(delimiter, '<sep>').replace('\n', '<LF>').replace('\r', '<CR>')
+	value = value.replace('\0', '<NUL>')
 	if is_key and value.startswith('#'):
 		value = '<#>' + value[1:]
 	return value
@@ -211,6 +212,9 @@ class CodecUnavailable(Exception):
 _BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True, 'false': False, 'no': False, 'off': False, '0': False}
 _BOOL_MARKERS = {'#_strip_trailing_whites_#': ('strip', True), '#_fill_empty_with_default_#': ('fill_empty', False),
 	'#_return_defaults_when_missing_#': ('return_missing', True)}
+POLICIES = ('recover', 'skip', 'stop')  # #_on_corruption_#; the first is the default (§4.10)
+BREAK = 'break'  # decompress(): a damaged member ended here; the unfinished line is dropped (§16.6)
+CORRUPT = 'corrupt'  # decompress(): (CORRUPT, output decoded before the failure); the policy decides
 
 
 class Replay(object):
@@ -227,6 +231,8 @@ class Replay(object):
 		self.strip = True
 		self.fill_empty = False
 		self.return_missing = True
+		self.on_corruption = POLICIES[0]
+		self.stopped = False  # a stop policy ended the read (§4.10)
 		self.entries = collections.OrderedDict()
 		self._bound = None
 
@@ -261,6 +267,13 @@ class Replay(object):
 			elif re.match(r'[0-9]+\Z', value) and int(value) >= 1:
 				self.version = int(value)
 			return
+		if key == '#_on_corruption_#':
+			lowered = value.lower() if all(ord(c) < 128 for c in value) else value
+			if value == '':
+				self.on_corruption = POLICIES[0]
+			elif lowered in POLICIES:
+				self.on_corruption = lowered
+			return
 		if key == '#_defaults_#':
 			self.defaults = tuple(decode_field(v, self.delimiter) for v in values)
 		elif key in _BOOL_MARKERS:
@@ -278,15 +291,54 @@ class Replay(object):
 			return
 		self._bound = None
 
-	def feed_part(self, data):
-		"""Apply one part's bytes: BOM removed (§4.7), bytes after the last '\\n' dropped (§4.3), U+FFFD for bad UTF-8 (§4.8)."""
-		if data.startswith(b'\xef\xbb\xbf'):
-			data = data[3:]
-		end = data.rfind(b'\n')
-		if end < 0:
-			return
-		for line in data[:end].decode('utf-8', 'replace').split('\n'):
-			self.feed_text(line)
+	def feed_line(self, raw):
+		"""Apply one committed line's bytes: zero-fill damage by the policy (§4.9-§4.10), U+FFFD for bad UTF-8 (§4.8)."""
+		damaged = raw.startswith(b'\0') if self.delimiter == '\0' else b'\0' in raw
+		if damaged:
+			if self.on_corruption == 'stop':
+				self.stopped = True
+				return
+			if self.on_corruption == 'skip':
+				return
+			raw = raw.lstrip(b'\0') if self.delimiter == '\0' else raw[raw.rfind(b'\0') + 1:]
+		self.feed_text(raw.decode('utf-8', 'replace'))
+
+	def feed_part(self, items):
+		"""Apply one part: its bytes, or the items decompress() gives for a compressed part (§16.6).
+
+		The BOM is removed (§4.7), bytes after the last '\\n' are dropped (§4.3), and
+		damaged data follows the policy in force when it is met (§4.10).
+		"""
+		if isinstance(items, bytes):
+			items = [items]
+		pending = b''
+		first = True
+		for item in items:
+			if self.stopped:
+				return
+			if item == BREAK:
+				pending = b''
+				continue
+			if isinstance(item, tuple):
+				if self.on_corruption == 'stop':
+					self.stopped = True
+					return
+				if self.on_corruption == 'skip':
+					continue
+				item = item[1]
+			pending += item
+			if first and len(pending) >= 3 or b'\n' in pending:
+				if first and pending.startswith(b'\xef\xbb\xbf'):
+					pending = pending[3:]
+				first = False
+			while not first:
+				end = pending.find(b'\n')
+				if end < 0:
+					break
+				line, pending = pending[:end], pending[end + 1:]
+				self.feed_line(line)
+				if self.stopped:
+					return
 
 	def resolve(self, key):
 		cells, (defaults, fill_empty) = self.entries[key]
@@ -370,10 +422,28 @@ def _next_complete(data, start, codec):
 	return None
 
 
-def decompress(data, codec):
-	"""The records of a compressed part (§16.6): its complete members in order, skipping damaged ones;
-	a last member cut short yields what it decoded."""
+def _decode_alone(raw, codec):
+	"""A damaged member's bytes decoded on their own (§16.6 rule 2): ('short', output) when they merely end
+	before the member does, else ('corrupt', the output decoded before the failure), fed a byte at a time so
+	that none of it is lost with the call that fails."""
+	decompressor = _decompressor(codec)
 	out = []
+	try:
+		for i in range(len(raw)):
+			out.append(decompressor.decompress(raw[i:i + 1]))
+			if decompressor.eof:
+				break
+	except CodecUnavailable:
+		raise
+	except Exception:
+		return CORRUPT, b''.join(out)
+	return ('short' if not decompressor.eof else CORRUPT), b''.join(out)
+
+
+def decompress_items(data, codec):
+	"""A compressed part as items for Replay.feed_part (§16.6): the output of each member that is complete
+	or cut short, BREAK after a damaged member, and (CORRUPT, output) where the corruption policy decides."""
+	items = []
 	pos = 0
 	while pos < len(data):
 		if codec == 'gzip' and data[pos] == 0:  # zero padding before a gzip member is skipped
@@ -381,18 +451,22 @@ def decompress(data, codec):
 			continue
 		status, chunk, end = _member(data, pos, codec)
 		if status == 'complete':
-			out.append(chunk)
+			items.append(chunk)
 			pos = end
 			continue
 		found = _next_complete(data, pos + 1, codec)
+		kind, out = _decode_alone(data[pos:found[0] if found else len(data)], codec)
+		items.append(out if kind == 'short' else (CORRUPT, out))
 		if found is None:
-			if status == 'short':
-				out.append(chunk)
 			break
-		kept = b''.join(out)
-		out = [kept[:kept.rfind(b'\n') + 1], found[1]]  # the unfinished line before the damage is dropped
+		items.extend([BREAK, found[1]])
 		pos = found[2]
-	return b''.join(out)
+	return items
+
+
+def decompress(data, codec):
+	"""The bytes a compressed part decodes to, a corrupt member's recovered output included (for byte checks)."""
+	return b''.join(item if isinstance(item, bytes) else item[1] for item in decompress_items(data, codec) if item != BREAK)
 
 
 def read_part(path):
@@ -403,10 +477,20 @@ def read_part(path):
 	return decompress(data, codec) if codec else data
 
 
+def read_part_items(path):
+	"""A part as Replay.feed_part takes it: its bytes, or a compressed part's items (§16.6)."""
+	with open(path, 'rb') as f:
+		data = f.read()
+	codec = split_codec(path)[1]
+	return decompress_items(data, codec) if codec else data
+
+
 def replay_store(store):
 	replay = Replay(delimiter_of(store))
 	for part in store_parts(store):
-		replay.feed_part(read_part(part))
+		replay.feed_part(read_part_items(part))
+		if replay.stopped:  # a stop policy ends the read of the whole store (§4.10)
+			break
 	return replay
 
 
@@ -873,6 +957,9 @@ def byte_rule(rule, store, before, now):
 			if '\r' in text:
 				at = text.index('\r')
 				problems.append('%s: a raw carriage return: %s' % (os.path.basename(path), show(text[max(0, at - 10):at + 10])))
+			if '\0' in text and delimiter_of(path) != '\0':
+				at = text.index('\0')
+				problems.append('%s: a raw zero byte: %s' % (os.path.basename(path), show(text[max(0, at - 10):at + 10])))
 	elif rule == 'lf-terminated':
 		for path, chunk in written_chunks(before, now):
 			if not chunk.endswith(b'\n'):
@@ -1952,25 +2039,6 @@ def check_line_limit(cx):
 			client.close()
 	finally:
 		problems.extend(handler.stop())
-	return problems
-
-
-@procedural('16.4.2-a-handler-writes-a-cut-members-lines-again', 'handler', ['16.4.2', '16.6'], 'SHOULD',
-	'A handler serving a store whose last member is cut short puts that member\'s whole lines at the start of '
-	'its first append, so they are still read once the cut member is no longer last.', requires=['handler'])
-def check_handler_recut(cx):
-	store = cx.write('s.tsvz.gz', _gzip_member(b'a\tx\n') + _gzip_member(b'b\ty\nbr')[:-6])
-	handler = cx.handler(store)
-	problems = []
-	try:
-		response = handler.client().request(['set', 'c', 'z'])
-		if response.status != 0:
-			problems.append('set answered status %s' % response.status)
-	finally:
-		problems.extend(handler.stop())
-	rows = [trim_row(row) for row in replay_store(store).rows()]
-	if rows != [['a', 'x'], ['b', 'y'], ['c', 'z']]:
-		problems.append('the store reads %s, not a, b and c' % show(rows))
 	return problems
 
 
