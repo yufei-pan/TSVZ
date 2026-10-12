@@ -601,3 +601,17 @@ def test_a_missing_tool_fails_and_a_runner_bug_is_an_error(tmp_path, monkeypatch
 	faithful = dict(WRITES, after={'fidelity': 'full'})
 	result = tc.run_case(tc.validate_case(faithful, 'writer', 'x'), 'files', context(tmp_path / 'w2'))
 	assert result.result == tc.ERROR and 'a bug in the runner' in result.detail[-1]
+
+
+# --- procedural checks -----------------------------------------------------------------------
+
+@pytest.mark.parametrize('check', tc.CHECKS, ids=[c.id for c in tc.CHECKS])
+def test_every_procedural_check_passes_with_the_reference(check, tmp_path):
+	result = tc.run_case(check, 'files', context(tmp_path / 'work', features=['handler']))
+	assert result.result in (tc.PASS, tc.SKIP), result.detail
+
+
+def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
+	check = next(c for c in tc.CHECKS if c.id == '21.2.4-refuse-wrong-first-line')
+	result = tc.run_case(check, 'files', context(tmp_path / 'work', fake(tmp_path, 'decoy')))
+	assert result.result == tc.FAIL and 'must not use' in result.detail[0]

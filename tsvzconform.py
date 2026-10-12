@@ -1505,3 +1505,374 @@ def run_case(case, mode, ctx):
 	else:
 		kept = case_dir
 	return Result(case, mode, result, detail, time.time() - started, kept)
+
+
+# ---------------------------------------------------------------------------
+# Procedural checks (design section 4.3)
+# ---------------------------------------------------------------------------
+
+@procedural('20.4.3-terminal-output-is-a-table', 'cli', ['20.4.3'], 'SHOULD',
+	'Without --format, output to a terminal uses the table layout, which differs from the records the same command prints to a file.')
+def check_terminal_default(cx):
+	import pty
+	store = cx.write('s.tsvz', 'alpha\tA\t1\nbeta\tB<sep>x\t2\n')
+	records = cx.run(cx.impl.argv + ['--format', 'records', 'read', store])
+	if records.exit != 0:
+		return ['read --format records exited %s' % records.exit]
+	master, slave = pty.openpty()
+	try:
+		proc = subprocess.Popen(cx.impl.argv + ['read', store], cwd=cx.impl.cwd, stdin=subprocess.DEVNULL, stdout=slave,
+			stderr=subprocess.DEVNULL, start_new_session=True)
+		os.close(slave)
+		slave = None
+		chunks = []
+		deadline = time.time() + cx.timeout
+		while time.time() < deadline:
+			try:
+				chunk = os.read(master, 65536)
+			except OSError:
+				break
+			if not chunk:
+				break
+			chunks.append(chunk)
+		code, _ = reap(proc, max(0.1, deadline - time.time()))
+	finally:
+		os.close(master)
+		if slave is not None:
+			os.close(slave)
+	shown = b''.join(chunks).replace(b'\r\n', b'\n')
+	if code != 0:
+		return ['read on a terminal exited %s' % code]
+	if shown == records.stdout:
+		return ['read on a terminal printed exactly the records format: %s' % show(shown)]
+	return []
+
+
+def _serving(cx, content='k\tv\n'):
+	store = cx.write('s.tsvz', content)
+	return store, cx.handler(store)
+
+
+@procedural('21.2.3-pointer-is-locked', 'handler', ['21.2.3'], 'MUST',
+	'While a handler serves, it holds an exclusive flock on its pointer file.', requires=['handler'])
+def check_pointer_locked(cx):
+	import fcntl
+	store, handler = _serving(cx)
+	problems = []
+	try:
+		with open(store + '.serve', 'rb') as f:
+			try:
+				fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+				problems.append('the runner could lock the pointer file while the handler serves')
+				fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+			except OSError:
+				pass
+	finally:
+		problems.extend(handler.stop())
+	return problems
+
+
+@procedural('21.2.2-pointer-names-host-and-pid', 'handler', ['21.2.2'], 'MUST',
+	'The pointer file names this host and the pid of a running process.', requires=['handler'])
+def check_pointer_fields(cx):
+	store, handler = _serving(cx)
+	problems = []
+	try:
+		pointer = read_pointer(store) or {}
+		if pointer.get('host') != socket.gethostname():
+			problems.append('host is %s, expected %s' % (show(pointer.get('host')), show(socket.gethostname())))
+		pid = pointer.get('pid', '')
+		if not pid.isdigit():
+			problems.append('pid is %s' % show(pid))
+		else:
+			try:
+				os.kill(int(pid), 0)
+			except ProcessLookupError:
+				problems.append('pid %s is not a running process' % pid)
+			except PermissionError:
+				pass
+	finally:
+		problems.extend(handler.stop())
+	return problems
+
+
+@procedural('21.2.3-pointer-not-writable-by-others', 'handler', ['21.2.3'], 'MUST',
+	'The pointer file is not writable by group or others.', requires=['handler'])
+def check_pointer_mode(cx):
+	store, handler = _serving(cx)
+	mode = None
+	try:
+		mode = stat.S_IMODE(os.stat(store + '.serve').st_mode)
+	finally:
+		problems = handler.stop()
+	if mode & 0o022:
+		problems.append('the pointer file has mode %o' % mode)
+	return problems
+
+
+@procedural('21.13.1-second-serve-exits-1', 'handler', ['21.13.1', '21.2.3'], 'MUST',
+	'serve exits with status 1 while another handler holds the pointer lock, and the first keeps serving.', requires=['handler'])
+def check_second_serve(cx):
+	store, handler = _serving(cx)
+	problems = []
+	try:
+		second = cx.run(cx.impl.argv + ['serve', store])
+		if second.timed_out:
+			problems.append('a second serve did not exit within %.0f s' % cx.timeout)
+		elif second.exit != 1:
+			problems.append('a second serve exited %s, expected 1' % second.exit)
+		client = handler.client()
+		try:
+			if client.request(['len']).status != 0:
+				problems.append('the first handler stopped answering')
+		finally:
+			client.close()
+	finally:
+		problems.extend(handler.stop())
+	return problems
+
+
+@procedural('21.2.3-stale-pointer-is-replaced', 'handler', ['21.2.3'], 'MUST',
+	'A pointer file that no process locks is stale: serve replaces it and starts.', requires=['handler'])
+def check_stale_pointer(cx):
+	store = cx.write('s.tsvz', 'k\tv\n')
+	cx.write('s.tsvz.serve', 'tsvz-handler\t1\naddress\tunix:%s\nhost\t%s\npid\t999999999\n' % (cx.path('gone.sock'), socket.gethostname()))
+	os.chmod(store + '.serve', 0o600)
+	try:
+		handler = cx.handler(store)
+	except HandlerError as e:
+		return ['serve did not take over a stale pointer: %s' % e]
+	return handler.stop()
+
+
+@procedural('21.2.3-no-write-through-symlink', 'handler', ['21.2.3'], 'MUST',
+	'A pointer path that is a symbolic link is never written through: the file it points to is unchanged.', requires=['handler'])
+def check_pointer_symlink(cx):
+	store = cx.write('s.tsvz', 'k\tv\n')
+	victim = cx.write('victim.txt', 'do not touch\n')
+	os.symlink(victim, store + '.serve')
+	problems = []
+	try:
+		handler = cx.handler(store)
+		problems.extend(handler.stop())
+	except HandlerError:
+		pass
+	with open(victim, 'rb') as f:
+		if f.read() != b'do not touch\n':
+			problems.append('the file the symlink points to was modified')
+	return problems
+
+
+def _decoy(cx, kind='unix'):
+	"""A listening socket that records whether anything connects to it.
+
+	A Unix socket goes in a short directory of its own: socket paths are
+	limited to about 100 bytes, and a case directory can be longer.
+	"""
+	if kind == 'unix':
+		directory = tempfile.mkdtemp(prefix='tsvzconform-', dir='/tmp' if os.path.isdir('/tmp') else None)
+		cx.cleanup.append(lambda: shutil.rmtree(directory, ignore_errors=True))
+		path = os.path.join(directory, 'decoy.sock')
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.bind(path)
+		address = 'unix:' + path
+	else:
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		sock.bind(('127.0.0.1', 0))
+		address = 'tcp:127.0.0.1:%d' % sock.getsockname()[1]
+	sock.listen(8)
+	sock.setblocking(False)
+	return sock, address
+
+
+def _contacted(sock):
+	try:
+		conn, _ = sock.accept()
+		conn.close()
+		return True
+	except (BlockingIOError, OSError):
+		return False
+
+
+def _pointer_text(address, host=None, extra=''):
+	return 'tsvz-handler\t1\naddress\t%s\nhost\t%s\npid\t%d\n%s' % (address, host or socket.gethostname(), os.getpid(), extra)
+
+
+def _refuse_pointer(cx, setup, kind='unix'):
+	"""Plant a bad pointer to a decoy; the CLI must not connect and must answer from the files."""
+	store = cx.write('s.tsvz', 'k\tv\n')
+	sock, address = _decoy(cx, kind)
+	try:
+		setup(store, address)
+		ran = cx.run(cx.impl.cli('get', store, ['k']))
+		problems = []
+		if _contacted(sock):
+			problems.append('the command connected to the address in a pointer file it must not use (§21.2.4)')
+		if ran.timed_out:
+			problems.append('get timed out')
+		elif ran.exit != 0 or match_stdout({'rows': [['k', 'v']]}, ran.stdout, '\t'):
+			problems.append('get did not answer from the files: exit %s, stdout %s' % (ran.exit, show(ran.stdout)))
+		return problems
+	finally:
+		sock.close()
+
+
+def _write_pointer(path, text, mode=0o600):
+	with open(path, 'w', encoding='utf-8') as f:
+		f.write(text)
+	os.chmod(path, mode)
+
+
+def _register_pointer_checks():
+	def symlink(store, address):
+		real = os.path.join(os.path.dirname(store), 'real.serve')
+		_write_pointer(real, _pointer_text(address))
+		os.symlink(real, store + '.serve')
+
+	def group_writable(store, address):
+		_write_pointer(store + '.serve', _pointer_text(address), 0o620)
+
+	def wrong_first_line(store, address):
+		_write_pointer(store + '.serve', _pointer_text(address).replace('tsvz-handler\t1', 'tsvz-handler\t2', 1))
+
+	def control_character(store, address):
+		_write_pointer(store + '.serve', _pointer_text(address, extra='x-note\tbad\x07value\n'))
+
+	def other_host(store, address):
+		_write_pointer(store + '.serve', _pointer_text(address, host='other-host.invalid'))
+
+	def not_unix(store, address):
+		_write_pointer(store + '.serve', _pointer_text(address))
+
+	def other_owner(store, address):
+		if os.geteuid() != 0:
+			raise Skip('needs root to give the pointer file another owner')
+		_write_pointer(store + '.serve', _pointer_text(address))
+		os.chown(store + '.serve', 65534, 65534)
+
+	def socket_other_owner(store, address):
+		if os.geteuid() != 0:
+			raise Skip('needs root to give the socket another owner')
+		_write_pointer(store + '.serve', _pointer_text(address))
+		os.chown(address[5:], 65534, 65534)
+
+	variants = [
+		('symlink', 'a pointer file that is a symbolic link', symlink, 'unix'),
+		('group-writable', 'a pointer file group members can write', group_writable, 'unix'),
+		('wrong-first-line', 'a pointer file whose first line is not tsvz-handler<TAB>1', wrong_first_line, 'unix'),
+		('control-character', 'a pointer file with a control character in a value', control_character, 'unix'),
+		('other-host', 'a pointer file naming another host', other_host, 'unix'),
+		('not-unix', 'a pointer file whose address is not a Unix-domain socket', not_unix, 'tcp'),
+		('other-owner', 'a pointer file owned by another user', other_owner, 'unix'),
+		('socket-other-owner', 'a pointer naming a socket owned by another user', socket_other_owner, 'unix'),
+	]
+	for slug, what, setup, kind in variants:
+		def check(cx, setup=setup, kind=kind):
+			return _refuse_pointer(cx, setup, kind)
+		procedural('21.2.4-refuse-%s' % slug, 'cli', ['21.2.4', '20.8.2'], 'MUST',
+			'A command does not use %s, and answers from the files.' % what)(check)
+
+
+_register_pointer_checks()
+
+
+@procedural('21.10.2-one-mib-request-line', 'handler', ['21.10.2'], 'MUST',
+	'A request line of 1 MiB is within the limit every handler must accept.', requires=['handler'])
+def check_line_limit(cx):
+	store, handler = _serving(cx, '')
+	problems = []
+	try:
+		value = 'x' * ((1 << 20) - len('set\tbig\t\n'))
+		client = handler.client()
+		try:
+			response = client.request(['set', 'big', value])
+			if response.status != 0:
+				problems.append('a 1 MiB set answered #%d' % response.status)
+			got = client.request(['get', 'big'])
+			if got.output != ('big\t%s\n' % value).encode('utf-8'):
+				problems.append('get did not return the 1 MiB value')
+		except (OSError, ConnectionError) as e:
+			problems.append('the handler did not answer a 1 MiB line: %s' % e)
+		finally:
+			client.close()
+	finally:
+		problems.extend(handler.stop())
+	return problems
+
+
+@procedural('21.7.2-cut-off-bulk-writes-nothing', 'handler', ['21.7.2'], 'MUST',
+	'A set - whose connection ends before the closing # line writes nothing.', requires=['handler'])
+def check_cut_off_bulk(cx):
+	store, handler = _serving(cx, '')
+	problems = []
+	try:
+		client = handler.client()
+		client.send(b'set\t-\na\t1\nb\t2\n')
+		client.close()
+		time.sleep(0.2)
+	finally:
+		problems.extend(handler.stop())
+	rows = replay_store(store).rows()
+	if rows:
+		problems.append('the store has rows: %s' % show(rows))
+	return problems
+
+
+@procedural('21.8.2-concurrent-pop-is-atomic', 'handler', ['21.8.2'], 'MUST',
+	'Eight clients pop one key at once: exactly one gets the row, the others status 3, and one tombstone is written.', requires=['handler'])
+def check_atomic_pop(cx):
+	store, handler = _serving(cx, 'k\tv\n')
+	problems = []
+	results = []
+	barrier = threading.Barrier(8)
+
+	def pop():
+		try:
+			client = handler.client()
+			try:
+				barrier.wait(cx.timeout)
+				results.append(client.request(['pop', 'k']))
+			finally:
+				client.close()
+		except Exception as e:
+			results.append(e)
+
+	try:
+		threads = [threading.Thread(target=pop) for _ in range(8)]
+		for thread in threads:
+			thread.daemon = True
+			thread.start()
+		for thread in threads:
+			thread.join(cx.timeout * 2)
+	finally:
+		problems.extend(handler.stop())
+	errors = [r for r in results if isinstance(r, Exception)]
+	if errors:
+		return problems + ['a client failed: %s' % errors[0]]
+	statuses = sorted(r.status for r in results)
+	if statuses != [0] + [3] * 7:
+		problems.append('statuses %s, expected one 0 and seven 3' % statuses)
+	with open(store, 'rb') as f:
+		tombstones = f.read().split(b'\n').count(b'k')
+	if tombstones != 1:
+		problems.append('%d tombstones for k, expected 1' % tombstones)
+	return problems
+
+
+@procedural('21.11.1-socket-closed-to-others', 'handler', ['21.11.1'], 'SHOULD',
+	'By default the socket, or a directory on its path, is closed to group and others.', requires=['handler'])
+def check_socket_access(cx):
+	store, handler = _serving(cx)
+	try:
+		path = handler.path
+		closed = not (stat.S_IMODE(os.stat(path).st_mode) & 0o066)
+		directory = os.path.dirname(os.path.abspath(path))
+		while not closed and directory not in ('', '/'):
+			info = os.stat(directory)
+			closed = info.st_uid == os.geteuid() and not (stat.S_IMODE(info.st_mode) & 0o011)
+			directory = os.path.dirname(directory)
+	finally:
+		problems = handler.stop()
+	if not closed:
+		problems.append('%s and every directory above it can be reached by others' % path)
+	return problems
