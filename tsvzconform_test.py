@@ -820,3 +820,66 @@ def test_the_oracle_passes_every_reader_case(case, tmp_path):
 		rows, code = _get(r, query['args'])
 		assert [tc.trim_row(x) for x in rows] == [tc.trim_row(x) for x in query.get('rows', [])]
 		assert code == query.get('exit', 0)
+
+
+def _crc32c(data):
+	crc = 0xffffffff
+	for byte in bytearray(data):
+		crc ^= byte
+		for _ in range(8):
+			crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+	return '%08x' % (crc ^ 0xffffffff)
+
+
+def _digest(algo, data):
+	"""The registry's digest of `data` (spec §15.2.1), or None for blake3 without its package and for other names."""
+	if algo == 'crc32':
+		return '%08x' % (zlib.crc32(data) & 0xffffffff)
+	if algo == 'crc32c':
+		return _crc32c(data)
+	if algo == 'sha256':
+		return hashlib.sha256(data).hexdigest()
+	if algo != 'blake3':
+		return None
+	try:
+		import blake3
+	except ImportError:
+		return None
+	return blake3.blake3(data).hexdigest()
+
+
+def _segments(data):
+	"""(algo, line number in its part, expected, segment bytes) for every closing checksum marker of a one-part store."""
+	found = []
+	armed = {}
+	data = data[3:] if data.startswith(b'\xef\xbb\xbf') else data
+	for number, line in enumerate(data.split(b'\n')[:-1], 1):
+		match = re.match(rb'#_checksum_([A-Za-z0-9_-]+)_#(?:\t(.*))?\Z', line, re.I)
+		algo = match.group(1).decode().lower() if match else None
+		for name in armed:
+			if name != algo:
+				armed[name] += line + b'\n'
+		if algo:
+			if algo in armed and match.group(2):
+				found.append((algo, number, match.group(2).decode().lower(), armed[algo]))
+			armed[algo] = b''
+	return found
+
+
+def test_digests_in_the_corpus_are_right():
+	checked = 0
+	for case in READER_CASES:
+		if len(case.files) != 1 or 'verify' not in case.expect or case.id.startswith('15.3-unclaimed'):
+			continue
+		data = tc.content_bytes(case.files['s.tsvz'])
+		lines = {(l[2], int(l[1])): l for l in case.expect['verify']['lines']}
+		for algo, number, expected, segment in _segments(data):
+			computed = _digest(algo, segment)
+			if computed is None:
+				continue
+			if (algo, number) in lines:
+				assert lines[(algo, number)][3:] == [expected, computed], case.id
+			else:
+				assert expected == computed, case.id
+			checked += 1
+	assert checked >= 8

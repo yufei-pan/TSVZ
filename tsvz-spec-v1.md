@@ -579,9 +579,21 @@ taken on a detected mismatch (warn, refuse the affected segment, halt) is
 implementation-defined.
 
 15.2 **Marker.** `#_checksum_<algo>_#`, where `<algo>` names a digest algorithm
-(for example `crc32`, `crc32c`, `sha256`, `blake3`). `<algo>` is part of the
-case-insensitive reserved key and matches the inner character class of §12.2.1. The
-value is the lowercase hexadecimal expected digest, or empty.
+(§15.2.1). `<algo>` is part of the case-insensitive reserved key and matches the
+inner character class of §12.2.1. The value is the lowercase hexadecimal expected
+digest, or empty.
+
+15.2.1 **Algorithms.** This specification defines these names:
+
+| `<algo>` | Algorithm | Digest written as |
+|---|---|---|
+| `crc32` | CRC-32/ISO-HDLC, the CRC-32 of zlib, gzip and PNG | its 32-bit value as 8 hexadecimal digits, most significant first |
+| `crc32c` | CRC-32C (Castagnoli), as in iSCSI | its 32-bit value as 8 hexadecimal digits, most significant first |
+| `sha256` | SHA-256 (FIPS 180-4) | its 32 output bytes, in order, as 64 hexadecimal digits |
+| `blake3` | BLAKE3 with its default 32-byte output | its 32 output bytes, in order, as 64 hexadecimal digits |
+
+Implementing any of them is optional (§15.3). A reader MAY implement other
+algorithms under other names; their meaning is implementation-defined.
 
 15.3 **Semantics.** A reader does not begin computing a digest automatically; an
 algorithm's accumulator is armed only by an explicit marker. For each
