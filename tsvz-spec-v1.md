@@ -37,9 +37,9 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 to be interpreted as described in RFC 2119 and RFC 8174.
 
 A **conformant reader** is software that reconstructs store state from a TSVZ file
-in accordance with §6–§15. A **conformant writer** is software that produces TSVZ
-files in accordance with this document. Some requirements apply only to one role
-and are marked accordingly.
+in accordance with §4–§17. A **conformant writer** is software that produces TSVZ
+files in accordance with this document. Both support all four strict variants of
+§5. Some requirements apply only to one role and are marked accordingly.
 
 A **conformant command-line tool** is software that implements §20. It MUST also
 be a conformant reader and a conformant writer for the strict variants. A reader
