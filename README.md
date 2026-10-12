@@ -229,14 +229,14 @@ and `-d=,`, except the ones C5 and C9 list.
 
 ## Spec deviations and interpretations
 
-The conformance cases these deviations make fail are listed in
-`conformance/reference-baseline.json` (see Conformance testing).
+None of these fails a conformance case: `conformance/reference-baseline.json`,
+which lists the cases this implementation does not pass, is empty (see
+Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
 - §18.6: locking is the 3.39 exclusive `lockf` per write plus an in-process lock; readers do not lock.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
-- §16.5: before Python 3.14 a `.zst` part is read as plain bytes instead of failing.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.

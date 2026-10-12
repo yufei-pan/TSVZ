@@ -1017,16 +1017,19 @@ def test_spec_bz2_and_xz_parts(tmp_path):
 	assert dict(_replay([b])[0]) == dict(_replay([x])[0]) == {'a': ['a', '1'], 'b': ['b', '2']}
 
 
-def test_spec_zst_without_support_is_skipped(tmp_path):
-	try:
-		from compression import zstd  # noqa: F401
-		pytest.skip('compression.zstd is available')
-	except ImportError:
-		pass
+def test_spec_part_in_an_unsupported_codec_is_unreadable_and_never_repaired(tmp_path, monkeypatch):
+	# Spec §16.5: a reader without a part's codec fails; it neither skips the part nor reads or repairs its bytes.
+	monkeypatch.setitem(sys.modules, 'compression.zstd', None)
 	z = str(tmp_path / 'a.tsvz.zst')
-	_touch(z, b'\x28\xb5\x2f\xfdjunk')
-	data, _, infos = _replay([z])
-	assert dict(data) == {} and infos[0].damaged.startswith('cannot decompress')
+	raw = b'\x28\xb5\x2f\xfdjunk'
+	_touch(z, raw)
+	status, out, err = _run('read', z)
+	assert status == 1 and out == '' and 'no zst support' in err
+	status, _, err = _run('set', z, 'k', 'v')
+	assert status == 1 and 'no zst support' in err
+	with open(z, 'rb') as f:
+		assert f.read() == raw
+	assert os.listdir(str(tmp_path)) == ['a.tsvz.zst']
 
 
 def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):

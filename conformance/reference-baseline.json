@@ -1,7 +1,4 @@
 {"impl": "python3 TSVZ.py",
  "features": ["bzip2", "xz", "crc32", "sha256", "file-first", "handler"],
  "note": "The reference also claims zstd on Python 3.14 and later. Every case it does not pass, and why; remove an entry when the reference is fixed.",
- "not_passing": [
-  {"id": "16.5-unsupported-zstd-part-fails", "modes": ["files", "socket", "forwarded"], "result": "FAIL", "python_below": [3, 14],
-   "reason": "Without compression.zstd a .zst part is read as plain bytes instead of failing (decision 2)."}
- ]}
+ "not_passing": []}

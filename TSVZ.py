@@ -694,7 +694,10 @@ def _compressBytes(codec, data, level=1):
 	if codec in ('xz', 'lzma'):
 		import lzma
 		return lzma.compress(data, preset=level)
-	from compression import zstd  # Python 3.14+
+	try:
+		from compression import zstd  # Python 3.14+
+	except ImportError as e:
+		raise ImportError('no {} support in this Python ({})'.format(codec, e))
 	return zstd.compress(data, level=level)
 
 
@@ -1743,11 +1746,7 @@ def _decompressChunks(f, info):
 	(``'corrupt (...)'``). ``info.goodRawEnd`` is the raw offset after the last
 	complete member.
 	"""
-	try:
-		decompressor = _newDecompressor(info.codec)
-	except ImportError as e:
-		info.damaged = 'cannot decompress ({})'.format(e)
-		return
+	decompressor = _newDecompressor(info.codec)
 	isGzip = info.codec in ('gz', 'gzip')
 	rawPos = 0
 	inMember = False
@@ -1794,6 +1793,14 @@ def _iterPartLines(info, reporter):
 	except OSError as e:
 		reporter.note('unreadable', None, 'skipped unreadable part {} ({})'.format(info.path, e))
 		return
+	if info.codec:
+		try:
+			_newDecompressor(info.codec)
+		except ImportError as e:
+			# Spec §16.5: a codec this Python lacks makes the part unreadable; it is not damage to repair.
+			f.close()
+			reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python ({})'.format(info.path, info.codec, e))
+			return
 	rest = b''
 	with f:
 		chunks = _decompressChunks(f, info) if info.codec else iter(lambda: f.read(_CHUNK), b'')
