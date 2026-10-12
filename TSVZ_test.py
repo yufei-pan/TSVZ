@@ -1065,6 +1065,85 @@ def test_spec_clear_writes_nothing_when_a_part_cannot_be_read(tmp_path, monkeypa
 		assert f.read() == b'b\t2\n'
 
 
+def _try(call):
+	try:
+		call()
+	except Exception:
+		pass
+
+
+def test_legacy_writes_refuse_a_codec_this_python_lacks(tmp_path, monkeypatch):
+	# The older .tsv-family writers used to fall back to plain file I/O over a .zst file and destroy it.
+	_block_zstd(monkeypatch)
+	p = str(tmp_path / 'a.tsv.zst')
+	_touch(p, ZST_JUNK)
+	_try(lambda: TSVZ.appendLinesTabularFile(p, [['k', 'v']]))
+	_try(lambda: TSVZ.scrubTabularFile(p))
+	_try(lambda: TSVZ.TSVZed(p).close())
+	with open(p, 'rb') as f:
+		assert f.read() == ZST_JUNK
+	new = str(tmp_path / 'new.tsv.zst')
+	_try(lambda: TSVZ.appendLinesTabularFile(new, [['k', 'v']], createIfNotExist=True))
+	assert not os.path.exists(new)
+
+
+def test_spec_constructor_defaults_are_not_written_when_a_part_cannot_be_read(tmp_path, monkeypatch):
+	# The store's own #_defaults_# may be in the part that could not be read.
+	_block_zstd(monkeypatch)
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1.zst', ZST_JUNK)
+	_touch(base + '.2', b'b\t2\n')
+	TSVZ.TSVZed(base, defaults=['k', 'dflt']).close()
+	lite = TSVZ.TSVZedLite(base, defaults=['k', 'dflt'])
+	assert not lite._pendingDefaults
+	lite.close()
+	with open(base + '.2', 'rb') as f:
+		assert f.read() == b'b\t2\n'
+
+
+def test_spec_read_then_write_operations_refuse_an_unreadable_store(tmp_path, monkeypatch):
+	# setdefault on a key only the unreadable part holds would hide its value; pop and popitem would act on a partial view.
+	_block_zstd(monkeypatch)
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1.zst', ZST_JUNK)
+	_touch(base + '.2', b'b\t2\n')
+	assert _run('setdefault', base, 'k', 'new')[0] == 1
+	assert _run('pop', base, 'b')[0] == 1
+	assert _run('popitem', base)[0] == 1
+	with open(base + '.2', 'rb') as f:
+		assert f.read() == b'b\t2\n'
+
+
+@pytest.mark.parametrize('operation', ['clear', 'scrub'])
+def test_spec_clear_and_scrub_retry_when_a_part_vanishes_during_the_read(tmp_path, monkeypatch, operation):
+	# A part removed between listing and reading (a rotation) changes the store: read again, do not refuse.
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'a\t1\n')
+	_touch(base + '.1', b'b\t2\n')
+	original = TSVZ._iterPartLines
+	gone = []
+
+	def vanishing(info, reporter):
+		if info.path.endswith('.1') and not gone:
+			gone.append(info.path)
+			os.remove(info.path)
+		return original(info, reporter)
+
+	monkeypatch.setattr(TSVZ, '_iterPartLines', vanishing)
+	if operation == 'clear':
+		assert TSVZ._specClearTabularFile(base, delimiter='\t') is True
+	else:
+		assert TSVZ._specScrub(base, delimiter='\t')[1] is True
+	assert gone
+
+
+def test_spec_non_strict_creation_in_a_missing_codec_returns_instead_of_raising(tmp_path, monkeypatch):
+	_block_zstd(monkeypatch)
+	new = str(tmp_path / 'new.tsvz.zst')
+	assert TSVZ.readTabularFile(new, createIfNotExist=True, strict=False) == {}
+	assert not os.path.exists(new)
+
+
 def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):
 	import zlib
 	base = str(tmp_path / 'm.tsvz')

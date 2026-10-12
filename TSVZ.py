@@ -121,6 +121,11 @@ def eprint(*args, **kwargs):
 
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
 	lowerFileName = fileName.lower()
+	if any(c in mode for c in 'wax+'):
+		# Writing plain bytes into a compressed file destroys it: refuse when this Python lacks the codec.
+		suffix = lowerFileName.rpartition('.')[2]
+		if suffix in COMPRESSED_FILE_EXTENSIONS:
+			_requireCodec(suffix)
 	if 'b' not in mode:
 		mode += 't'
 	kwargs = {}
@@ -689,7 +694,7 @@ _CODEC_SUPPORT = {}
 
 
 def _codecSupported(codec):
-	"""True when this Python has ``codec`` (only zstd can be missing: it needs Python 3.14). Checked once per codec."""
+	"""True when this Python has ``codec`` (zstd needs Python 3.14; a minimal build may lack lzma or bz2). Checked once per codec."""
 	name = _CODEC_NAMES.get(codec, codec)
 	if name not in _CODEC_SUPPORT:
 		try:
@@ -2136,7 +2141,13 @@ def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLo
 		lines.append(_specFormatRecord(defaults, delimiter, marker=True))
 	content = ''.join(line + '\n' for line in lines).encode('utf-8')
 	codec = _parsePartName(fileName).codec
-	_requireCodec(codec)  # not even an empty file in a codec this Python lacks
+	try:
+		_requireCodec(codec)  # not even an empty file in a codec this Python lacks
+	except ImportError as e:
+		__teePrintOrNot('Failed to create {}: {}'.format(fileName, e),'error',teeLogger=teeLogger)
+		if strict:
+			raise
+		return False
 	try:
 		with open(fileName, 'xb') as f:
 			f.write(_compressBytes(codec, content) if codec and content else content)
@@ -2430,6 +2441,8 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
 			if attempt.has('unreadable'):
+				if _storeParts(fileName)[0] != parts:
+					continue  # a part went away during the read (a rotation): read again
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
 				return False
 			if len(load.parts) > 1:
@@ -2548,6 +2561,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 							 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
 			if attempt.has('unreadable'):
+				if _storeParts(fileName)[0] != parts:
+					continue  # a part went away during the read (a rotation): read again
 				attempt.note('refused', None, 'scrub skipped: a part of the store could not be read; nothing was written')
 				return taskDic, False
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
@@ -2863,6 +2878,7 @@ class TSVZed(OrderedDict):
 				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
 								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
 								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
+			unreadable = reporter.has('unreadable')
 		finally:
 			reporter.flush()
 		OrderedDict.clear(self)
@@ -2886,7 +2902,7 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
-				and not self.memoryOnly):
+				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
 			# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
 			self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
 			self._specState.sawDefaults = True
@@ -3902,6 +3918,7 @@ class TSVZedLite(MutableMapping):
 							 strict=self.strict, defaults=self._constructorDefaults,
 							 correctColumnNum=self.correctColumnNum, storeOffset=True, taskDic=target,
 							 reporter=reporter, verbose=self.verbose)
+			unreadable = reporter.has('unreadable')
 		finally:
 			reporter.flush()
 		self._specState = load.state
@@ -3918,7 +3935,7 @@ class TSVZedLite(MutableMapping):
 		held = sum(1 for value in target.values() if isinstance(value, list))
 		if held:
 			_warnOnce(self, 'held', self._fileName, f'{held} keys from older or compressed parts are held in memory (offsets cannot address them)')
-		if not load.state.sawDefaults and any(self._constructorDefaults[1:]):
+		if not load.state.sawDefaults and any(self._constructorDefaults[1:]) and not unreadable:
 			self._pendingDefaults = True
 		return self
 
@@ -4927,6 +4944,8 @@ class _ServeStore(object):
 		"""Atomically return the row of ``key`` and append its tombstone; None when it is missing."""
 		with self.lock:
 			self._fresh(log)
+			if self.unreadable:
+				return _SERVE_PARTIAL
 			key = self.resolve(key)
 			row = self.data.get(key)
 			if row is None:
@@ -4940,6 +4959,8 @@ class _ServeStore(object):
 		"""Atomically return the row of the last (or first) live key and delete it; None when empty."""
 		with self.lock:
 			self._fresh(log)
+			if self.unreadable:
+				return _SERVE_PARTIAL
 			if not self.data:
 				return None
 			key = next(reversed(self.data)) if last else next(iter(self.data))
@@ -4952,6 +4973,8 @@ class _ServeStore(object):
 		"""Atomically return the row of ``cells[0]``, appending ``cells`` first when the key is missing."""
 		with self.lock:
 			self._fresh(log)
+			if self.unreadable:
+				return _SERVE_PARTIAL
 			key = self.resolve(cells[0])
 			row = self.data.get(key)
 			if row is not None:
@@ -5036,6 +5059,8 @@ _SERVE_ARITY = {
 	'delete': (1, None), 'has': (1, 1), 'pop': (1, 1), 'popitem': (0, 1), 'setdefault': (2, None),
 }
 _SERVE_UNREADABLE = 'could not read every part of the store'
+#: What pop, popitem and setdefault return instead of acting on a store they could not read whole.
+_SERVE_PARTIAL = object()
 #: Operations that fail on a missing store (spec §20.2.2).
 _SERVE_NEED_STORE = ('read', 'get', 'has', 'len', 'keys', 'pop', 'popitem', 'scrub', 'verify', 'parts')
 #: A pointer file larger than this is not one (spec §21.2).
@@ -5159,11 +5184,15 @@ def _serveDispatch(store, line, bulk, log):
 			if args and args[0] not in ('first', 'last'):
 				raise _ServeUsage('popitem takes first or last')
 			row = store.popitem(not args or args[0] == 'last', sync, log)
+		if row is _SERVE_PARTIAL:
+			return 1, [], _SERVE_UNREADABLE
 		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
 	if operation == 'setdefault':
 		if _MARKER_RE.match(raw[0]):
 			raise _ServeUsage('setdefault takes a data KEY, not a marker')
 		row = store.setdefault(args, sync, log)
+		if row is _SERVE_PARTIAL:
+			return 1, [], _SERVE_UNREADABLE
 		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
 	if operation in ('clear', 'scrub'):
 		done = store.clear(log) if operation == 'clear' else store.scrub(log)
