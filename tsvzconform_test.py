@@ -464,6 +464,23 @@ def test_a_handler_that_never_starts(tmp_path):
 	assert not tc.LIVE_HANDLERS
 
 
+def test_a_serve_that_forks_and_exits_leaves_nothing_running(tmp_path):
+	store = tmp_path / 's.tsvz'
+	store.write_text('')
+	pidfile = tmp_path / 'child.pid'
+	code = ('import os, sys, time\nif os.fork() == 0:\n\topen(%r, "w").write(str(os.getpid()))\n\ttime.sleep(30)\n\tos._exit(0)\n'
+		'time.sleep(0.5)\nsys.exit(0)\n' % str(pidfile))
+	script = tmp_path / 'forky.py'
+	script.write_text(code)
+	impl = tc.Impl('%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	with pytest.raises(tc.HandlerError, match='exited with status 0'):
+		tc.Handler(impl, str(store), str(tmp_path)).start()
+	pid = int(pidfile.read_text())
+	time.sleep(0.2)
+	with pytest.raises(ProcessLookupError):
+		os.kill(pid, 0)
+
+
 FAKE_SERVE = r'''
 import os, socket, sys, tempfile
 args = sys.argv[1:]

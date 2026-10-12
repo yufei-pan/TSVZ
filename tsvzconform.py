@@ -1127,6 +1127,13 @@ class Client(object):
 LIVE_HANDLERS = set()
 
 
+def _exited(proc):
+	"""True once `proc` has exited. Where os.waitid exists the leader is left a zombie, so its group can still be killed safely."""
+	if hasattr(os, 'waitid'):
+		return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+	return proc.poll() is not None
+
+
 class Handler(object):
 	"""The implementation's own `serve STORE` (§21.13), started and stopped by the runner (design section 2.7)."""
 
@@ -1150,8 +1157,9 @@ class Handler(object):
 		LIVE_HANDLERS.add(self)
 		deadline = time.time() + self.wait
 		while True:
-			if self.proc.poll() is not None:
-				self.exit = self.proc.returncode
+			if _exited(self.proc):
+				kill_group(self.proc.pid)
+				self.exit = reap(self.proc, self.wait)[0]
 				self._forget()
 				raise HandlerError('serve exited with status %d before answering%s' % (self.exit, self.stderr_tail()))
 			pointer = read_pointer(self.store)
