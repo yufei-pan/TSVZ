@@ -962,7 +962,7 @@ effect and exit status (§20.6).
 | `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`. It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
 | `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). |
 | `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store; it then writes nothing and exits with status 1. |
-| `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: part path, line number, algorithm, expected digest, computed digest. |
+| `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: the part path; the line number, which is the 1-based line, within that part, of the `#_checksum_<algo>_#` marker that closes the segment; the algorithm name in lowercase; the expected digest; and the computed digest. Both digests are printed in lowercase hexadecimal. |
 | `parts` | `STORE` | Print the parts of the store in replay order (§17.3), one per line: index (from 0), ordinal in hexadecimal (empty for the unnumbered part 0), path, and flags (`active` for the part appends go to, and the compression codec if any, separated by commas). Parts carrying `.rotated` are not listed. |
 | `has` | `STORE KEY` | Print nothing. Exit with status 0 when KEY is live and 3 when it is not. |
 | `len` | `STORE` | Print the number of live keys. |
