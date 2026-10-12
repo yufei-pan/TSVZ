@@ -1017,21 +1017,52 @@ def test_spec_bz2_and_xz_parts(tmp_path):
 	assert dict(_replay([b])[0]) == dict(_replay([x])[0]) == {'a': ['a', '1'], 'b': ['b', '2']}
 
 
-def test_spec_part_in_an_unsupported_codec_is_unreadable_and_never_repaired(tmp_path, monkeypatch):
-	# Spec §16.5: a reader without a part's codec fails; it neither skips the part nor reads or repairs its bytes.
+def _block_zstd(monkeypatch):
+	"""Make this Python look like one without compression.zstd (before 3.14)."""
 	monkeypatch.setitem(sys.modules, 'compression.zstd', None)
 	if 'compression' in sys.modules:  # Python 3.14+: an earlier import left zstd as an attribute of the package
 		monkeypatch.delattr(sys.modules['compression'], 'zstd', raising=False)
+	monkeypatch.setattr(TSVZ, '_CODEC_SUPPORT', {}, raising=False)
+
+
+ZST_JUNK = b'\x28\xb5\x2f\xfdjunk'
+
+
+def test_spec_part_in_an_unsupported_codec_is_unreadable_and_never_repaired(tmp_path, monkeypatch):
+	# Spec §16.5: a reader without a part's codec fails; it neither skips the part nor reads or repairs its bytes.
+	_block_zstd(monkeypatch)
 	z = str(tmp_path / 'a.tsvz.zst')
 	raw = b'\x28\xb5\x2f\xfdjunk'
 	_touch(z, raw)
 	status, out, err = _run('read', z)
-	assert status == 1 and out == '' and 'no zst support' in err
+	assert status == 1 and out == '' and 'no zstd support' in err
 	status, _, err = _run('set', z, 'k', 'v')
-	assert status == 1 and 'no zst support' in err
+	assert status == 1 and 'no zstd support' in err
+	for operation in ('clear', 'scrub'):
+		assert _run(operation, z)[0] == 1, operation
 	with open(z, 'rb') as f:
 		assert f.read() == raw
 	assert os.listdir(str(tmp_path)) == ['a.tsvz.zst']
+
+
+def test_spec_a_store_is_not_created_in_an_unsupported_codec(tmp_path, monkeypatch):
+	_block_zstd(monkeypatch)
+	new = str(tmp_path / 'new.tsvz.zst')
+	status, _, err = _run('set', new, 'k', 'v')
+	assert status == 1 and 'no zstd support' in err and not os.path.exists(new)
+
+
+def test_spec_clear_writes_nothing_when_a_part_cannot_be_read(tmp_path, monkeypatch):
+	# Tombstones for the readable parts alone would leave the unreadable part's keys alive.
+	_block_zstd(monkeypatch)
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1.zst', ZST_JUNK)
+	_touch(base + '.2', b'b\t2\n')
+	assert _run('clear', base)[0] == 1
+	with open(base + '.1.zst', 'rb') as f:
+		assert f.read() == ZST_JUNK
+	with open(base + '.2', 'rb') as f:
+		assert f.read() == b'b\t2\n'
 
 
 def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):

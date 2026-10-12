@@ -683,6 +683,29 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
 				_unlockFile(f)
 
 
+#: Compression suffix -> codec name (spec §16.2), as ``parts`` and error messages say it.
+_CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
+_CODEC_SUPPORT = {}
+
+
+def _codecSupported(codec):
+	"""True when this Python has ``codec`` (only zstd can be missing: it needs Python 3.14). Checked once per codec."""
+	name = _CODEC_NAMES.get(codec, codec)
+	if name not in _CODEC_SUPPORT:
+		try:
+			_newDecompressor(codec)
+			_CODEC_SUPPORT[name] = True
+		except ImportError:
+			_CODEC_SUPPORT[name] = False
+	return _CODEC_SUPPORT[name]
+
+
+def _requireCodec(codec):
+	"""Raise ImportError before any write to a part in a codec this Python lacks (spec §16.5): nothing is written."""
+	if codec and not _codecSupported(codec):
+		raise ImportError('no {} support in this Python'.format(_CODEC_NAMES.get(codec, codec)))
+
+
 def _compressBytes(codec, data, level=1):
 	"""Compress ``data`` as one complete member / stream for ``codec``."""
 	if codec in ('gz', 'gzip'):
@@ -694,10 +717,8 @@ def _compressBytes(codec, data, level=1):
 	if codec in ('xz', 'lzma'):
 		import lzma
 		return lzma.compress(data, preset=level)
-	try:
-		from compression import zstd  # Python 3.14+
-	except ImportError as e:
-		raise ImportError('no {} support in this Python ({})'.format(codec, e))
+	_requireCodec(codec)
+	from compression import zstd  # Python 3.14+
 	return zstd.compress(data, level=level)
 
 
@@ -1793,14 +1814,11 @@ def _iterPartLines(info, reporter):
 	except OSError as e:
 		reporter.note('unreadable', None, 'skipped unreadable part {} ({})'.format(info.path, e))
 		return
-	if info.codec:
-		try:
-			_newDecompressor(info.codec)
-		except ImportError as e:
-			# Spec §16.5: a codec this Python lacks makes the part unreadable; it is not damage to repair.
-			f.close()
-			reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python ({})'.format(info.path, info.codec, e))
-			return
+	if info.codec and not _codecSupported(info.codec):
+		# Spec §16.5: a codec this Python lacks makes the part unreadable; it is not damage to repair.
+		f.close()
+		reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python'.format(info.path, _CODEC_NAMES.get(info.codec, info.codec)))
+		return
 	rest = b''
 	with f:
 		chunks = _decompressChunks(f, info) if info.codec else iter(lambda: f.read(_CHUNK), b'')
@@ -2118,6 +2136,7 @@ def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLo
 		lines.append(_specFormatRecord(defaults, delimiter, marker=True))
 	content = ''.join(line + '\n' for line in lines).encode('utf-8')
 	codec = _parsePartName(fileName).codec
+	_requireCodec(codec)  # not even an empty file in a codec this Python lacks
 	try:
 		with open(fileName, 'xb') as f:
 			f.write(_compressBytes(codec, content) if codec and content else content)
@@ -2172,6 +2191,7 @@ def _specRepairCompressed(path, reporter):
 	intact.
 	"""
 	info = _PartInfo(path)
+	_requireCodec(info.codec)  # a part this Python cannot decode is not damaged; it is left alone
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
 			_lockFile(f)
@@ -2217,6 +2237,7 @@ def _specAppendPayload(path, payload, reporter, repair=False, fsync=False):
 	if not codec:
 		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
 		return
+	_requireCodec(codec)
 	if repair and os.path.exists(path):
 		_specRepairCompressed(path, reporter)
 	with _pathLock(path):
@@ -2261,6 +2282,7 @@ def _specRewriteInPlace(path, content, expect=None):
 	writer committed in between, so nothing is written and None is returned.
 	"""
 	codec = _parsePartName(path).codec
+	_requireCodec(codec)
 	raw = _compressBytes(codec, content) if codec and content else content
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
@@ -2407,6 +2429,9 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			parts, stamp = _specSnapshot(fileName)
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
+			if attempt.has('unreadable'):
+				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
+				return False
 			if len(load.parts) > 1:
 				tombstones = ''.join(_specFormatRecord([key], delimiter) + '\n' for key in load.data)
 				if tombstones:
@@ -2522,6 +2547,9 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=verifyHeader, strict=strict,
 							 defaults=initial, correctColumnNum=correctColumnNum, taskDic=taskDic,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
+			if attempt.has('unreadable'):
+				attempt.note('refused', None, 'scrub skipped: a part of the store could not be read; nothing was written')
+				return taskDic, False
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
 				attempt.note('multipart', None, 'scrub skipped: TSVZ does not compact multi-part stores or single parts of them; nothing was written')
 				return taskDic, False
@@ -4466,10 +4494,6 @@ _SERVE_CHECK_BYTES = 64
 #: A directory modified less than this long ago may change again within the same
 #: timestamp tick, so its part list is checked on every sync until it is older.
 _SERVE_RACY_SECONDS = 2.0
-
-
-#: Compression suffix -> the codec name ``parts`` prints (spec §16.2, §20.2).
-_CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
 
 
 def _partRows(store, reporter):
