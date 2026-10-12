@@ -229,16 +229,17 @@ and `-d=,`, except the ones C5 and C9 list.
 
 ## Spec deviations and interpretations
 
-- §19.2.3c: scrub keeps the header comment (3.39 header verification needs it).
+The conformance cases these deviations make fail are listed in
+`conformance/reference-baseline.json` (see Conformance testing).
+
 - §17.5: a numbered part opened directly is read alone, with a warning.
-- §4.1: a leading byte order mark is tolerated (stripped, with a warning).
-- A leading byte order mark is not part of any `#_checksum_*_#` segment.
-- §12.4.1: boolean marker values also accept `yes/no/on/off/1/0`; TSVZ writes `true`/`false`.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
 - §18.6: locking is the 3.39 exclusive `lockf` per write plus an in-process lock; readers do not lock.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
-- Invalid UTF-8 is replaced with U+FFFD (and reported).
-- v1 has no `<CR>` token, so a value whose last cell ends in `\r` loses it; values set through `TSVZed` are right-stripped, so this only affects rows passed raw to the append helpers.
+- §13: `<CR>` is neither written nor read yet. A carriage return is written raw, so one that ends a row's last value is lost, and `<CR>` in a file reads as text.
+- §10.4: marker values have trailing whitespace stripped, so `#_strip_trailing_whites_#` with `false ` turns stripping off; the spec makes that value invalid (§12.4.5).
+- §16.5: before Python 3.14 a `.zst` part is read as plain bytes instead of failing.
+- §20.2: `parts` names a compressed part's codec by its suffix (`gz`), not the codec name (`gzip`).
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
@@ -263,6 +264,24 @@ python3 website/tsvz_site.py build /tmp/site   # static files for any host
 ```
 
 `deploy/tsvz-site.service` runs it under systemd; restart it to publish an edit.
+
+## Conformance testing
+
+`tsvzconform.py` tests how closely an implementation of tsvz-spec-v1, in any
+language, follows the spec. Its cases are JSON files in `conformance/cases/`,
+each naming the § clauses it tests, and it drives an implementation only
+through the spec's command line (§20) and handler socket (§21).
+
+```bash
+python3 tsvzconform.py --impl ./tsvz --feature crc32,sha256,handler
+python3 tsvzconform.py --impl ./tsvz --class reader --only 13
+```
+
+Each failure is printed with its input, what was expected, what came back and
+a command line that reruns it alone; the summary gives a verdict for each
+conformance class (reader, writer, cli, handler). `conformance/README.md`
+explains the options and the features to claim, and how to load the cases into
+another language's tests.
 
 ## Benchmarking implementations
 
@@ -306,6 +325,7 @@ runs, because a single run can land in a slower mode as a whole.
 python3 -m pytest TSVZ_test.py -q                         # everything, incl. 3.39 differential tests
 python3 -m pytest website/tsvz_site_test.py -q            # the tsvz.org site
 python3 -m pytest tsvzbench_test.py -q                    # the benchmark harness
+python3 -m pytest tsvzconform_test.py -q                  # the conformance runner and cases, against the reference
 python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a test)
 ```
 

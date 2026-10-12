@@ -84,8 +84,12 @@ TSVZ 4.2 is the first Python release that follows spec v1. Earlier releases
 (3.x) read `.tsvz` files under older rules.
 
 Writing one in another language? The spec is one document with worked
-examples and pseudocode. Test against the reference implementation, then
-[open an issue](https://github.com/yufei-pan/TSVZ/issues) to be listed here.
+examples and pseudocode, and the
+[conformance suite](https://github.com/yufei-pan/TSVZ/tree/main/conformance)
+tests an implementation against it, class by class: the Read, Write, CLI and
+Handler columns above. Run it, then
+[open an issue](https://github.com/yufei-pan/TSVZ/issues) with its report to be
+listed here.
 
 ## When TSVZ isn't the right fit
 
