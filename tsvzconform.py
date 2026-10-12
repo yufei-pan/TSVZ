@@ -1538,6 +1538,7 @@ def run_case(case, mode, ctx):
 	'Without --format, output to a terminal uses the table layout, which differs from the records the same command prints to a file.')
 def check_terminal_default(cx):
 	import pty
+	from select import select as wait_readable
 	store = cx.write('s.tsvz', 'alpha\tA\t1\nbeta\tB<sep>x\t2\n')
 	records = cx.run(cx.impl.argv + ['--format', 'records', 'read', store])
 	if records.exit != 0:
@@ -1546,11 +1547,18 @@ def check_terminal_default(cx):
 	try:
 		proc = subprocess.Popen(cx.impl.argv + ['read', store], cwd=cx.impl.cwd, stdin=subprocess.DEVNULL, stdout=slave,
 			stderr=subprocess.DEVNULL, start_new_session=True)
+		LIVE_GROUPS.add(proc.pid)
 		os.close(slave)
 		slave = None
 		chunks = []
 		deadline = time.time() + cx.timeout
-		while time.time() < deadline:
+		timed_out = False
+		while True:
+			left = deadline - time.time()
+			if left <= 0 or not wait_readable([master], [], [], left)[0]:
+				timed_out = True
+				kill_group(proc.pid)
+				break
 			try:
 				chunk = os.read(master, 65536)
 			except OSError:
@@ -1564,6 +1572,8 @@ def check_terminal_default(cx):
 		if slave is not None:
 			os.close(slave)
 	shown = b''.join(chunks).replace(b'\r\n', b'\n')
+	if timed_out:
+		return ['read on a terminal timed out after %.0f s' % cx.timeout]
 	if code != 0:
 		return ['read on a terminal exited %s' % code]
 	if shown == records.stdout:

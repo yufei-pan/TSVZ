@@ -540,6 +540,8 @@ if mode == 'hang' and op == 'read':
 	time.sleep(60)
 if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
+if mode == 'ttyhang' and op == 'read' and os.isatty(1):
+	time.sleep(40)
 if mode == 'decoy' and op == 'get':
 	try:
 		lines = open(store + '.serve').read().split('\n')
@@ -645,6 +647,15 @@ def test_a_missing_tool_fails_and_a_runner_bug_is_an_error(tmp_path, monkeypatch
 def test_every_procedural_check_passes_with_the_reference(check, tmp_path):
 	result = tc.run_case(check, 'files', context(tmp_path / 'work', features=['handler']))
 	assert result.result in (tc.PASS, tc.SKIP), result.detail
+
+
+def test_the_terminal_check_obeys_the_timeout(tmp_path):
+	check = next(c for c in tc.CHECKS if c.id == '20.4.3-terminal-output-is-a-table')
+	ctx = tc.Context(tc.Impl(fake(tmp_path, 'ttyhang')), str(tmp_path), 2.0, frozenset())
+	started = time.time()
+	result = tc.run_case(check, 'files', ctx)
+	assert time.time() - started < 15
+	assert result.result == tc.WARN and 'timed out' in ' '.join(result.detail)
 
 
 def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
