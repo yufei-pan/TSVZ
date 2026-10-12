@@ -1165,6 +1165,163 @@ def test_spec_strict_read_reports_a_damaged_first_part_not_a_header_mismatch(tmp
 	assert 'damaged' in capsys.readouterr().err
 
 
+GZ_TRUNCATED_B = gzip.compress(b'b\t2\n')[:-6]  # a member cut short in its trailer, as a crash leaves it
+
+
+def test_spec_append_after_a_damaged_compressed_part_stays_readable(tmp_path):
+	# An append adds a member; after a damaged one no reader reaches it, so the part is repaired first.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	TSVZ.appendLinesTabularFile(p, [['c', '3']])
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b', 'c'}
+	assert any(name.startswith('m.tsvz.gz.damaged-') for name in os.listdir(str(tmp_path)))
+
+
+def test_spec_append_to_a_compressed_part_reads_only_its_tail(tmp_path, monkeypatch):
+	# An append costs the same whatever the part's size: only the part's tail is checked for damage.
+	p = str(tmp_path / 'big.tsvz.gz')
+	_touch(p, gzip.compress(b''.join(b'k%d\t%s\n' % (i, os.urandom(16).hex().encode()) for i in range(40000))))
+	assert os.path.getsize(p) > 4 * TSVZ._TAIL_WINDOW
+	read = []
+	real_open = open
+
+	class Counting(object):
+		def __init__(self, f):
+			self._f = f
+		def read(self, *args):
+			data = self._f.read(*args)
+			read.append(len(data))
+			return data
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+
+	monkeypatch.setattr(TSVZ, 'open', lambda *args, **kwargs: Counting(real_open(*args, **kwargs)), raising=False)
+	TSVZ.appendLinesTabularFile(p, [['new', 'v']])
+	monkeypatch.undo()
+	assert sum(read) <= TSVZ._TAIL_WINDOW
+	assert TSVZ.readTabularFile(p)['new'] == ['new', 'v']
+
+
+@pytest.mark.parametrize('suffix', ['gz', 'bz2', 'xz', 'zst'])
+def test_spec_tail_check_finds_a_damaged_last_member(tmp_path, suffix):
+	if not TSVZ._codecSupported(suffix):
+		pytest.skip('no {} support in this Python'.format(suffix))
+	def member(data):
+		return TSVZ._compressBytes(suffix, data)
+	p = str(tmp_path / ('m.tsvz.' + suffix))
+	_touch(p, member(b'a\t1\n') + member(b'b\t2\n'))
+	assert not TSVZ._specTailDamaged(p)
+	_touch(p, member(b'a\t1\n') + member(b'b\t2\n')[:-3])  # cut short, as a crash leaves it
+	assert TSVZ._specTailDamaged(p)
+	_touch(p, member(b'a\t1\n') + member(b'b\t2\n') + b'junk')
+	assert TSVZ._specTailDamaged(p)
+
+
+def test_engine_append_after_a_damaged_compressed_part_stays_readable(tmp_path):
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	store = TSVZ._ServeStore(p, create=True)
+	store.write([(['c', '3'], False)], False, None)
+	store.close()
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b', 'c'}
+
+
+def test_spec_read_keeps_records_before_the_damage_in_the_same_chunk(tmp_path):
+	# Member b lost the end of its trailer, so the next member's header is read as b's length: the
+	# decompressor fails there, after b's records, which a reader keeps.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\n')[:-4] + gzip.compress(b'c\t3\n'))
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b'}
+
+
+def test_spec_strict_scrub_of_a_part_damaged_before_any_line(tmp_path, capsys):
+	# The repair leaves the part empty; the scrub does not then call that a header mismatch.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, GZ_CORRUPT)
+	TSVZ.scrubTabularFile(p, header='key\tvalue', strict=True)
+	assert any(name.startswith('m.tsvz.gz.damaged-') for name in os.listdir(str(tmp_path)))
+
+
+def test_spec_scrub_repair_does_not_use_up_an_attempt(tmp_path, monkeypatch):
+	monkeypatch.setattr(TSVZ, '_SPEC_REWRITE_ATTEMPTS', 1)
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	assert TSVZ._specScrub(p, delimiter='\t')[1] is True
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b'}
+
+
+def test_spec_scrub_refuses_when_the_damaged_part_cannot_be_backed_up(tmp_path, monkeypatch, capsys):
+	# No room for <part>.damaged-<time> (a full disk, a read-only directory): nothing is written.
+	def no_room(path, reporter):
+		raise OSError(28, 'No space left on device')
+	monkeypatch.setattr(TSVZ, '_specRepairCompressed', no_room)
+	p = str(tmp_path / 'm.tsvz.gz')
+	raw = gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B
+	_touch(p, raw)
+	assert TSVZ._specScrub(p, delimiter='\t')[1] is False
+	assert 'could not be repaired' in capsys.readouterr().err
+	with open(p, 'rb') as f:
+		assert f.read() == raw
+
+
+def test_spec_repair_leaves_no_partial_backup_when_the_copy_fails(tmp_path, monkeypatch):
+	def full(source, target, *args):
+		target.write(b'partial')
+		raise OSError(28, 'No space left on device')
+	monkeypatch.setattr(TSVZ.shutil, 'copyfileobj', full)
+	p = str(tmp_path / 'm.tsvz.gz')
+	raw = gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B
+	_touch(p, raw)
+	with pytest.raises(OSError):
+		TSVZ._specRepairCompressed(p, TSVZ._Reporter(p))
+	assert os.listdir(str(tmp_path)) == ['m.tsvz.gz']
+	with open(p, 'rb') as f:
+		assert f.read() == raw
+
+
+def test_spec_read_stopped_by_an_io_error_counts_as_unreadable(tmp_path, monkeypatch, capsys):
+	# A part that opens but cannot be read (EIO) hides its header too: report it, not a header mismatch.
+	p = str(tmp_path / 'm.tsvz')
+	_touch(p, b'a\t1\n')
+
+	class Failing(object):
+		def __init__(self, path, mode):
+			pass
+		def read(self, size=-1):
+			raise OSError(5, 'Input/output error')
+		def close(self):
+			pass
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self.close()
+
+	monkeypatch.setattr(TSVZ, 'open', Failing, raising=False)
+	assert TSVZ.readTabularFile(p, header='key\tvalue', strict=True) == {}
+	assert 'stopped reading' in capsys.readouterr().err
+
+
+def test_spec_lite_refused_clear_still_writes_pending_defaults(tmp_path, monkeypatch):
+	p = str(tmp_path / 'd.tsvz')
+	lite = TSVZ.TSVZedLite(p, defaults=['key', 'dflt'])
+	lite.close()
+	_touch(p, b'a\t1\n')  # the store lost its #_defaults_# marker
+	lite = TSVZ.TSVZedLite(p, defaults=['key', 'dflt'])
+	_touch(p, b'a\t1\n')
+	monkeypatch.setattr(TSVZ, '_specClearTabularFile', lambda *args, **kwargs: False)
+	try:
+		with pytest.raises(OSError):
+			lite.clear()
+	finally:
+		lite.close()
+	with open(p, 'rb') as f:
+		assert b'#_defaults_#' in f.read()
+
+
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
 	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
 	_block_zstd(monkeypatch)
@@ -2659,6 +2816,11 @@ def test_cli_table_shows_bidi_and_line_separator_characters_as_escapes(tmp_path)
 
 def test_pretty_format_table_without_a_header():
 	assert TSVZ.pretty_format_table([['a', 'bb'], ['ccc', 'd']], header=False, full=True) == 'a   | bb\nccc | d \n'
+
+
+def test_pretty_format_table_without_a_header_drops_dict_keys():
+	assert TSVZ.pretty_format_table([{'k': 'a', 'v': '1'}], header=False, full=True) == 'a | 1\n'
+	assert TSVZ.pretty_format_table({'a': {'v': '1'}}, header=False, full=True) == 'a | 1\n'
 
 
 def test_pretty_format_table_pads_wide_characters_by_display_width():
