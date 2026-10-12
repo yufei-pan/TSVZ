@@ -13,7 +13,7 @@ tool, handler). Its per-class verdicts are the Read / Write / CLI / Handler
 columns of the implementations table on tsvz.org.
 
 Expected results come from the spec text, never from what the reference
-implementation happens to do. Writing the suite settles twelve gaps in the spec
+implementation happens to do. Writing the suite settles fourteen gaps in the spec
 (section 5); each lands in the spec together with the cases that test it.
 
 In this document `§N` refers to tsvz-spec-v1; "section N" refers to this
@@ -184,6 +184,8 @@ the whole part when a step rewrote it.
 | `appended` | 3.1 | Every part's earlier bytes are an unchanged prefix of its new bytes |
 | `unchanged` | 20.2, 20.6 | Every part is byte-identical to before (refusals) |
 | `same-file` | 18.7 | Every part that existed keeps its inode and permission bits |
+| `last-part-only` | 17.7 | Only the last part grew: the same parts exist, every other part is byte-identical, and the last one's earlier bytes are unchanged |
+| `header-kept` | 19.8 | The first committed line is still the original header comment |
 | `snapshot-layout` | 19.2.3 | Optionally the original header comment first (decision 9); then a block of marker lines with `#_version_#` first and, if present, `#_defaults_#` last; then one data row per live key, in first-appearance order, each with at least one delimiter; then optionally another block of marker lines restoring the final state (decision 12). No other comment, no tombstone, no key twice |
 
 A case has a single level, so a SHOULD rule (such as `lf-terminated`) gets its
@@ -431,7 +433,7 @@ without writing the cases twice.
 
 ## 5. Spec decisions
 
-Each decision is one spec commit carrying the cases that test it. v1 is still a
+Each decision is one spec commit carrying the cases that test it. Decisions 13 and 14 came up while the cases were written and were settled with the user at that checkpoint (section 4.1.3). v1 is still a
 Draft, so these are clarifications without a version bump.
 `website/spec-glance.md` is updated where it repeats a changed rule.
 
@@ -449,6 +451,8 @@ Draft, so these are clarifications without a version bump.
 | 10 | §13.2, §13.3, §13.5, §6.1 | Add the token `<CR>` for U+000D. Writers MUST encode every carriage return as `<CR>`; readers decode it. A raw `\r` before `\n` is still stripped (§4.2). §13.5 gains the example | deviates: writes raw `\r`, does not decode `<CR>` |
 | 11 | §15.2 | A registry: `crc32` (CRC-32/ISO-HDLC, as zlib's `crc32`), `crc32c` (CRC-32C, Castagnoli), `sha256` (FIPS 180-4), `blake3` (default 32-byte output). A CRC is written as its 32-bit value in 8 hex digits, most significant first; a hash as its output bytes in order. Other names MAY be supported; their meaning is implementation-defined | conforms for crc32 and sha256; has no crc32c or blake3 (optional) |
 | 12 | §19.2.3, §19.4, §19.6 | A snapshot MUST preserve the live rows and the final marker state. When it writes its rows under different marker state to keep them exact, it MUST re-emit the final markers after the rows; the layout of §19.2.3 and the strategy suggested in §19.4 say so | conforms |
+| 13 | §16.4, §16.6, §17.7 | A command-line tool appends to the store's last part in replay order, which `parts` flags `active`; §17.7's fresh-part advice is for long-running writers. A compressed part is appended to by writing a new compressed member (gzip member, bzip2 or xz stream, Zstandard frame), never by rewriting it. Readers MUST read every member of a part as one stream; a final member cut short is a torn tail, not an error | conforms (it appends members) |
+| 14 | §20.2 | `parts` flags a compressed part with its codec name, `gzip`, `bzip2`, `xz` or `zstd`, whatever suffix spelling the file uses | deviates: prints the suffix (`gz`) |
 
 ## 6. Report and exit status
 
