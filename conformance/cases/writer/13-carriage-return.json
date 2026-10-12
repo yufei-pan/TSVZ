@@ -1,0 +1,12 @@
+{"format": 1, "class": "writer", "cases": [
+{"id": "13.3-set-encodes-carriage-returns", "spec": ["13.3", "13.5"], "level": "MUST",
+ "note": "Every carriage return is written <CR>, so one inside a value and one ending the last value both read back.",
+ "steps": [{"op": ["set", "k", "e\rf", "x\r"]},
+  {"op": ["get", "k"], "stdout": {"rows": [["k", "e\rf", "x\r"]]}}],
+ "after": {"rows": [["k", "e\rf", "x\r"]], "bytes": ["encoded"]}},
+{"id": "19.2-scrub-keeps-a-carriage-return", "spec": ["19.2", "13.3"], "level": "MUST",
+ "note": "A scrub writes a carriage return as <CR>, so one ending the last value survives.",
+ "files": {"s.tsvz": "a\tc<CR>\nb\tx<CR>y\n"},
+ "steps": [{"op": ["scrub"]}],
+ "after": {"rows": [["a", "c\r"], ["b", "x\ry"]], "fidelity": "full", "bytes": ["snapshot-layout", "same-file", "encoded"]}}
+]}

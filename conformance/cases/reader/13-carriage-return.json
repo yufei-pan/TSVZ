@@ -1,0 +1,10 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "13.2-cr-token-decodes", "spec": ["13.2", "13.4"], "level": "MUST",
+ "note": "<CR> reads back as a carriage return.",
+ "files": {"s.tsvz": "a\tc<CR>r\tx\n"},
+ "expect": {"read": [["a", "c\rr", "x"]]}},
+{"id": "13.5-cr-token-at-the-end-of-a-row", "spec": ["13.5", "13.2"], "level": "MUST",
+ "note": "<CR> at the end of the last cell reads back as a carriage return.",
+ "files": {"s.tsvz": "a\tx<CR>\n"},
+ "expect": {"read": [["a", "x\r"]]}}
+]}

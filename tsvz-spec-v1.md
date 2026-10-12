@@ -467,10 +467,10 @@ MAY warn about it.
 
 ## 13. Field escaping
 
-13.1 The variant delimiter, the line feed `\n`, and the escape introducer `<`
-cannot appear literally inside a field; they are represented by reversible
-**control tokens** of the form `<...>`. The number sign `#` is represented by a
-token only where required by §8.3. Reading inverts writing.
+13.1 The variant delimiter, the line feed `\n`, the carriage return `\r`, and the
+escape introducer `<` cannot appear literally inside a field; they are represented
+by reversible **control tokens** of the form `<...>`. The number sign `#` is
+represented by a token only where required by §8.3. Reading inverts writing.
 
 ### 13.2 Token table (version 1)
 
@@ -478,11 +478,13 @@ token only where required by §8.3. Reading inverts writing.
 |------------------------|----------------|--------------|
 | the delimiter character | `<sep>` | the delimiter character |
 | line feed `U+000A`      | `<LF>`  | line feed |
+| carriage return `U+000D` | `<CR>` | carriage return |
 | less-than `<` `U+003C`  | `<lt>`  | `<` |
 | number sign `#` `U+0023`| `<#>`   | `#` |
 
 13.3 **Writer rules.** A conformant writer **MUST** encode every literal `<` as
-`<lt>`, every delimiter character as `<sep>`, and every line feed as `<LF>`. A
+`<lt>`, every delimiter character as `<sep>`, every line feed as `<LF>`, and every
+carriage return as `<CR>`. A
 writer **MUST** encode a `#` as `<#>` when it is the first character of a data key
 (§8.3); elsewhere `#` MAY be written literally. A writer **MUST NOT** emit a bare
 `<`.
@@ -505,6 +507,8 @@ a split.
    - a data key whose value is `#foo`: written `<#>foo` (raw first field begins
      `<`, classified as data) ⟶ reads as `#foo`
    - `a<b`: written `a<lt>b` ⟶ reads as `a<b`
+   - a value ending in a carriage return: written `a<CR>` ⟶ reads as `a`‹CR› (a raw
+     `\r` there would be removed as part of a CRLF line ending, §4.2)
 
 13.6 The token *framing* (`<...>`) and the literal-`<` rule (§13.3–§13.4) are part
 of the frozen meta-grammar (§6.1). The *set of recognized token names* MAY grow in
