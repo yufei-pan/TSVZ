@@ -511,6 +511,8 @@ def _check_step(step, where):
 	elif action in ('append', 'write'):
 		if not _content_ok(value) or not isinstance(step.get('path'), str):
 			_fail(where, '%s needs content and a path' % action)
+		if os.path.isabs(step['path']) or '..' in step['path'].split('/'):
+			_fail(where, '%s takes a relative path inside the case directory' % action)
 	elif action == 'check':
 		_check_after(value, where)
 	if 'stdin' in step and not _content_ok(step['stdin']):

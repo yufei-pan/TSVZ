@@ -170,6 +170,8 @@ def test_bad_reader_cases_are_refused(raw, problem):
 	([{'argv': []}, {'raw': 'len\n'}], 'cannot mix'),
 	([{'check': {'bytes': ['nope']}}], 'byte rule'),
 	([{'append': 'x'}], 'needs content and a path'),
+	([{'append': 'x', 'path': '../escape.tsvz'}], 'relative path'),
+	([{'write': 'x', 'path': '/tmp/abs.tsvz'}], 'relative path'),
 ])
 def test_bad_steps_are_refused(steps, problem):
 	raw = {'id': '20.2-x', 'spec': ['20.2'], 'level': 'MUST', 'note': 'n', 'steps': steps}
