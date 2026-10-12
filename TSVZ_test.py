@@ -1744,6 +1744,46 @@ def test_spec_a_byte_order_mark_after_dropped_bytes_is_data(tmp_path):
 	assert list(TSVZ.readTabularFile(p)) == ['\ufeffk']
 
 
+def test_engine_reloads_a_stopped_store_scrubbed_down_to_the_stop(tmp_path):
+	# The scrub leaves exactly the bytes before the stop: same size as the follower's offset, but a rewrite.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_version_#\t1\n#_on_corruption_#\tstop\na\t1\nb\t2\n\0\0\0c\t3\nd\t4\n')
+	store = TSVZ._ServeStore(p, create=True)
+	TSVZ.scrubTabularFile(p)
+	with open(p, 'ab') as f:
+		f.write(b'e\t5\n')
+	store.sync(None)
+	assert not store.stopped and store.read(None) == [['a', '1'], ['b', '2'], ['e', '5']]
+	store.close()
+
+
+def test_cli_scrub_of_a_stopped_store_says_it_rewrote(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\nd\t4\n')
+	status, _, err = _run('scrub', p)
+	assert status == 1 and 'rewritten' in err and 'nothing was written' not in err
+
+
+def test_spec_a_zero_fill_stop_still_reports_damaged_members(tmp_path, capsys):
+	bad = _crc_only_flip(gzip.compress(b''.join(b'k%04d\tv\n' % i for i in range(500))))
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + bad + gzip.compress(b'#_on_corruption_#\tstop\n\0\0z\t9\n'))
+	TSVZ.readTabularFile(p)
+	err = capsys.readouterr().err
+	assert 'not verified' in err and 'stopped' in err
+
+
+def test_engine_follower_removes_a_byte_order_mark_only_at_the_part_start(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'\xef\xbb\xbf')
+	store = TSVZ._ServeStore(p, create=True)
+	with open(p, 'ab') as f:
+		f.write(b'\xef\xbb\xbfk\t1\n')
+	store.sync(None)
+	assert store.read(None) == [['\ufeffk', '1']] == list(TSVZ.readTabularFile(p).values())
+	store.close()
+
+
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
 	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
 	_block_zstd(monkeypatch)

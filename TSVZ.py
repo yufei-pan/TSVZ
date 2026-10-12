@@ -1971,6 +1971,55 @@ def _nextMemberStart(f, codec, start):
 _STOP = object()
 
 
+def _gzipHeaderLength(data):
+	"""The length of the gzip member header at the start of ``data`` (RFC 1952), or None when it is not all there."""
+	if len(data) < 10 or data[:3] != b'\x1f\x8b\x08':
+		return None
+	flags = data[3] if not isinstance(data[3], str) else ord(data[3])
+	pos = 10
+	if flags & 4:  # FEXTRA
+		if len(data) < pos + 2:
+			return None
+		pos += 2 + data[pos] + 256 * data[pos + 1]
+	for flag in (8, 16):  # FNAME, FCOMMENT: zero-terminated
+		if flags & flag:
+			end = data.find(b'\0', pos)
+			if end < 0:
+				return None
+			pos = end + 1
+	if flags & 2:  # FHCRC
+		pos += 2
+	return pos if pos <= len(data) else None
+
+
+def _gzipUnpad(region):
+	"""A damaged gzip member's bytes without the zero padding that ends them (spec §16.6 rule 2), keeping the
+	zero bytes that are its own: the end of its compressed data, or the rest of a trailer it has begun."""
+	import zlib
+	stripped = region.rstrip(b'\0')
+	zeros = len(region) - len(stripped)
+	if not zeros:
+		return region
+	start = _gzipHeaderLength(region)
+	if start is None or start > len(stripped):
+		return stripped
+	inflater = zlib.decompressobj(-15)  # the compressed data alone, to see where it ends
+	try:
+		inflater.decompress(stripped[start:])
+		if not inflater.eof:  # its last bytes may be zero bytes of its own
+			for count in range(1, zeros + 1):
+				inflater.decompress(b'\0')
+				if inflater.eof:
+					return stripped + b'\0' * count  # the trailer had not begun: the rest is padding
+			return stripped
+	except zlib.error:
+		return stripped  # the zero bytes are not compressed data: padding after a member cut short
+	begun = len(inflater.unused_data)  # trailer bytes before the zeros
+	if 0 < begun < 8:
+		return stripped + b'\0' * min(8 - begun, zeros)
+	return stripped
+
+
 def _decodeAlone(raw, codec):
 	"""Decode a damaged member's bytes on their own (spec §16.6 rule 2): ``(cutShort, output, error)``.
 
@@ -2032,7 +2081,7 @@ def _decompressChunks(f, info):
 		f.seek(start)
 		raw = f.read(stop - start)
 		if _CODEC_NAMES[info.codec] == 'gzip':
-			raw = raw.rstrip(b'\0')  # zero padding before the next member (spec §16.6)
+			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
 		cutShort, out, error = _decodeAlone(raw, info.codec)
 		if cutShort:
 			info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
@@ -2086,6 +2135,7 @@ def _iterPartLines(info, reporter, label=''):
 			for chunk in chunks:
 				if chunk is None:  # a damaged member ended: the unfinished line before the next member is dropped
 					rest = b''
+					atStart = False  # the part's bytes began before this point (spec §4.7)
 					continue
 				if chunk is _STOP:
 					info.stopped = True
@@ -2093,6 +2143,9 @@ def _iterPartLines(info, reporter, label=''):
 					break
 				data = rest + chunk if rest else chunk
 				if atStart:
+					if len(data) < 3 and b'\n' not in data:
+						rest = data  # too few bytes yet to tell whether they begin with a byte order mark
+						continue
 					atStart = False
 					if data.startswith(b'\xef\xbb\xbf'):
 						data = data[3:]
@@ -2116,6 +2169,11 @@ def _iterPartLines(info, reporter, label=''):
 	if rest:
 		info.tail = rest
 		reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(rest[:80]))
+	_reportPartDamage(info, reporter)
+
+
+def _reportPartDamage(info, reporter):
+	"""Report what was wrong with a compressed part's members (spec §4.10)."""
 	if info.damaged:
 		reporter.note('stopped' if info.stopped else 'damaged', None, 'compressed part {}: {}'.format(info.path, '; '.join(info.damaged)))
 
@@ -2197,6 +2255,7 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 			if fill is not raw:
 				info.lost = True
 				if fill is _STOP:
+					_reportPartDamage(info, reporter)  # the part reader stops here too, before its own report
 					info.stopped = True
 					info.lines = lineNo
 					info.committed = offset  # where reading stopped: a follower checks the bytes before it
@@ -2222,18 +2281,19 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 			return
 
 
-def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter):
+def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter, atStart=False):
 	"""Replay one committed line of the part ``path``, as ``_specReplay`` does for each line.
 
 	``raw`` is the line with its b'\\n'; ``lineNo`` counts from 1 within the
-	part and ``label`` prefixes locations in reports. Returns ``(text,
+	part and ``label`` prefixes locations in reports; ``atStart`` says the line
+	begins the part, the one place a byte order mark is removed (spec §4.7). Returns ``(text,
 	record)`` as ``_specProcessRecord`` sees it, None for the checksum marker
 	of a supported algorithm or an ignored zero-filled line, or ``_STOP``.
 	(``_specReplay`` keeps this logic inline for speed; the two must stay in
 	step.)
 	"""
 	where = '{}line {}'.format(label, lineNo)
-	if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
+	if atStart and raw.startswith(b'\xef\xbb\xbf'):
 		raw = raw[3:]
 		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
 	whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
@@ -2927,8 +2987,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
 	never compacted away. ``done`` is False when nothing was written because
 	the store is missing, has several parts (or the path names one part), or
-	kept changing, and also when the read stopped at damaged data (spec
-	§4.10): the part is then rewritten from what was read, the original kept.
+	kept changing. It is None when the read stopped at damaged data (spec
+	§4.10): the part was rewritten from what was read, the original kept.
 	"""
 	if taskDic is None:
 		taskDic = {}
@@ -2991,7 +3051,7 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if verbose:
 				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
 			# A read that stopped at damaged data was rewritten as far as it went, but it still failed (spec §4.10).
-			return taskDic, not attempt.has('stopped')
+			return taskDic, None if attempt.has('stopped') else True
 		attempt.note('changing', None, 'scrub skipped: the store kept changing while it was being compacted; nothing was written')
 	finally:
 		reporter.flush()
@@ -5171,9 +5231,9 @@ class _ServeStore(object):
 	def _follow(self, path, stamp, log):
 		"""Replay what was appended to the active part; False when it changed some other way."""
 		old = self.stamps.get(path)
-		if (_parsePartName(path).codec or old is None or stamp[0] != old[0] or stamp[1] < self.offset
-				or stamp[1] == old[1]):
-			return False  # an append always grows the part; anything else is a rewrite
+		if (self.stopped or _parsePartName(path).codec or old is None or stamp[0] != old[0]
+				or stamp[1] < self.offset or stamp[1] <= old[1]):
+			return False  # an append always grows the part; anything else is a rewrite (and a stopped read is read again)
 		try:
 			with open(path, 'rb') as f:
 				f.seek(self.offset - len(self.check))
@@ -5188,8 +5248,8 @@ class _ServeStore(object):
 		reporter = _Reporter(self.path, log)
 		try:
 			if end:
-				for raw in data[:end].split(b'\n')[:-1]:
-					self._apply(raw + b'\n', reporter)
+				for i, raw in enumerate(data[:end].split(b'\n')[:-1]):
+					self._apply(raw + b'\n', reporter, atStart=self.offset == 0 and i == 0)
 			tail = data[end:]
 			if tail and tail != self.tailSeen:
 				reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(tail[:80]))
@@ -5201,8 +5261,8 @@ class _ServeStore(object):
 		self.stamps[path] = (stamp[0], self.offset + len(data) - end, stamp[2])
 		return True
 
-	def _apply(self, raw, reporter):
-		"""Replay one appended committed line of the active part into the view."""
+	def _apply(self, raw, reporter, atStart=False):
+		"""Replay one appended committed line of the active part into the view; ``atStart``: it begins the part."""
 		self.lineNo += 1
 		if not self.spec:
 			try:
@@ -5216,7 +5276,7 @@ class _ServeStore(object):
 		if self.stopped:
 			return  # a stop policy ended the read: nothing after it is read (spec §4.10)
 		replayed = _specReplayLine(raw, self.lineNo, self.label, self.parts[-1], self.state, self.delimiter,
-								   reporter)
+								   reporter, atStart)
 		if replayed is _STOP:
 			self.stopped = self.unreadable = True
 			return
@@ -5404,7 +5464,8 @@ class _ServeStore(object):
 				self.reload(log)
 
 	def scrub(self, log):
-		"""``scrub`` (spec §20.2) through the library; True when it was not refused."""
+		"""``scrub`` (spec §20.2) through the library; True when done, False when refused, None when the read
+		stopped at damaged data and the store was rewritten from what was read (spec §4.10)."""
 		with self.lock:
 			self.writer.barrier()
 			try:
@@ -5599,6 +5660,8 @@ def _serveDispatch(store, line, bulk, log):
 		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
 	if operation in ('clear', 'scrub'):
 		done = store.clear(log) if operation == 'clear' else store.scrub(log)
+		if done is None:  # spec §4.10: rewritten from a read that stopped at damaged data
+			return 1, [], 'the read stopped at damaged data; the store was rewritten from what was read, the original kept'
 		return (0, [], '') if done else (1, [], '{} refused; nothing was written'.format(operation))
 	if operation == 'verify':
 		mismatches, readable = store.verify(log)
@@ -6920,6 +6983,10 @@ def _cliScrub(args, delimiter, logger, stdin, stdout):
 						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
 	if done:
 		return 0
+	if done is None:
+		logger.teelog('tsvz: {}: the read stopped at damaged data (#_on_corruption_# stop); the store was rewritten '
+					  'from what was read, and the original part was kept as a .damaged- copy'.format(args.store), 'error')
+		return 1
 	logger.teelog('tsvz: {}: scrub refused; nothing was written'.format(args.store), 'error')
 	return 1
 
