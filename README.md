@@ -26,7 +26,7 @@ The delimiter follows the extension: tab, comma, NUL, pipe. A trailing
 compression suffix (`.gz`, `.bz2`, `.xz`, `.zst`) is allowed on both; `.zst`
 needs Python 3.14. For important or sensitive data, keep the part you write to
 uncompressed and compress parts once they no longer change: a damaged
-compressed member loses every record in it (spec §16.4.3).
+compressed member can lose every record in it (spec §16.4.2).
 
 `TSVZed`, `TSVZedLite`, `readTabularFile`, `appendTabularFile`,
 `appendLinesTabularFile`, `clearTabularFile`, `scrubTabularFile` (and the
@@ -178,12 +178,12 @@ TSVZ warning: data.tsvz: invalid UTF-8 replaced with U+FFFD (3 occurrences, firs
 Examples: bytes after the last newline (ignored on read; truncated before the
 next append, and quoted), invalid UTF-8, a byte order mark, a newer
 `#_version_#`, a marker with a bad value, a checksum mismatch, a damaged
-compressed member (it is skipped and reading continues at the next complete
-member, spec §16.6; a last member cut short keeps its whole lines, and
-`TSVZed`, `TSVZedLite` and `tsvz serve` write them again with their first
-append; a scrub that drops a damaged member keeps the original part as
-`<part>.damaged-<time>`), an unreadable part, and a delimiter or encoding
-argument that conflicts with the extension.
+compressed member or a zero-filled line (a member cut short by a crash keeps
+the whole lines it decoded; a corrupt member or a zero-filled line is
+recovered, skipped or stops the read, as the store's `#_on_corruption_#` says,
+`recover` by default, spec §4.9, §4.10, §16.6; a scrub that rewrites such a
+part keeps the original as `<part>.damaged-<time>`), an unreadable part, and a
+delimiter or encoding argument that conflicts with the extension.
 
 ## Breaking changes from 3.39
 
@@ -214,7 +214,8 @@ argument that conflicts with the extension.
 | S10 | Files named `x.tsvz.<hex>` beside `x.tsvz` are read as parts of the store. |
 | S11 | `lastLineOnly` reads forward (slower on large files). |
 | S12 | `TSVZedLite.clear()` and `clear_file()` raise `OSError` when the clear is refused (a part could not be read, the path names one part of a store, or the store kept changing). Memory is reloaded from the unchanged store first. |
-| S13 | Compressed parts are written in members of at most 1 MiB of records (`#_member_size_#`), Zstandard frames with a checksum; a member is read only once it passes its check, and an append never reads or repairs the part. |
+| S13 | Compressed parts are written in members of at most 1 MiB of records (`#_member_size_#`), Zstandard frames with a checksum; an append never reads or repairs the part. |
+| S14 | A zero byte in a value is written `<NUL>`, and a raw zero byte in a record is read as zero-fill damage (spec §4.9): under the default `recover` only the bytes after it are read. **A value that 4.2 or 4.3 wrote with a raw zero byte therefore reads differently in 4.4.** Such values are rare; before upgrading, `grep -c -P '\x00' store.tsvz` (any `.tsvz`, `.csvz` or `.psvz` part) finds them. Stop 4.2 and 4.3 handlers before upgrading: they read `<NUL>` as text, as they read `<CR>`. |
 
 ### The `tsvz` command
 

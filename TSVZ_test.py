@@ -1002,12 +1002,13 @@ def test_spec_gzip_damage(tmp_path, capsys):
 	g = str(tmp_path / 'g.tsvz.gz')
 	_touch(g, gzip.compress(b'a\t1\n') + b'\0\0\0' + gzip.compress(b'b\t2\n') + gzip.compress(b'c\t3\n')[:-6])
 	data, _, infos = _replay([g])
-	assert dict(data) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}  # a last member cut short keeps its lines
-	assert infos[0].cutLines == b'c\t3\n' and not infos[0].lost and 'cut short' in infos[0].damaged[0]
+	assert dict(data) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}  # a member cut short keeps its lines
+	assert not infos[0].lost and 'cut short' in infos[0].damaged[0]
 	_touch(g, gzip.compress(b'a\t1\n') + b'garbage!')
 	data, _, infos = _replay([g])
-	assert dict(data) == {'a': ['a', '1']} and infos[0].lost and not infos[0].cutLines
+	assert dict(data) == {'a': ['a', '1']} and infos[0].lost  # nothing decodes from the garbage to recover
 	assert len(_tsvz_warnings(capsys)) == 2
+
 
 def test_spec_bz2_and_xz_parts(tmp_path):
 	import bz2
@@ -1164,20 +1165,19 @@ def test_spec_strict_read_reports_a_damaged_first_part_not_a_header_mismatch(tmp
 	p = str(tmp_path / 'm.tsvz.gz')
 	_touch(p, GZ_CORRUPT)
 	assert TSVZ.readTabularFile(p, header='key\tvalue', strict=True) == {}
-	assert 'damaged' in capsys.readouterr().err
+	assert 'corrupt' in capsys.readouterr().err
 
 
 GZ_TRUNCATED_B = gzip.compress(b'b\t2\n')[:-6]  # a member cut short in its trailer, as a crash leaves it
 
 
-def test_spec_one_shot_append_after_a_cut_member_leaves_it_as_debris(tmp_path):
-	# A one-shot append does not read the part (spec §16.4): the cut member before it is skipped from then on (§16.6).
+def test_spec_one_shot_append_after_a_cut_member_keeps_its_lines(tmp_path):
+	# Spec §16.6: a member cut short keeps its whole lines, also once something is appended after it.
 	p = str(tmp_path / 'm.tsvz.gz')
 	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
-	assert set(TSVZ.readTabularFile(p)) == {'a', 'b'}
 	TSVZ.appendLinesTabularFile(p, [['c', '3']])
-	assert set(TSVZ.readTabularFile(p)) == {'a', 'c'}
-	assert not any(name.startswith('m.tsvz.gz.damaged-') for name in os.listdir(str(tmp_path)))
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b', 'c'}
+
 
 def test_spec_append_to_a_compressed_part_reads_none_of_it(tmp_path, monkeypatch):
 	# An append costs the same whatever the part's size: it does not read the part (spec §16.4).
@@ -1228,14 +1228,24 @@ def _crc_only_flip(member):
 	raise AssertionError('no bit flip that only the checksum catches')
 
 
-def test_spec_a_member_that_fails_its_checksum_is_neither_read_nor_scrubbed_into_the_store(tmp_path, monkeypatch):
-	# Spec §16.6: a member is used only once it passes its check. Its decoded bytes are wrong somewhere;
-	# re-compressing them would give them a valid checksum.
-	bad = _crc_only_flip(gzip.compress(b''.join(b'key%05d\tv\n' % i for i in range(2000))))
+def test_spec_a_corrupt_member_is_recovered_by_default_and_scrub_keeps_a_copy(tmp_path, monkeypatch):
+	# Spec §4.10 recover: what the member decoded before it failed is used, a byte at a time, so even the
+	# piece that failed gives up its output; a scrub, which re-checksums it, keeps the original bytes.
+	records = b''.join(b'key%05d\tv\n' % i for i in range(2000))
+	bad = _crc_only_flip(gzip.compress(records))
 	p = str(tmp_path / 'm.tsvz.gz')
 	_touch(p, gzip.compress(b'a\t1\n') + bad)
-	assert set(TSVZ.readTabularFile(p)) == {'a'}
-	monkeypatch.setattr(TSVZ, '_CHUNK', 64)  # small reads: the member's output is still held until its check
+	monkeypatch.setattr(TSVZ, '_CHUNK', 64)  # many small reads: the recovery must not depend on them
+	assert len(TSVZ.readTabularFile(p)) == 2001
+	monkeypatch.undo()
+	TSVZ.scrubTabularFile(p)
+	assert any(n.startswith('m.tsvz.gz.damaged-') for n in os.listdir(str(tmp_path)))
+
+
+def test_spec_a_corrupt_member_is_neither_read_nor_scrubbed_under_skip(tmp_path):
+	bad = _crc_only_flip(gzip.compress(b''.join(b'key%05d\tv\n' % i for i in range(2000))))
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'#_on_corruption_#\tskip\na\t1\n') + bad)
 	assert set(TSVZ.readTabularFile(p)) == {'a'}
 	TSVZ.scrubTabularFile(p)
 	with open(p, 'rb') as f:
@@ -1243,16 +1253,17 @@ def test_spec_a_member_that_fails_its_checksum_is_neither_read_nor_scrubbed_into
 
 
 def test_spec_records_appended_after_damage_are_read(tmp_path):
-	# Spec §16.6: a damaged member with more after it is skipped, so what was appended after it reads at once.
+	# Spec §16.6: reading goes on after a damaged member, so what was appended after it reads at once.
 	p = str(tmp_path / 'm.tsvz.gz')
 	big = gzip.compress(b''.join(b'k%05d\t%s\n' % (i, os.urandom(8).hex().encode()) for i in range(8000)))
 	_touch(p, gzip.compress(b'a\t1\n') + big[:-1000] + GZ_CORRUPT)
 	TSVZ.appendLinesTabularFile(p, [['new', 'row']])
 	before = TSVZ.readTabularFile(p)
-	assert before['new'] == ['new', 'row'] and 'a' in before and 'k00000' not in before
+	assert before['new'] == ['new', 'row'] and 'a' in before and 'k00000' in before  # the cut member keeps its lines
 	TSVZ.scrubTabularFile(p)
 	assert TSVZ.readTabularFile(p) == before
 	assert any(name.startswith('m.tsvz.gz.damaged-') for name in os.listdir(str(tmp_path)))
+
 
 def test_spec_strict_scrub_of_a_part_damaged_before_any_line(tmp_path, capsys):
 	# The repair leaves the part empty; the scrub does not then call that a header mismatch.
@@ -1431,23 +1442,6 @@ def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypat
 	assert sum(read) <= 2 * os.path.getsize(p) + TSVZ._CHUNK
 
 
-def test_spec_cut_lines_are_tied_to_the_size_the_cut_member_was_read_at(tmp_path, monkeypatch):
-	# A member appended while the reader looked past the cut one must not count as read (spec §16.4.2).
-	p = str(tmp_path / 'm.tsvz.gz')
-	cut = gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B
-	_touch(p, cut)
-	real = TSVZ._nextCompleteMember
-
-	def append_meanwhile(*args):
-		found = real(*args)  # nothing after the cut member yet
-		with open(p, 'ab') as f:
-			f.write(gzip.compress(b'm\t2\n'))
-		return found
-	monkeypatch.setattr(TSVZ, '_nextCompleteMember', append_meanwhile)
-	_, _, infos = _replay([p])
-	assert infos[0].cutLines == b'b\t2\n' and infos[0].rawSize == len(cut)
-
-
 def _tear_first_append(monkeypatch, path):
 	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would."""
 	torn = []
@@ -1527,21 +1521,30 @@ def test_engine_does_not_repeat_cut_lines_written_before_a_failed_sync(tmp_path,
 	assert TSVZ.readTabularFile(p)['b'] == ['b', '9']
 
 
-def test_engine_keeps_the_newer_cut_size_when_a_reload_raced_a_failed_append(tmp_path, monkeypatch):
-	p = str(tmp_path / 'm.tsvz.gz')
-	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
-	store = TSVZ._ServeStore(p, create=True)
-	size = store.recut.size
+def test_spec_header_check_skips_a_first_part_that_cannot_be_read(tmp_path, monkeypatch):
+	# An I/O error reading part 0 (a bad sector) hides the header, as a read is told; the append goes on.
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base, b'#key\tvalue\na\t1\n')
+	_touch(base + '.1', b'b\t2\n')
+	real_open = open
 
-	def torn_while_reloaded(path, payload, reporter, fsync=False, memberSize=None, recut=None):
-		store.recut = TSVZ._Recut(recut.lines, recut.size)  # a reload read the part before the write
-		recut.size += 10  # the write tore
-		raise OSError(28, 'No space left on device')
-	monkeypatch.setattr(TSVZ, '_specAppendPayload', torn_while_reloaded)
-	with pytest.raises(OSError):
-		store._append(b'c\t3\n', False)
-	assert store.recut.size == size + 10
-	store.close()
+	class Failing(object):
+		def __init__(self, f):
+			self._f = f
+		def read(self, *args):
+			raise OSError(5, 'Input/output error')
+		def __iter__(self):
+			raise OSError(5, 'Input/output error')
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+	monkeypatch.setattr(TSVZ, 'open', lambda name, mode='r', *a, **k: Failing(real_open(name, mode, *a, **k)) if name == base and 'r' in mode and '+' not in mode else real_open(name, mode, *a, **k), raising=False)
+	TSVZ.appendLinesTabularFile(base, [['c', '3']], header='key\tvalue', verifyHeader=True, strict=True)
+	monkeypatch.undo()
+	assert TSVZ.readTabularFile(base)['c'] == ['c', '3']
 
 
 def test_spec_backup_does_not_fail_when_the_directory_cannot_be_synced(tmp_path, monkeypatch):
@@ -1557,24 +1560,6 @@ def test_spec_backup_does_not_fail_when_the_directory_cannot_be_synced(tmp_path,
 	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT)
 	backup = TSVZ._specBackupPart(p, TSVZ._Reporter(p))
 	assert os.path.exists(backup)
-
-
-def test_spec_scrub_does_not_copy_again_when_the_part_only_grew_by_whole_members(tmp_path, monkeypatch):
-	p = str(tmp_path / 'm.tsvz.gz')
-	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT + gzip.compress(b'b\t2\n'))
-	real = TSVZ._specRewriteInPlace
-	calls = []
-
-	def changed_once(path, content, expect=None, memberSize=None):
-		if not calls:
-			calls.append(1)
-			with open(path, 'ab') as f:
-				f.write(gzip.compress(b'c\t3\n'))
-			return None
-		return real(path, content, expect=expect, memberSize=memberSize)
-	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', changed_once)
-	assert TSVZ._specScrub(p, delimiter='\t')[1] is True
-	assert len([n for n in os.listdir(str(tmp_path)) if n.startswith('m.tsvz.gz.damaged-')]) == 1
 
 
 def test_spec_header_check_of_an_append_reads_only_the_first_lines(tmp_path, monkeypatch):
@@ -1665,6 +1650,62 @@ def test_spec_scrub_backs_up_again_when_the_part_changed(tmp_path, monkeypatch):
 	assert len(backups) == 2
 	with open(str(tmp_path / backups[-1]), 'rb') as f:
 		assert gzip.compress(b'c\t3\n') in f.read()
+
+
+def test_cli_stop_policy_fails_the_read_but_lets_scrub_rewrite(tmp_path):
+	# Spec §4.10 stop: the read fails (exit 1) and changes based on it are refused; a scrub may rewrite
+	# what was read, keeping the original bytes.
+	p = str(tmp_path / 's.tsvz')
+	raw = b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\nd\t4\n'
+	_touch(p, raw)
+	status, out, err = _run('read', p)
+	assert (status, out) == (1, 'a\t1\n') and 'stopped' in err
+	assert _run('clear', p)[0] == 1
+	with open(p, 'rb') as f:
+		assert f.read() == raw
+	assert _run('scrub', p)[0] == 0
+	assert TSVZ.readTabularFile(p) == {'a': ['a', '1']}
+	assert any(n.startswith('s.tsvz.damaged-') for n in os.listdir(str(tmp_path)))
+
+
+def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')
+	store = TSVZ._ServeStore(p, create=True)
+	with open(p, 'ab') as f:
+		f.write(b'\0\0b\t2\nc\t3\n')
+	store.sync(None)
+	assert store.unreadable and store.read(None) == [['a', '1']]
+	store.close()
+
+
+def test_lite_reads_the_record_after_zero_fill_by_its_offset(tmp_path):
+	# TSVZedLite reads rows again from their offsets: the offset is that of the bytes after the zeros.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\n\0\0\0c\t3\n')
+	lite = TSVZ.TSVZedLite(p)
+	try:
+		assert lite['c'] == ['c', '3'] and lite['a'] == ['a', '1']
+	finally:
+		lite.close()
+
+
+def test_a_zero_byte_in_a_value_round_trips_as_a_token(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p)
+	t['k'] = ['k', 'x\0y']
+	t.close()
+	with open(p, 'rb') as f:
+		assert b'x<NUL>y' in f.read()
+	assert TSVZ.readTabularFile(p)['k'] == ['k', 'x\0y']
+
+
+def test_spec_decode_alone_tells_a_cut_member_from_a_corrupt_one():
+	member = gzip.compress(b''.join(b'k%05d\tv\n' % i for i in range(3000)))
+	cutShort, out, error = TSVZ._decodeAlone(member[:-8], 'gz')
+	assert cutShort and error is None and out.endswith(b'k02999\tv\n')
+	cutShort, out, error = TSVZ._decodeAlone(_crc_only_flip(member), 'gz')
+	assert not cutShort and 'incorrect data check' in error and out.endswith(b'k02999\tv\n')
 
 
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
@@ -1975,20 +2016,6 @@ def test_spec_append_header_mismatch_strict(tmp_path):
 	TSVZ.appendTabularFile(p, ['k', 'v'], header='id\tv', strict=True)
 	assert open(p, 'rb').read() == b'#id\tv\nk\tv\n'
 
-
-def test_spec_append_writes_a_cut_members_lines_again_only_while_the_part_is_unchanged(tmp_path, capsys):
-	# Spec §16.4.2: the prefix goes in front of the payload only when the part still has the size it was read at.
-	g = str(tmp_path / 'g.tsvz.gz')
-	cut = gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\nbr')[:-6]
-	_touch(g, cut)
-	reporter = TSVZ._Reporter(g)
-	assert TSVZ._specAppendPayload(g, b'c\t3\n', reporter, recut=TSVZ._Recut(b'b\t2\n', len(cut))) is True
-	reporter.flush()
-	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}
-	assert any('again' in w for w in _tsvz_warnings(capsys))
-	_touch(g, cut)
-	assert TSVZ._specAppendPayload(g, b'c\t3\n', TSVZ._Reporter(g), recut=TSVZ._Recut(b'b\t2\n', len(cut) - 1)) is False
-	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'c': ['c', '3']}  # the cut member is debris now
 
 def test_spec_rewrite_in_place_keeps_inode_and_skips_identical(tmp_path):
 	p = str(tmp_path / 'r.tsvz')

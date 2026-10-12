@@ -43,7 +43,7 @@ elif os.name == 'posix':
 version = '4.4'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-10-11'
+COMMIT_DATE = '2026-10-12'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -574,6 +574,10 @@ class _Reporter(object):
 	def has(self, kind):
 		"""True when an event of ``kind`` was noted and not yet flushed."""
 		return kind in self._events
+
+	def incomplete(self):
+		"""True when the read did not see the whole store: a part was unreadable, or a stop policy ended it."""
+		return 'unreadable' in self._events or 'stopped' in self._events
 
 	def flush(self):
 		for count, where, detail in self._events.values():
@@ -1598,8 +1602,8 @@ MAX_SPEC_VERSION = 1
 _MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
 _CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
 _ASCII_DIGITS_RE = re.compile(r'^[0-9]+$')
-_SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|CR|lt|#)>')
-_SPEC_TOKENS = {'<LF>': '\n', '<CR>': '\r', '<lt>': '<', '<#>': '#'}
+_SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|CR|NUL|lt|#)>')
+_SPEC_TOKENS = {'<LF>': '\n', '<CR>': '\r', '<NUL>': '\0', '<lt>': '<', '<#>': '#'}
 _RowState = namedtuple('_RowState', 'defaults strip fillEmpty')
 _BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True,
 				'false': False, 'no': False, 'off': False, '0': False}
@@ -1607,9 +1611,10 @@ _BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True,
 _BOOL_MARKERS = {'#_strip_trailing_whites_#': ('strip', True),
 				 '#_fill_empty_with_default_#': ('fillEmpty', False),
 				 '#_return_defaults_when_missing_#': ('returnDefaults', True)}
-#: Advisory enumerated markers: key -> (state attribute, choices; first is the default).
+#: Enumerated markers: key -> (state attribute, choices; first is the default).
 _ENUM_MARKERS = {'#_rotate_#': ('rotate', ('keep', 'rename', 'delete')),
-				 '#_write_ack_#': ('writeAck', ('memory', 'disk'))}
+				 '#_write_ack_#': ('writeAck', ('memory', 'disk')),
+				 '#_on_corruption_#': ('onCorruption', ('recover', 'skip', 'stop'))}
 #: Advisory marker: the most uncompressed data a writer puts in one compressed member (spec §16.7).
 MEMBER_SIZE_KEY = '#_member_size_#'
 _DEFAULT_MEMBER_SIZE = 1 << 20
@@ -1634,6 +1639,8 @@ def _specEncodeField(value, delimiter, isKey=False):
 		value = value.replace('\n', '<LF>')
 	if '\r' in value:
 		value = value.replace('\r', '<CR>')
+	if '\0' in value:  # (in .nsvz every zero byte is the delimiter, already <sep>)
+		value = value.replace('\0', '<NUL>')
 	if isKey and value.startswith('#'):
 		value = '<#>' + value[1:]
 	return value
@@ -1659,6 +1666,7 @@ class _SpecState(object):
 		self.rotate = 'keep'
 		self.writeAck = 'memory'
 		self.memberSize = _DEFAULT_MEMBER_SIZE
+		self.onCorruption = 'recover'  # what a reader does with damaged data (spec §4.10)
 		self.sawDefaults = False
 		self.digests = {}
 		self.mismatches = []
@@ -1844,10 +1852,9 @@ class _PartInfo(object):
 		self.codec = _parsePartName(path).codec
 		self.tail = b''
 		self.damaged = []  # what was wrong with a compressed part's members, for the warning
-		self.lost = False  # data of a damaged member is not in what was read (spec §16.6)
-		self.lostAt = []  # raw offsets of the members whose data is lost
-		self.cutLines = b''  # whole lines of a last member cut short (spec §16.4.2)
-		self.rawSize = 0  # raw bytes of a compressed part when it was read
+		self.lost = False  # damaged data was recovered, skipped or stopped at (spec §4.10): a rewrite keeps a copy
+		self.stopped = False  # a stop policy ended the read here (spec §4.10)
+		self.state = None  # the reader's marker state, for the corruption policy in force (spec §4.10)
 		self.unreadable = False  # the part could not be opened, or this Python lacks its codec
 		self.committed = 0  # bytes of committed lines read (decompressed bytes for a compressed part)
 		self.lines = 0  # committed lines replayed (set by _specReplay)
@@ -1864,8 +1871,9 @@ def _newDecompressor(codec):
 class _PartBytes(object):
 	"""The raw bytes of a part, read in ``_CHUNK`` blocks and handed out in pieces; a piece can be given back."""
 
-	def __init__(self, f):
+	def __init__(self, f, block=_CHUNK):
 		self.f = f
+		self.size = block  # bytes read from the file at a time
 		self.block = b''
 		self.at = 0  # offset of the next unread byte in ``block``
 		self.base = 0  # raw offset of ``block[0]``
@@ -1881,7 +1889,7 @@ class _PartBytes(object):
 		"""Up to ``size`` unread bytes (a memoryview), or an empty one at the end of the part."""
 		if self.at >= len(self.block):
 			self.base += len(self.block)
-			self.block, self.at = self.f.read(_CHUNK), 0
+			self.block, self.at = self.f.read(self.size), 0
 		piece = memoryview(self.block)[self.at:self.at + size]
 		self.at += len(piece)
 		return piece
@@ -1889,6 +1897,13 @@ class _PartBytes(object):
 	def giveBack(self, size):
 		"""Return the last ``size`` bytes of the piece just taken."""
 		self.at -= size
+
+
+def _gzipPadding(piece, codec):
+	"""How many zero bytes start ``piece`` when they are gzip padding before a member (spec §16.6), else 0."""
+	if _CODEC_NAMES[codec] != 'gzip':
+		return 0
+	return len(piece) - len(bytes(piece).lstrip(b'\0'))
 
 
 def _readMember(src, codec):
@@ -1902,7 +1917,6 @@ def _readMember(src, codec):
 	a member is not used before it is known complete (spec §16.6): memory grows
 	with the largest member, which writers keep to 1 MiB (spec §16.7).
 	"""
-	isGzip = _CODEC_NAMES[codec] == 'gzip'
 	decompressor = _newDecompressor(codec)
 	out = []
 	start = None
@@ -1912,11 +1926,9 @@ def _readMember(src, codec):
 		if not piece:
 			break
 		if start is None:
-			if isGzip:  # zero bytes before a gzip member are padding (spec §16.6)
-				lead = len(piece) - len(bytes(piece).lstrip(b'\0'))
-				if lead == len(piece):
-					continue
-				piece = piece[lead:]
+			piece = piece[_gzipPadding(piece, codec):]
+			if not piece:
+				continue
 			start = src.offset() - len(piece)
 		try:
 			out.append(decompressor.decompress(piece))
@@ -1953,16 +1965,52 @@ def _nextCompleteMember(f, codec, start):
 		offset += i + 1
 
 
-def _decompressChunks(f, info):
-	"""Yield what a compressed part contributes (spec §16.6): the output of its complete members, in order.
+#: Yielded by _decompressChunks, returned by _specZeroFill: a stop policy ended the read (spec §4.10).
+_STOP = object()
 
-	A member is used only once it decodes to its end and passes its checks.
-	After a damaged member the reading continues at the next complete member;
-	None is yielded there, so the caller drops the line left unfinished before
-	the damage. A damaged last member contributes the lines it decoded only
-	when its bytes merely ended early (a crash): they are kept on
-	``info.cutLines`` too, with ``info.rawSize`` the size of the part when it
-	was read (spec §16.4.2). Damage is recorded on ``info``.
+
+def _decodeAlone(raw, codec):
+	"""Decode a damaged member's bytes on their own (spec §16.6 rule 2): ``(cutShort, output, error)``.
+
+	``cutShort`` is True when they merely end before the member does. Otherwise
+	``output`` is what the member decoded before it failed: the piece that
+	failed is fed again a byte at a time, so none of it is lost with the call
+	that raised.
+	"""
+	step = 1 << 16
+	def run(sizes):
+		decompressor = _newDecompressor(codec)
+		out = []
+		pos = 0
+		for size in sizes:
+			piece = raw[pos:pos + size]
+			if not piece:
+				break
+			try:
+				out.append(decompressor.decompress(piece))
+			except Exception as e:
+				return out, pos, str(e)
+			pos += len(piece)
+			if decompressor.eof:
+				break
+		return out, None, None
+	out, failed, error = run([step] * (len(raw) // step + 1))
+	if failed is None:
+		return True, b''.join(out), None
+	out = run([step] * (failed // step) + [1] * min(step, len(raw) - failed))[0]
+	return False, b''.join(out), error
+
+
+def _decompressChunks(f, info):
+	"""Yield what a compressed part contributes (spec §16.6), member by member.
+
+	A complete member's output is used. A damaged member's bytes, up to the next
+	complete member, are decoded on their own: a member cut short contributes
+	what it decoded; a corrupt one follows the corruption policy in force
+	(spec §4.10): its output before the failure (recover), nothing (skip), or
+	``_STOP`` (stop). None is yielded before the next complete member, so the
+	caller drops the line left unfinished at the damage. Damage is recorded on
+	``info``.
 	"""
 	src = _PartBytes(f)
 	while True:
@@ -1975,20 +2023,31 @@ def _decompressChunks(f, info):
 			continue
 		found = _nextCompleteMember(f, info.codec, start + 1)
 		if found is None:
-			if status == 'short':
-				info.damaged.append('its last member is cut short; its whole lines are read')
-				info.rawSize = end
-				info.cutLines = out[:out.rfind(b'\n') + 1]
+			f.seek(0, os.SEEK_END)
+			stop = f.tell()
+		else:
+			stop = found[0]
+		f.seek(start)
+		cutShort, out, error = _decodeAlone(f.read(stop - start), info.codec)
+		if cutShort:
+			info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
+			if out:
+				yield out
+		else:
+			info.lost = True
+			policy = info.state.onCorruption if info.state is not None else 'recover'
+			if policy == 'stop':
+				info.damaged.append('the member at byte {} is corrupt ({}); reading stopped there (#_on_corruption_# stop)'.format(start, error))
+				yield _STOP
+				return
+			if policy == 'skip':
+				info.damaged.append('skipped the corrupt member at byte {} ({})'.format(start, error))
+			else:
+				info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
 				if out:
 					yield out
-			else:
-				info.damaged.append('its last member at byte {} is damaged ({}) and was not read'.format(start, error))
-				info.lost = True
-				info.lostAt.append(start)
+		if found is None:
 			break
-		info.damaged.append('skipped a damaged member at byte {} ({})'.format(start, error or 'cut short'))
-		info.lost = True
-		info.lostAt.append(start)
 		yield None
 		_, out, end = found
 		if out:
@@ -2020,9 +2079,13 @@ def _iterPartLines(info, reporter):
 		offset = 0
 		try:
 			for chunk in chunks:
-				if chunk is None:  # a damaged member was skipped: the unfinished line before it is dropped
+				if chunk is None:  # a damaged member ended: the unfinished line before the next member is dropped
 					rest = b''
 					continue
+				if chunk is _STOP:
+					info.stopped = True
+					rest = b''  # nothing after the stop is read
+					break
 				data = rest + chunk if rest else chunk
 				start = 0
 				while True:
@@ -2043,7 +2106,7 @@ def _iterPartLines(info, reporter):
 		info.tail = rest
 		reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(rest[:80]))
 	if info.damaged:
-		reporter.note('damaged', None, 'compressed part {}: {}'.format(info.path, '; '.join(info.damaged)))
+		reporter.note('stopped' if info.stopped else 'damaged', None, 'compressed part {}: {}'.format(info.path, '; '.join(info.damaged)))
 
 
 def _decodeLine(raw, reporter, where):
@@ -2077,6 +2140,26 @@ def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
 	state.digests[algo] = _newDigest(algo)
 
 
+def _specZeroFill(raw, delimiter, state, reporter, where):
+	"""Apply spec §4.9 to one committed line: the bytes to replay, None to ignore the line, or ``_STOP``.
+
+	A zero byte in a record (at its start, for .nsvz) is zero-fill damage, handled
+	by the corruption policy in force (spec §4.10).
+	"""
+	cut = len(raw) - len(raw.lstrip(b'\0')) if delimiter == '\0' else raw.rfind(b'\0') + 1
+	if not cut:
+		return raw
+	policy = state.onCorruption
+	if policy == 'stop':
+		reporter.note('stopped', where, 'a zero-filled line: reading stopped there (#_on_corruption_# stop)')
+		return _STOP
+	if policy == 'skip':
+		reporter.note('zero-fill', where, 'ignored a zero-filled line')
+		return None
+	reporter.note('zero-fill', where, 'read only the bytes after the zero-filled data in a line')
+	return raw[cut:]
+
+
 def _specReplay(parts, delimiter, state, reporter, infos):
 	"""Replay ``parts`` as one stream (spec §7, §17.4).
 
@@ -2089,6 +2172,7 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 	multi = len(parts) > 1
 	for partIndex, path in enumerate(parts):
 		info = _PartInfo(path)
+		info.state = state
 		infos.append(info)
 		label = os.path.basename(path) + ' ' if multi else ''
 		lineNo = 0
@@ -2098,6 +2182,17 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 			if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
 				raw = raw[3:]
 				reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+			fill = _specZeroFill(raw, delimiter, state, reporter, where)
+			if fill is not raw:
+				info.lost = True
+				if fill is _STOP:
+					info.stopped = True
+					info.lines = lineNo
+					return
+				if fill is None:
+					continue
+				offset += len(raw) - len(fill)
+				raw = fill
 			text = _decodeLine(raw, reporter, where)
 			check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
 			algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
@@ -2109,6 +2204,8 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 				continue
 			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
 		info.lines = lineNo
+		if info.stopped:  # a stop policy ends the read of the whole store (spec §4.10)
+			return
 
 
 def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter):
@@ -2116,14 +2213,18 @@ def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter):
 
 	``raw`` is the line with its b'\\n'; ``lineNo`` counts from 1 within the
 	part and ``label`` prefixes locations in reports. Returns ``(text,
-	record)`` as ``_specProcessRecord`` sees it, or None for the checksum
-	marker of a supported algorithm. (``_specReplay`` keeps this logic inline
-	for speed; the two must stay in step.)
+	record)`` as ``_specProcessRecord`` sees it, None for the checksum marker
+	of a supported algorithm or an ignored zero-filled line, or ``_STOP``.
+	(``_specReplay`` keeps this logic inline for speed; the two must stay in
+	step.)
 	"""
 	where = '{}line {}'.format(label, lineNo)
 	if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
 		raw = raw[3:]
 		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+	raw = _specZeroFill(raw, delimiter, state, reporter, where)
+	if raw is None or raw is _STOP:
+		return raw
 	text = _decodeLine(raw, reporter, where)
 	check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
 	algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
@@ -2392,14 +2493,16 @@ def _fsyncDirectory(path):
 	"""Sync the directory holding ``path``, so a file just created there survives a crash (POSIX)."""
 	if os.name != 'posix':
 		return
-	fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+	unsupported = {errno.EINVAL, errno.EACCES} | {getattr(errno, name) for name in ('ENOTSUP', 'EOPNOTSUPP') if hasattr(errno, name)}
 	try:
-		os.fsync(fd)
+		fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+		try:
+			os.fsync(fd)
+		finally:
+			os.close(fd)
 	except OSError as e:
-		if e.errno not in (errno.EINVAL, getattr(errno, 'ENOTSUP', None), getattr(errno, 'EOPNOTSUPP', None)):
-			raise  # some network and FUSE file systems do not sync directories
-	finally:
-		os.close(fd)
+		if e.errno not in unsupported:
+			raise  # some network and FUSE file systems do not sync directories, and a write-only one cannot be opened
 
 
 def _specBackupPart(path, reporter):
@@ -2436,70 +2539,29 @@ def _specBackupPart(path, reporter):
 	return backup
 
 
-class _Recut(object):
-	"""The whole lines of a last member cut short, and the part size they were read at (spec §16.4.2).
-
-	A long-running writer puts the lines again at the start of its first
-	append, while the part still has that size, so they outlive the cut member.
-	"""
-	__slots__ = ('lines', 'size')
-
-	def __init__(self, lines, size):
-		self.lines = lines
-		self.size = size
-
-
-def _specRecut(load):
-	"""A ``_Recut`` when the active part of ``load`` ends in a member cut short, else None."""
-	info = load.infos[-1] if load.infos else None
-	if info is None or info.path != load.active or not info.codec or not info.cutLines:
-		return None
-	return _Recut(info.cutLines, info.rawSize)
-
-
-def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None, recut=None):
-	"""Append whole records to a spec part (design §5.4); return True when ``recut``'s lines were written.
+def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
+	"""Append whole records to a spec part (design §5.4).
 
 	Uncompressed: an uncommitted tail is truncated first. Compressed: the
 	payload becomes new members of at most ``memberSize`` bytes (spec §16.7);
-	the part is not checked for damage, since readers skip a damaged member
-	(spec §16.6). The lines of ``recut`` (a ``_Recut``) go before the payload
-	only when the part still has ``recut.size`` under the lock (spec §16.4.2).
-	When such a write fails partway, ``recut.size`` becomes the size it left:
-	the torn member is debris, so the next append repeats the lines after it.
-	A missing part is created.
+	the part is not read or checked for damage, since readers handle a damaged
+	member (spec §16.6). A missing part is created.
 	"""
 	codec = _parsePartName(path).codec
 	if not codec:
 		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
-		return False
+		return
 	_requireCodec(codec)
 	with _pathLock(path):
 		with open(path, 'ab') as f:
 			_lockFile(f)
 			try:
-				used = recut is not None and bool(recut.lines) and os.fstat(f.fileno()).st_size == recut.size
-				written = False
-				try:
-					f.write(_compressBytes(codec, recut.lines + payload if used else payload, memberSize=memberSize))
-					f.flush()
-					written = True
-					if fsync:
-						os.fsync(f.fileno())
-				except BaseException:
-					if used and written:
-						recut.lines = b''  # the copy is whole and read; repeating it would undo later records
-					elif used:
-						try:
-							recut.size = os.fstat(f.fileno()).st_size  # a torn copy is debris: repeat after it
-						except OSError:
-							pass
-					raise
+				f.write(_compressBytes(codec, payload, memberSize=memberSize))
+				f.flush()
+				if fsync:
+					os.fsync(f.fileno())
 			finally:
 				_unlockFile(f)
-	if used:
-		reporter.note('recut', None, 'wrote the whole lines of the member cut short at the end of {} again (spec §16.4.2)'.format(path))
-	return used
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -2577,6 +2639,8 @@ def _specPreamble(state, delimiter, compensate=False, version=True):
 		lines.append('#_write_ack_#' + d + state.writeAck)
 	if state.memberSize != _DEFAULT_MEMBER_SIZE:
 		lines.append(MEMBER_SIZE_KEY + d + str(state.memberSize))
+	if state.onCorruption != 'recover':
+		lines.append('#_on_corruption_#' + d + state.onCorruption)
 	if any(state.defaults[1:]):
 		lines.append(_specFormatRecord(state.defaults, d, marker=True))
 	return lines
@@ -2592,7 +2656,7 @@ def _specFirstLines(path):
 	Compressed members are streamed, not held until their check (spec §16.6
 	governs records; nothing is read or written from these lines), so the
 	check costs only what it decodes. Raises ``_StartUnreadable`` when the part
-	cannot be opened or decoded before the lines run out.
+	cannot be opened, read or decoded before the lines run out.
 	"""
 	codec = _parsePartName(path).codec
 	if codec and not _codecSupported(codec):
@@ -2602,38 +2666,45 @@ def _specFirstLines(path):
 	except OSError:
 		raise _StartUnreadable()
 	with f:
-		if not codec:
-			for raw in f:
-				if not raw.endswith(b'\n'):
-					return  # uncommitted (spec §4.3)
-				yield raw
-			return
-		isGzip = _CODEC_NAMES[codec] == 'gzip'
-		src = _PartBytes(f)
-		decompressor = None
-		rest = b''
-		while True:
-			piece = src.take(1 << 16)
-			if not piece:
+		try:
+			if not codec:
+				for raw in f:
+					if not raw.endswith(b'\n'):
+						return  # uncommitted (spec §4.3)
+					yield raw
 				return
-			if decompressor is None:
-				if isGzip:  # zero padding before a gzip member (spec §16.6)
-					lead = len(piece) - len(bytes(piece).lstrip(b'\0'))
-					if lead == len(piece):
+			src = _PartBytes(f, block=1 << 16)
+			decompressor = None
+			pending = []  # pieces of the line not yet ended
+			while True:
+				piece = src.take(1 << 16)
+				if not piece:
+					return
+				if decompressor is None:
+					piece = piece[_gzipPadding(piece, codec):]
+					if not piece:
 						continue
-					piece = piece[lead:]
-				decompressor = _newDecompressor(codec)
-			try:
-				data = decompressor.decompress(piece)
-			except Exception:
-				raise _StartUnreadable()
-			if decompressor.eof:
-				src.giveBack(len(decompressor.unused_data))
-				decompressor = None
-			lines = (rest + data).split(b'\n')
-			rest = lines.pop()
-			for raw in lines:
-				yield raw + b'\n'
+					decompressor = _newDecompressor(codec)
+				try:
+					data = decompressor.decompress(piece)
+				except Exception:
+					raise _StartUnreadable()
+				if decompressor.eof:
+					src.giveBack(len(decompressor.unused_data))
+					decompressor = None
+				start = 0
+				while True:
+					nl = data.find(b'\n', start)
+					if nl < 0:
+						break
+					pending.append(data[start:nl + 1])
+					yield b''.join(pending)
+					pending = []
+					start = nl + 1
+				if start < len(data):
+					pending.append(data[start:])
+		except OSError:
+			raise _StartUnreadable()
 
 
 def _specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger):
@@ -2740,7 +2811,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			parts, stamp = _specSnapshot(fileName)
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
-			if attempt.has('unreadable'):
+			if attempt.incomplete():
 				if _storeParts(fileName)[0] != parts:
 					continue  # a part went away during the read (a rotation): read again
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
@@ -2873,10 +2944,9 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
 			info = load.infos[0]
-			if info.lost and (backedUp is None or stamp[0] != backedUp[0] or stamp[1] < backedUp[1]
-							  or any(offset >= backedUp[1] for offset in info.lostAt)):
-				# The damaged members' data is not in what is written (spec §16.6): keep the original bytes,
-				# again when the part was replaced or a damaged member lies past the last copy.
+			if (info.lost or info.damaged) and backedUp != stamp:
+				# Damaged data is not in what is written, or only unverified (spec §4.10, §16.6): keep the original
+				# bytes, again whenever the part changed since the last copy.
 				try:
 					_specBackupPart(load.parts[0], reporter)
 				except OSError as e:
@@ -3107,7 +3177,6 @@ class TSVZed(OrderedDict):
 			self._specState = _SpecState(self.defaults)
 			self._parts = []
 			self._activePath = fileName
-			self._recut = None  # a _Recut: the lines of a last member cut short, written again by the next append
 			self._dirMtimeNs = _dirMtimeNs(fileName)
 			self._writeFailing = False
 			self._specLoaded = False
@@ -3191,7 +3260,7 @@ class TSVZed(OrderedDict):
 				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
 								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
 								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
-			unreadable = reporter.has('unreadable')
+			unreadable = reporter.incomplete()
 		finally:
 			reporter.flush()
 		OrderedDict.clear(self)
@@ -3202,7 +3271,6 @@ class TSVZed(OrderedDict):
 			self._specState = load.state
 			self.defaults = list(load.state.defaults)
 			self._parts, self._activePath = load.parts, load.active
-			self._recut = _specRecut(load)
 			width = load.correctColumnNum
 		if self.header and any(self.header) and self.verifyHeader:
 			self.correctColumnNum = len(self.header)
@@ -3507,9 +3575,7 @@ class TSVZed(OrderedDict):
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
 			payload = ''.join(item + '\n' for item in items).encode('utf-8', errors='replace')
-			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize,
-							   recut=self._recut)
-			self._recut = None
+			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize)
 			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			if self._writeFailing:
 				self._writeFailing = False
@@ -4201,7 +4267,6 @@ class TSVZedLite(MutableMapping):
 		self._transStates = []
 		self._activePath = self._fileName
 		self._pendingDefaults = False
-		self._recut = None  # a _Recut: the lines of a last member cut short, written again by the next append
 		if indexes is ...:
 			self.indexes = dict()
 			self.load()
@@ -4226,14 +4291,13 @@ class TSVZedLite(MutableMapping):
 							 strict=self.strict, defaults=self._constructorDefaults,
 							 correctColumnNum=self.correctColumnNum, storeOffset=True, taskDic=target,
 							 reporter=reporter, verbose=self.verbose)
-			unreadable = reporter.has('unreadable')
+			unreadable = reporter.incomplete()
 		finally:
 			reporter.flush()
 		self._specState = load.state
 		self.defaults = list(load.state.defaults)
 		self._activePath = load.active
 		self._inMemoryRows = bool(_parsePartName(load.active).codec)
-		self._recut = _specRecut(load)
 		self._transOffsets = [offset for offset, _ in load.transitions]
 		self._transStates = [rowState for _, rowState in load.transitions]
 		if self.correctColumnNum == -1:
@@ -4337,11 +4401,9 @@ class TSVZedLite(MutableMapping):
 		if self.fileObj is None:
 			reporter = _Reporter(self._activePath)
 			try:
-				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize,
-								   recut=self._recut)
+				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
 			finally:
 				reporter.flush()
-			self._recut = None
 			return None
 		f = self.fileObj
 		with _pathLock(self._activePath):
@@ -4467,7 +4529,6 @@ class TSVZedLite(MutableMapping):
 			self._transOffsets, self._transStates = [], []
 			self._activePath = newFileName
 			self._pendingDefaults = False
-			self._recut = None
 			self.reload()
 			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
 			self._specFlushPendingDefaults()
@@ -4977,8 +5038,7 @@ class _ServeStore(object):
 		self.lock = threading.RLock()
 		self.data = OrderedDict()
 		self.unreadable = False
-		self.recut = None  # a _Recut: the lines of a last member cut short, written again by the next append
-		self.recutLock = threading.Lock()  # recut is set by reload and taken by the writer thread
+		self.stopped = False
 		if create:
 			self._create(header, self.defaults if createDefaults is None else createDefaults)
 		self.reload(teeLogger)
@@ -5004,7 +5064,8 @@ class _ServeStore(object):
 					self._loadSpec(reporter, log)
 				else:
 					self._loadLegacy(reporter)
-				self.unreadable = reporter.has('unreadable')
+				self.unreadable = reporter.incomplete()
+				self.stopped = reporter.has('stopped')  # a stop policy ended the read (spec §4.10)
 			finally:
 				reporter.flush()
 
@@ -5032,8 +5093,6 @@ class _ServeStore(object):
 			self.parts = load.parts
 			self.stamps = {}
 		info = load.infos[-1] if load.infos else None
-		with self.recutLock:
-			self.recut = _specRecut(load)
 		self.offset = info.committed if info is not None else 0
 		self.lineNo = info.lines if info is not None else 0
 		self.tailSeen = info.tail if info is not None else b''
@@ -5133,8 +5192,13 @@ class _ServeStore(object):
 			self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
 										 defaults=self.legacyDefaults, reporter=reporter)
 			return
+		if self.stopped:
+			return  # a stop policy ended the read: nothing after it is read (spec §4.10)
 		replayed = _specReplayLine(raw, self.lineNo, self.label, self.parts[-1], self.state, self.delimiter,
 								   reporter)
+		if replayed is _STOP:
+			self.stopped = self.unreadable = True
+			return
 		if replayed is None or replayed[1] is None:
 			return
 		key, row = replayed[1]
@@ -5209,7 +5273,7 @@ class _ServeStore(object):
 			reporter = _Reporter(self.path, log)
 			try:
 				mismatches = _specVerify(self.path, self.delimiter, reporter)
-				return mismatches, not reporter.has('unreadable')
+				return mismatches, not reporter.incomplete()
 			finally:
 				reporter.flush()
 
@@ -5347,18 +5411,8 @@ class _ServeStore(object):
 		reporter = _Reporter(self.path, self.teeLogger)
 		try:
 			if self.spec:
-				with self.recutLock:
-					recut, self.recut = self.recut, None
-				try:
-					_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
-									   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None), recut=recut)
-				except BaseException:
-					with self.recutLock:
-						# Not written: the next append tries again. A reload that ran meanwhile read the part
-						# before this write, so its size is not newer than the one this attempt left.
-						if recut is not None and (self.recut is None or self.recut.size <= recut.size):
-							self.recut = recut
-					raise
+				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
+								   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None))
 			elif _isCompressedFile(self.path):
 				with openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger) as f:
 					f.write(payload)
@@ -6641,7 +6695,7 @@ def _cliSpecLoad(args, delimiter, logger):
 	try:
 		load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
 						 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
-		readable = not reporter.has('unreadable')
+		readable = not reporter.incomplete()
 	finally:
 		reporter.flush()
 	return load, readable
@@ -6858,7 +6912,7 @@ def _cliVerify(args, delimiter, logger, stdin, stdout):
 	reporter = _Reporter(args.store, logger)
 	try:
 		mismatches = _specVerify(args.store, delimiter, reporter)
-		readable = not reporter.has('unreadable')
+		readable = not reporter.incomplete()
 	finally:
 		reporter.flush()
 	rows = [[path, str(lineNo), algo, expected, computed] for path, lineNo, algo, expected, computed in mismatches]
