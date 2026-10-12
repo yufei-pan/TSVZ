@@ -131,7 +131,9 @@ conditioned on "fails to parse" would admit corruption.)
 are valid and represent an empty store.
 
 4.7 **Byte-order mark.** A reader **MUST** remove one UTF-8 byte-order mark (the
-bytes `EF BB BF`) at the start of each part before it frames records. The mark is
+bytes `EF BB BF`) at the start of each part before it frames records. In a
+compressed part the mark is at the start only when no damaged member (§16.6) comes
+before it; after one, it is data. The mark is
 not part of the part's first line, is not fed into any integrity accumulator
 (§15.4), and does not change line numbering. A reader MAY warn about it.
 
@@ -756,10 +758,11 @@ in order, as one stream, by these rules:
       that member is complete or not, or to the end of the part. A member begins
       with gzip `1F 8B 08`, bzip2 `42 5A 68` ("BZh"), xz `FD 37 7A 58 5A 00` or
       Zstandard `28 B5 2F FD`. For gzip, zero bytes that end those bytes are
-      padding and are left out, except those that complete a trailer the member
-      has begun: its compressed data has ended and some of its 8-byte trailer
-      (CRC-32 and length) precedes the zeros. The reader decodes those bytes on
-      their own:
+      padding and are left out, except those that belong to the member: the
+      ones its compressed data needs to reach its end, and the ones that complete
+      a trailer the member has begun (its compressed data has ended and some of
+      its 8-byte trailer, CRC-32 and length, precedes the zeros). The reader
+      decodes those bytes on their own:
       - when they merely end before the member does, the member is **cut short**,
         as a crash during a write leaves it: its output is used;
       - otherwise the member is **corrupt**: it fails to decode or fails its check.

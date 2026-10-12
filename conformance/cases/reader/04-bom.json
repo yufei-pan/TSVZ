@@ -18,5 +18,9 @@
 {"id": "4.7-a-byte-order-mark-after-a-damaged-member-is-data", "spec": ["4.7", "16.6"], "level": "MUST",
  "note": "Once a damaged member has been read, a byte order mark is no longer at the start of the part's bytes: it is data.",
  "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0tMAgAfiwgAAAAAAAL/e797fzanIRcA0tBgTwcAAAA="}},
+ "expect": {"read": [["﻿k", "1"]], "len": 1}},
+{"id": "4.7-a-byte-order-mark-after-an-empty-damaged-member-is-data", "spec": ["4.7", "16.6"], "level": "MUST",
+ "note": "A damaged member that decodes to nothing still comes before the mark, so the mark is data.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/x+LCAAAAAAAAv97v3t/NqchFwDS0GBPBwAAAA=="}},
  "expect": {"read": [["﻿k", "1"]], "len": 1}}
 ]}
