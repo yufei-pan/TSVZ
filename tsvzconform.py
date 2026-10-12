@@ -197,3 +197,188 @@ def show(value):
 	if isinstance(value, bytes):
 		value = value.decode('utf-8', 'replace')
 	return json.dumps(value, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# The oracle: the runner's own reader (§4-§17)
+# ---------------------------------------------------------------------------
+
+class CodecUnavailable(Exception):
+	"""The runner's Python cannot decompress this codec (zstd before 3.14)."""
+
+
+_BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True, 'false': False, 'no': False, 'off': False, '0': False}
+_BOOL_MARKERS = {'#_strip_trailing_whites_#': ('strip', True), '#_fill_empty_with_default_#': ('fill_empty', False),
+	'#_return_defaults_when_missing_#': ('return_missing', True)}
+
+
+class Replay(object):
+	"""Replays committed records (§7) and resolves rows (§14).
+
+	Each live key keeps its decoded cells and the marker state in force at its
+	row, so absent and present-empty cells resolve against that state.
+	"""
+
+	def __init__(self, delimiter):
+		self.delimiter = delimiter
+		self.version = 1
+		self.defaults = ()
+		self.strip = True
+		self.fill_empty = False
+		self.return_missing = True
+		self.entries = collections.OrderedDict()
+		self._bound = None
+
+	def feed_text(self, line):
+		"""Apply one committed record, given without its '\\n' (§7.1-§7.10)."""
+		if line.endswith('\r'):
+			line = line[:-1]
+		d = self.delimiter
+		fields = line.split(d)
+		first = fields[0]
+		if first.startswith('#'):
+			if is_marker_key(first):
+				self._marker(first.lower(), fields[1:])
+			return
+		strip = self.strip
+		key = decode_field(first.rstrip(' \t') if strip else first, d)
+		if key == '':
+			return
+		if len(fields) == 1:
+			self.entries.pop(key, None)
+			return
+		cells = [decode_field(f.rstrip(' \t') if strip else f, d) for f in fields[1:]]
+		if self._bound is None:
+			self._bound = (self.defaults, self.fill_empty)
+		self.entries[key] = (cells, self._bound)
+
+	def _marker(self, key, values):
+		value = decode_field(values[0], self.delimiter) if values else ''
+		if key == '#_version_#':
+			if value == '':
+				self.version = 1
+			elif re.match(r'[0-9]+\Z', value) and int(value) >= 1:
+				self.version = int(value)
+			return
+		if key == '#_defaults_#':
+			self.defaults = tuple(decode_field(v, self.delimiter) for v in values)
+		elif key in _BOOL_MARKERS:
+			attr, default = _BOOL_MARKERS[key]
+			lowered = value.lower() if all(ord(c) < 128 for c in value) else value
+			if value == '':
+				setattr(self, attr, default)
+			elif lowered in _BOOL_VALUES:
+				setattr(self, attr, _BOOL_VALUES[lowered])
+			else:
+				return
+			if attr == 'return_missing':
+				return
+		else:
+			return
+		self._bound = None
+
+	def feed_part(self, data):
+		"""Apply one part's bytes: BOM removed (§4.7), bytes after the last '\\n' dropped (§4.3), U+FFFD for bad UTF-8 (§4.8)."""
+		if data.startswith(b'\xef\xbb\xbf'):
+			data = data[3:]
+		end = data.rfind(b'\n')
+		if end < 0:
+			return
+		for line in data[:end].decode('utf-8', 'replace').split('\n'):
+			self.feed_text(line)
+
+	def resolve(self, key):
+		cells, (defaults, fill_empty) = self.entries[key]
+		out = [defaults[j] if c == '' and fill_empty and j < len(defaults) else c for j, c in enumerate(cells)]
+		out.extend(defaults[len(out):])
+		return trim(out)
+
+	def rows(self):
+		return [[key] + self.resolve(key) for key in self.entries]
+
+	def missing(self):
+		"""What a read of a missing key returns (§14.5): the current defaults, or None for not-found."""
+		return trim(self.defaults) if self.return_missing else None
+
+
+_PART_RE = re.compile(r'([0-9A-Fa-f]+)(\.rotated)?(\.[A-Za-z0-9]+)?\Z')
+
+
+def store_parts(store):
+	"""The parts of a store in replay order (§17): the unnumbered file, then hex ordinals ascending; .rotated skipped."""
+	base = split_codec(store)[0]
+	directory = os.path.dirname(base) or '.'
+	prefix = os.path.basename(base) + '.'
+	numbered = []
+	try:
+		names = os.listdir(directory)
+	except OSError:
+		names = []
+	for name in names:
+		if not name.startswith(prefix):
+			continue
+		match = _PART_RE.match(name[len(prefix):])
+		if not match or match.group(2) or (match.group(3) and match.group(3).lower() not in CODECS):
+			continue
+		numbered.append((int(match.group(1), 16), name))
+	parts = [store] if os.path.isfile(store) else []
+	return parts + [os.path.join(directory, name) for _, name in sorted(numbered)]
+
+
+def _decompressor(codec):
+	if codec == 'gzip':
+		return zlib.decompressobj(31)
+	if codec == 'bzip2':
+		return bz2.BZ2Decompressor()
+	if codec == 'xz':
+		return lzma.LZMADecompressor()
+	try:
+		from compression import zstd
+	except ImportError:
+		raise CodecUnavailable('zstd')
+	return zstd.ZstdDecompressor()
+
+
+def decompress(data, codec):
+	"""Every member of a compressed part as one stream; a member cut short yields what it decoded (§16.6)."""
+	out = []
+	while data:
+		decompressor = _decompressor(codec)
+		try:
+			out.append(decompressor.decompress(data))
+		except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
+			break
+		if not decompressor.eof:
+			break
+		data = decompressor.unused_data
+	return b''.join(out)
+
+
+def read_part(path):
+	"""A part's bytes, decompressed by its suffix (§16)."""
+	with open(path, 'rb') as f:
+		data = f.read()
+	codec = split_codec(path)[1]
+	return decompress(data, codec) if codec else data
+
+
+def replay_store(store):
+	replay = Replay(delimiter_of(store))
+	for part in store_parts(store):
+		replay.feed_part(read_part(part))
+	return replay
+
+
+Observed = collections.namedtuple('Observed', 'rows missing probe')
+PROBE_LINES = (PROBE_PREFIX + '-1{d}v  {d}{d}', PROBE_PREFIX + '-2 {d}w')
+
+
+def observe(store):
+	"""The observable state of a store (design section 3.2): rows, the missing-key read, and the probe."""
+	replay = replay_store(store)
+	rows = replay.rows()
+	missing = replay.missing()
+	for line in PROBE_LINES:
+		replay.feed_text(line.format(d=replay.delimiter))
+	probe = [row for row in replay.rows() if row[0].startswith(PROBE_PREFIX)]
+	return Observed(rows, missing, probe)

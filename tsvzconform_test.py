@@ -84,3 +84,59 @@ def test_delimiters_and_codecs():
 	assert tc.is_loose('s.csv') and not tc.is_loose('s.csvz')
 	with pytest.raises(ValueError):
 		tc.delimiter_of('s.txt')
+
+
+# --- the oracle ---------------------------------------------------------------------------
+
+def replay(text, delimiter='\t'):
+	r = tc.Replay(delimiter)
+	r.feed_part(text.encode('utf-8'))
+	return r
+
+
+def test_replay_basics():
+	r = replay('#_defaults_#\tguest\t0\nalice\tAlice\t30\nbob\tBob\ncarol\t\t25\nalice\tAlice\t31\nbob\n')
+	assert r.rows() == [['alice', 'Alice', '31'], ['carol', '', '25']]
+	assert r.missing() == ['guest', '0']
+	assert replay('a\t1\nb\t2\na\nc\t3\na\t4\n').rows() == [['b', '2'], ['c', '3'], ['a', '4']]
+	assert replay('a\tx\na \n').rows() == []
+	assert replay('a\tx\nb\ty').rows() == [['a', 'x']]
+	assert replay('﻿#_strip_trailing_whites_#\tno\na\tx \n').rows() == [['a', 'x ']]
+	assert replay('#_strip_trailing_whites_#\tfalse\n#_strip_trailing_whites_#\tmaybe\na\tx \n').rows() == [['a', 'x ']]
+	assert replay('#_strip_trailing_whites_#\tfalse \na\tx \n').rows() == [['a', 'x']]
+	assert replay('#_return_defaults_when_missing_#\tfalse\n').missing() is None
+	assert replay('a,x<sep>y\n', ',').rows() == [['a', 'x,y']]
+
+
+def test_invalid_utf8_becomes_replacement_characters():
+	r = tc.Replay('\t')
+	r.feed_part(b'c\t\xe2\x82\xed\xa0\x80z\n')
+	assert r.rows() == [['c', '�' * 4 + 'z']]
+
+
+@pytest.mark.parametrize('codec, pack', [
+	('gzip', lambda d: gzip.compress(d, mtime=0)),
+	('bzip2', bz2.compress),
+	('xz', lzma.compress),
+])
+def test_decompress_reads_every_member_and_keeps_a_cut_short_one(codec, pack):
+	assert tc.decompress(pack(b'a\t1\n') + pack(b'b\t2\n'), codec) == b'a\t1\nb\t2\n'
+	assert tc.decompress(pack(b'a\t1\n') + pack(b'b\t2\n')[:4], codec) == b'a\t1\n'
+
+
+def test_store_parts_and_observe(tmp_path):
+	for name, text in (('s.tsvz', '#_defaults_#\td1\td2\n'), ('s.tsvz.10', 'k\t2\n'), ('s.tsvz.f', 'k\t1\n'),
+			('s.tsvz.5.rotated', 'r\t9\n'), ('s.tsvz.serve', 'x'), ('s.tsvzx.1', 'y\n')):
+		(tmp_path / name).write_text(text)
+	store = str(tmp_path / 's.tsvz')
+	assert [os.path.basename(p) for p in tc.store_parts(store)] == ['s.tsvz', 's.tsvz.f', 's.tsvz.10']
+	seen = tc.observe(store)
+	assert seen.rows == [['k', '2', 'd2']] and seen.missing == ['d1', 'd2']
+	assert seen.probe == [['tsvzconform-probe-1', 'v'], ['tsvzconform-probe-2', 'w', 'd2']]
+
+
+def test_the_probe_shows_the_final_marker_state(tmp_path):
+	path = tmp_path / 's.tsvz'
+	path.write_text('#_strip_trailing_whites_#\tfalse\n#_fill_empty_with_default_#\ttrue\n#_defaults_#\td1\td2\td3\td4\n')
+	probe = tc.observe(str(path)).probe
+	assert probe == [['tsvzconform-probe-1', 'v  ', 'd2', 'd3', 'd4'], ['tsvzconform-probe-2 ', 'w', 'd2', 'd3', 'd4']]
