@@ -924,6 +924,7 @@ def check_after(block, store, case_dir, before, serve_exit=None):
 # ---------------------------------------------------------------------------
 
 LIVE_GROUPS = set()
+_REAP_LOCK = threading.Lock()
 
 
 def kill_group(pid, sig=signal.SIGKILL):
@@ -945,7 +946,9 @@ def reap(proc, timeout, first_signal=signal.SIGKILL):
 	"""Wait for `proc`, signalling its group after `timeout` (SIGTERM first means SIGKILL 5 s later); then kill what is left of the group.
 
 	Where os.waitid exists the group is killed while the leader is a zombie, so
-	its id cannot have been reused. Returns (exit status, timed out).
+	its id cannot have been reused. A second thread reaping the same process (a
+	worker stopping a handler while Ctrl-C kills every handler) gets the first
+	one's result. Returns (exit status, timed out).
 	"""
 	pid = proc.pid
 	fired = threading.Event()
@@ -963,15 +966,24 @@ def reap(proc, timeout, first_signal=signal.SIGKILL):
 	try:
 		if hasattr(os, 'waitid'):
 			os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
-			kill_group(pid)
-			status = os.waitpid(pid, 0)[1]
+			with _REAP_LOCK:
+				if proc.returncode is None:
+					kill_group(pid)
+					proc.returncode = exit_code(os.waitpid(pid, 0)[1])
 		else:
 			status = os.waitpid(pid, 0)[1]
+			with _REAP_LOCK:
+				if proc.returncode is None:
+					proc.returncode = exit_code(status)
 			kill_group(pid)
+	except ChildProcessError:
+		pass
 	finally:
 		for timer in timers:
 			timer.cancel()
-	proc.returncode = exit_code(status)
+	deadline = time.time() + 5.0
+	while proc.returncode is None and time.time() < deadline:
+		time.sleep(0.01)
 	LIVE_GROUPS.discard(pid)
 	return proc.returncode, fired.is_set()
 
@@ -1017,7 +1029,10 @@ def kill_live_groups():
 	for pid in list(LIVE_GROUPS):
 		kill_group(pid)
 	for handler in list(LIVE_HANDLERS):
-		handler.kill()
+		try:
+			handler.kill()
+		except Exception:
+			pass
 
 
 def quote(argv):

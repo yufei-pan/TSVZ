@@ -363,6 +363,25 @@ def test_processes_left_in_the_group_are_killed(tmp_path):
 		os.kill(pid, 0)
 
 
+def test_two_threads_can_reap_the_same_process(tmp_path):
+	"""Ctrl-C reaps live handlers from the main thread while a worker stops the same one; neither may raise."""
+	proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.5)'], start_new_session=True)
+	got = []
+
+	def reap():
+		try:
+			got.append(tc.reap(proc, 10))
+		except Exception as e:
+			got.append(e)
+
+	threads = [threading.Thread(target=reap) for _ in range(2)]
+	for thread in threads:
+		thread.start()
+	for thread in threads:
+		thread.join(15)
+	assert got == [(0, False), (0, False)]
+
+
 def _short_socket_dir():
 	return tempfile.mkdtemp(prefix='tc-', dir='/tmp')
 
