@@ -1731,8 +1731,8 @@ def _pointer_text(address, host=None, extra=''):
 	return 'tsvz-handler\t1\naddress\t%s\nhost\t%s\npid\t%d\n%s' % (address, host or socket.gethostname(), os.getpid(), extra)
 
 
-def _refuse_pointer(cx, setup, kind='unix'):
-	"""Plant a bad pointer to a decoy; the CLI must not connect and must answer from the files."""
+def _refuse_pointer(cx, setup, kind='unix', answer=False):
+	"""Plant a bad pointer to a decoy: the CLI must not connect (§21.2.4); with `answer`, it should answer from the files (§20.8.2)."""
 	store = cx.write('s.tsvz', 'k\tv\n')
 	sock, address = _decoy(cx, kind)
 	try:
@@ -1743,7 +1743,7 @@ def _refuse_pointer(cx, setup, kind='unix'):
 			problems.append('the command connected to the address in a pointer file it must not use (§21.2.4)')
 		if ran.timed_out:
 			problems.append('get timed out')
-		elif ran.exit != 0 or match_stdout({'rows': [['k', 'v']]}, ran.stdout, '\t'):
+		elif answer and (ran.exit != 0 or match_stdout({'rows': [['k', 'v']]}, ran.stdout, '\t')):
 			problems.append('get did not answer from the files: exit %s, stdout %s' % (ran.exit, show(ran.stdout)))
 		return problems
 	finally:
@@ -1802,8 +1802,13 @@ def _register_pointer_checks():
 	for slug, what, setup, kind in variants:
 		def check(cx, setup=setup, kind=kind):
 			return _refuse_pointer(cx, setup, kind)
-		procedural('21.2.4-refuse-%s' % slug, 'cli', ['21.2.4', '20.8.2'], 'MUST',
-			'A command does not use %s, and answers from the files.' % what)(check)
+		procedural('21.2.4-refuse-%s' % slug, 'cli', ['21.2.4'], 'MUST',
+			'A command does not use %s.' % what)(check)
+
+	def fall_back(cx):
+		return _refuse_pointer(cx, wrong_first_line, answer=True)
+	procedural('20.8.2-files-answer-past-a-bad-pointer', 'cli', ['20.8.2', '21.2.4'], 'SHOULD',
+		'A command that ignores a pointer file it must not use operates on the files instead.')(fall_back)
 
 
 _register_pointer_checks()

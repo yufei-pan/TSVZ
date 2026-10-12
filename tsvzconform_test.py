@@ -542,6 +542,9 @@ if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
 if mode == 'ttyhang' and op == 'read' and os.isatty(1):
 	time.sleep(40)
+if mode == 'refuse' and store and os.path.lexists(store + '.serve'):
+	sys.stderr.write('refusing: there is a pointer file\n')
+	sys.exit(1)
 if mode == 'decoy' and op == 'get':
 	try:
 		lines = open(store + '.serve').read().split('\n')
@@ -656,6 +659,15 @@ def test_the_terminal_check_obeys_the_timeout(tmp_path):
 	result = tc.run_case(check, 'files', ctx)
 	assert time.time() - started < 15
 	assert result.result == tc.WARN and 'timed out' in ' '.join(result.detail)
+
+
+def test_refusing_a_bad_pointer_is_conformant_but_falls_short_of_the_should(tmp_path):
+	"""Not connecting is the MUST (§21.2.4); answering from the files instead is a SHOULD (§20.8.2)."""
+	checks = {c.id: c for c in tc.CHECKS}
+	must = tc.run_case(checks['21.2.4-refuse-wrong-first-line'], 'files', context(tmp_path / 'w1', fake(tmp_path, 'refuse')))
+	assert must.result == tc.PASS, must.detail
+	should = tc.run_case(checks['20.8.2-files-answer-past-a-bad-pointer'], 'files', context(tmp_path / 'w2', fake(tmp_path, 'refuse')))
+	assert should.result == tc.WARN and 'did not answer from the files' in should.detail[0]
 
 
 def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
