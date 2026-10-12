@@ -1,0 +1,12 @@
+{"format": 1, "class": "writer", "cases": [
+{"id": "19.8-clear-keeps-the-header-and-markers", "spec": ["19.8", "20.2"], "level": "MUST",
+ "note": "Clearing one part leaves no rows, the header comment first, and the same marker state, in the same file.",
+ "files": {"s.tsvz": "#hdr\n#_defaults_#\td\n#_strip_trailing_whites_#\tfalse\na\tx\n"},
+ "steps": [{"op": ["clear"], "stdout": "empty"}],
+ "after": {"rows": [], "fidelity": "markers", "bytes": ["header-kept", "same-file", "encoded"]}},
+{"id": "19.8-clear-without-a-header", "spec": ["19.8", "20.2"], "level": "MUST",
+ "note": "Clearing a part without a header keeps its markers.",
+ "files": {"s.tsvz": "#_defaults_#\td\n#_return_defaults_when_missing_#\tfalse\na\tx\n"},
+ "steps": [{"op": ["clear"]}],
+ "after": {"rows": [], "fidelity": "markers", "bytes": ["same-file"]}}
+]}
