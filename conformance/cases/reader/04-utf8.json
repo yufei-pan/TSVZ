@@ -6,5 +6,9 @@
 {"id": "4.8-invalid-utf8-in-a-key", "spec": ["4.8"], "level": "MUST",
  "note": "Replacement happens before the key is resolved, so the key is U+FFFD.",
  "files": {"s.tsvz": {"b64": "/wl2Cg=="}},
- "expect": {"read": [["�", "v"]], "keys": ["�"]}}
+ "expect": {"read": [["�", "v"]], "keys": ["�"]}},
+{"id": "4.8-a-replaced-byte-is-the-same-key-as-u-fffd", "spec": ["4.8", "3.3"], "level": "MUST",
+ "note": "A raw 0xFF key decodes to U+FFFD, so it and a key written as the UTF-8 of U+FFFD are one key: last wins.",
+ "files": {"s.tsvz": {"b64": "/wl2MQrvv70JdjIK"}},
+ "expect": {"read": [["\ufffd", "v2"]], "len": 1, "keys": ["\ufffd"]}}
 ]}
