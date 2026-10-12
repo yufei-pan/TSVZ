@@ -1,0 +1,10 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "4.8-invalid-utf8-becomes-replacement-characters", "spec": ["4.8"], "level": "MUST",
+ "note": "Each maximal subpart of an ill-formed sequence becomes one U+FFFD: a lone 0xFF, a truncated E2 82, and the three bytes ED A0 80 one by one.",
+ "files": {"s.tsvz": {"b64": "YQn/CmIJeMMKYwnigu2ggHoK"}},
+ "expect": {"read": [["a", "�"], ["b", "x�"], ["c", "����z"]], "len": 3}},
+{"id": "4.8-invalid-utf8-in-a-key", "spec": ["4.8"], "level": "MUST",
+ "note": "Replacement happens before the key is resolved, so the key is U+FFFD.",
+ "files": {"s.tsvz": {"b64": "/wl2Cg=="}},
+ "expect": {"read": [["�", "v"]], "keys": ["�"]}}
+]}

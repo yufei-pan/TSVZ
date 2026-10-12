@@ -135,6 +135,14 @@ bytes `EF BB BF`) at the start of each part before it frames records. The mark i
 not part of the part's first line, is not fed into any integrity accumulator
 (§15.4), and does not change line numbering. A reader MAY warn about it.
 
+4.8 **Invalid UTF-8.** A reader **MUST** decode bytes that are not well-formed
+UTF-8 by replacing each maximal subpart of an ill-formed sequence with U+FFFD (the
+Unicode Standard, section 3.9, "U+FFFD Substitution of Maximal Subparts"), and
+continue reading. A reader MAY warn about it. Integrity digests (§15) cover the
+raw bytes, not the decoded text. Because the delimiters (§5) and `\n` are ASCII,
+and an ASCII byte always ends a maximal subpart, decoding a part record by record
+or as a whole gives the same text.
+
 > Recovery at §4.3–§4.5 handles truncation at end-of-file. Avoiding torn records
 > in the *middle* of a part is the writer's responsibility; see §18.
 
