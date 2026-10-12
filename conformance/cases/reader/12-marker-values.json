@@ -1,0 +1,18 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "12.4.1-boolean-spellings", "spec": ["12.4.1"], "level": "MUST",
+ "note": "no, off and 0 mean false; yes, on and 1 mean true.",
+ "files": {"s.tsvz": "#_strip_trailing_whites_#\tno\na\tx \n#_strip_trailing_whites_#\tyes\nb\ty \n#_strip_trailing_whites_#\tOff\nc\tz \n#_strip_trailing_whites_#\tON\nd\tw \n#_strip_trailing_whites_#\t0\ne\tv \n#_strip_trailing_whites_#\t1\nf\tu \n"},
+ "expect": {"read": [["a", "x "], ["b", "y"], ["c", "z "], ["d", "w"], ["e", "v "], ["f", "u"]]}},
+{"id": "12.4.5-invalid-boolean-is-ignored", "spec": ["12.4.5"], "level": "MUST",
+ "note": "An invalid value leaves the marker as it was (stripping stays off).",
+ "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\n#_strip_trailing_whites_#\tmaybe\na\tx \n"},
+ "expect": {"read": [["a", "x "]]}},
+{"id": "12.4.5-invalid-return-defaults-is-ignored", "spec": ["12.4.5", "14.5"], "level": "MUST",
+ "note": "An invalid value leaves #_return_defaults_when_missing_# false.",
+ "files": {"s.tsvz": "#_return_defaults_when_missing_#\tfalse\n#_return_defaults_when_missing_#\tnope\na\tx\n"},
+ "expect": {"get": [{"args": ["m"], "rows": [], "exit": 3}]}},
+{"id": "12.4.5-marker-value-is-not-stripped", "spec": ["12.4.5", "10.4"], "level": "MUST",
+ "note": "Marker lines are not stripped, so \"false \" is not a valid boolean and stripping stays on.",
+ "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse \na\tx \n"},
+ "expect": {"read": [["a", "x"]]}}
+]}

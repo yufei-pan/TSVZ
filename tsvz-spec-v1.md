@@ -433,10 +433,13 @@ those markers are inert.
 | `#_write_ack_#` | advisory | when a writer/handler acknowledges a record (§18) | `memory` / `disk` | `memory` |
 | `#_checksum_<algo>_#` | integrity | verify a segment digest (§15) | hex digest, or empty | off |
 
-12.4.1 Boolean values (`true`/`false`), enumerated values, and `<algo>` names are
-matched case-insensitively over ASCII. An empty value resets a stateful marker to
-its built-in default; for `#_checksum_<algo>_#`, an empty value begins a new
-segment without verification (§15.3).
+12.4.1 A boolean value is `true` or `false`; `yes`, `on` and `1` are also accepted
+as `true`, and `no`, `off` and `0` as `false`. A writer SHOULD write `true` or
+`false`. Boolean values, enumerated values, and `<algo>` names are matched
+case-insensitively over ASCII. The value of `#_version_#` is written in ASCII
+decimal digits. An empty value resets a stateful marker to its built-in default;
+for `#_checksum_<algo>_#`, an empty value begins a new segment without
+verification (§15.3).
 
 12.4.2 **`#_version_#`** — see §6. **`#_defaults_#`, `#_fill_empty_with_default_#`,
 `#_return_defaults_when_missing_#`** — see §14. **`#_strip_trailing_whites_#`** —
@@ -454,6 +457,11 @@ well: each data row is resolved under the state in force at that row's position.
 later change to any of these markers does not retroactively alter rows already
 processed under the earlier state. See §14.4 and §19.4 for the consequences for
 defaulting and snapshots.
+
+12.4.5 **Invalid values.** A marker line whose value is not valid for its marker
+(for example `#_version_#` with `abc` or `0`, or `#_strip_trailing_whites_#` with
+`maybe`) is ignored: the marker keeps the state it had before the line. A reader
+MAY warn about it.
 
 ---
 
