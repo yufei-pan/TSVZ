@@ -382,3 +382,294 @@ def observe(store):
 		replay.feed_text(line.format(d=replay.delimiter))
 	probe = [row for row in replay.rows() if row[0].startswith(PROBE_PREFIX)]
 	return Observed(rows, missing, probe)
+
+
+# ---------------------------------------------------------------------------
+# The corpus: case files and procedural checks
+# ---------------------------------------------------------------------------
+
+class CorpusError(Exception):
+	pass
+
+
+class Skip(Exception):
+	"""Raised by a case that the environment cannot run; its message is the reason."""
+
+
+_ID_RE = re.compile(r'(\d+(?:\.\d+)*)-[a-z0-9]+(?:-[a-z0-9]+)*\Z')
+_CLAUSE_RE = re.compile(r'\d+(?:\.\d+)*\Z')
+_CASE_KEYS = {'id', 'spec', 'level', 'requires', 'note', 'store', 'files', 'modes', 'expect', 'steps', 'after'}
+_EXPECT_KEYS = {'read', 'keys', 'len', 'get', 'verify'}
+_STEP_KEYS = {
+	'op': {'stdin', 'body', 'exit', 'stdout', 'stderr'},
+	'argv': {'stdin', 'exit', 'stdout', 'stderr'},
+	'request': {'options', 'body', 'exit', 'stdout'},
+	'raw': {'exit', 'stdout'},
+	'append': {'path'},
+	'write': {'path'},
+	'check': set(),
+}
+_AFTER_KEYS = {'rows', 'missing', 'fidelity', 'exists', 'absent', 'bytes', 'serve_exit'}
+BYTE_RULES = ('encoded', 'lf-terminated', 'appended', 'last-part-only', 'unchanged', 'same-file', 'header-kept', 'snapshot-layout')
+
+
+class Case(object):
+	"""One conformance case, from a case file or a procedural check."""
+
+	def __init__(self, id, cls, spec, level, note, requires=(), store='s.tsvz', files=None, modes=None,
+			expect=None, steps=None, after=None, source=None, func=None):
+		self.id = id
+		self.cls = cls
+		self.spec = list(spec)
+		self.level = level
+		self.note = note
+		self.requires = tuple(requires)
+		self.store = store
+		self.files = files or {}
+		self.modes = tuple(modes) if modes else None
+		self.expect = expect
+		self.steps = steps
+		self.after = after
+		self.source = source
+		self.func = func
+
+
+CHECKS = []
+
+
+def procedural(id, cls, spec, level, note, requires=()):
+	"""Register a check written in Python (design section 1.8); it gets a CheckContext and returns problems."""
+	def wrap(func):
+		CHECKS.append(Case(id, cls, spec, level, note, requires=requires, source=__file__, func=func))
+		return func
+	return wrap
+
+
+def _fail(where, message):
+	raise CorpusError('%s: %s' % (where, message))
+
+
+def _content_ok(value):
+	return isinstance(value, str) or (isinstance(value, dict) and set(value) == {'b64'} and isinstance(value['b64'], str))
+
+
+def _check_matcher(matcher, where):
+	if matcher in ('empty', 'nonempty'):
+		return
+	if not isinstance(matcher, dict) or len(set(matcher) & {'rows', 'lines', 'text'}) != 1 or set(matcher) - {'rows', 'lines', 'text'}:
+		_fail(where, 'stdout must be "empty", "nonempty", or one of {"rows": ...}, {"lines": ...}, {"text": ...}')
+	for name in ('rows', 'lines'):
+		if name in matcher and not (isinstance(matcher[name], list) and all(
+				isinstance(r, list) and all(isinstance(c, str) for c in r) for r in matcher[name])):
+			_fail(where, '%s must be a list of lists of strings' % name)
+	if 'text' in matcher and not isinstance(matcher['text'], str):
+		_fail(where, 'text must be a string')
+
+
+def _check_after(block, where):
+	if not isinstance(block, dict) or set(block) - _AFTER_KEYS:
+		_fail(where, 'an after/check block takes %s' % ', '.join(sorted(_AFTER_KEYS)))
+	if 'rows' in block:
+		_check_matcher({'rows': block['rows']}, where)
+	if 'missing' in block and not (block['missing'] is None or (isinstance(block['missing'], list) and all(isinstance(c, str) for c in block['missing']))):
+		_fail(where, 'missing must be a list of strings or null')
+	if block.get('fidelity', 'full') not in ('full', 'markers'):
+		_fail(where, 'fidelity must be "full" or "markers"')
+	for name in ('exists', 'absent'):
+		if name in block and not (isinstance(block[name], list) and all(isinstance(p, str) for p in block[name])):
+			_fail(where, '%s must be a list of paths' % name)
+	for rule in block.get('bytes', []):
+		if rule not in BYTE_RULES:
+			_fail(where, 'unknown byte rule %r' % rule)
+	if 'serve_exit' in block and not isinstance(block['serve_exit'], int):
+		_fail(where, 'serve_exit must be an integer')
+
+
+def action_of(step):
+	actions = [a for a in _STEP_KEYS if a in step]
+	return actions[0] if len(actions) == 1 else None
+
+
+def _check_step(step, where):
+	action = action_of(step) if isinstance(step, dict) else None
+	if action is None:
+		_fail(where, 'a step has exactly one of %s' % ', '.join(_STEP_KEYS))
+	extra = set(step) - {action} - _STEP_KEYS[action]
+	if extra:
+		_fail(where, '%s step does not take %s' % (action, ', '.join(sorted(extra))))
+	value = step[action]
+	if action in ('op', 'argv', 'request'):
+		if not (isinstance(value, list) and (value or action == 'argv') and all(isinstance(a, str) for a in value)):
+			_fail(where, '%s must be a list of strings, not empty' % action if action != 'argv' else 'argv must be a list of strings')
+		if action != 'argv' and value[0] not in OPERATIONS:
+			_fail(where, 'unknown operation %r' % value[0])
+		if action == 'op' and value[0] in ('serve', 'stop'):
+			_fail(where, 'serve and stop are not op steps; use argv or request')
+	elif action == 'raw':
+		if not isinstance(value, str):
+			_fail(where, 'raw must be a string')
+	elif action in ('append', 'write'):
+		if not _content_ok(value) or not isinstance(step.get('path'), str):
+			_fail(where, '%s needs content and a path' % action)
+	elif action == 'check':
+		_check_after(value, where)
+	if 'stdin' in step and not _content_ok(step['stdin']):
+		_fail(where, 'stdin must be a string or {"b64": ...}')
+	if 'body' in step and not (isinstance(step['body'], list) and all(isinstance(l, str) for l in step['body'])):
+		_fail(where, 'body must be a list of protocol lines')
+	if 'exit' in step and not isinstance(step['exit'], int):
+		_fail(where, 'exit must be an integer')
+	if 'stdout' in step:
+		_check_matcher(step['stdout'], where)
+	if step.get('stderr', 'empty') not in ('empty', 'nonempty'):
+		_fail(where, 'stderr must be "empty" or "nonempty"')
+	if 'options' in step and not (isinstance(step['options'], list) and all(isinstance(o, str) and o.startswith('--') for o in step['options'])):
+		_fail(where, 'options must be a list of --options')
+
+
+def _check_expect(expect, where):
+	if not isinstance(expect, dict) or not expect or set(expect) - _EXPECT_KEYS:
+		_fail(where, 'expect takes %s' % ', '.join(sorted(_EXPECT_KEYS)))
+	if 'read' in expect:
+		read = expect['read']
+		if isinstance(read, dict):
+			if set(read) - {'rows', 'exit'} or not isinstance(read.get('exit', 0), int):
+				_fail(where, 'read takes rows and exit')
+			if read.get('rows') is not None:
+				_check_matcher({'rows': read['rows']}, where)
+		else:
+			_check_matcher({'rows': read}, where)
+	if 'keys' in expect and not (isinstance(expect['keys'], list) and all(isinstance(k, str) for k in expect['keys'])):
+		_fail(where, 'keys must be a list of strings')
+	if 'len' in expect and not isinstance(expect['len'], int):
+		_fail(where, 'len must be an integer')
+	for query in expect.get('get', []):
+		if not isinstance(query, dict) or set(query) - {'args', 'rows', 'exit'} or not query.get('args'):
+			_fail(where, 'each get takes args, rows and exit')
+		_check_matcher({'rows': query.get('rows', [])}, where)
+	if 'verify' in expect:
+		verify = expect['verify']
+		if not isinstance(verify, dict) or set(verify) - {'lines', 'exit'}:
+			_fail(where, 'verify takes lines and exit')
+		_check_matcher({'lines': verify.get('lines', [])}, where)
+
+
+def validate_case(raw, cls, where):
+	"""Check one case object against the format (design section 1.3) and return a Case."""
+	if not isinstance(raw, dict):
+		_fail(where, 'a case is a JSON object')
+	where = '%s: %s' % (where, raw.get('id', '?'))
+	extra = set(raw) - _CASE_KEYS
+	if extra:
+		_fail(where, 'unknown fields %s' % ', '.join(sorted(extra)))
+	for name in ('id', 'spec', 'level', 'note'):
+		if name not in raw:
+			_fail(where, 'missing %s' % name)
+	match = _ID_RE.match(raw['id']) if isinstance(raw['id'], str) else None
+	if not match:
+		_fail(where, 'id must be CLAUSE-slug, e.g. 9.2-lone-key-deletes')
+	spec = raw['spec']
+	if not (isinstance(spec, list) and spec and all(isinstance(c, str) and _CLAUSE_RE.match(c) for c in spec)):
+		_fail(where, 'spec must be a non-empty list of clauses like "9.2"')
+	if match.group(1) not in spec:
+		_fail(where, 'the clause of the id (%s) must be listed in spec' % match.group(1))
+	if raw['level'] not in LEVELS:
+		_fail(where, 'level must be MUST or SHOULD')
+	if not (isinstance(raw['note'], str) and raw['note'].strip()):
+		_fail(where, 'note must be a sentence')
+	requires = raw.get('requires', [])
+	if not isinstance(requires, list) or any(not isinstance(r, str) or r.lstrip('!') not in FEATURES for r in requires):
+		_fail(where, 'requires names features from %s, optionally with !' % ','.join(FEATURES))
+	store = raw.get('store', 's.tsvz')
+	if not isinstance(store, str) or os.path.isabs(store) or '..' in store.split('/'):
+		_fail(where, 'store must be a relative path')
+	try:
+		delimiter_of(store)
+	except ValueError:
+		_fail(where, 'store must have a TSVZ variant extension')
+	files = raw.get('files', {})
+	if not isinstance(files, dict) or any(os.path.isabs(p) or '..' in p.split('/') or not _content_ok(c) for p, c in files.items()):
+		_fail(where, 'files maps relative paths to a string or {"b64": ...}')
+	modes = raw.get('modes')
+	if modes is not None and not (isinstance(modes, list) and modes and all(m in MODES for m in modes)):
+		_fail(where, 'modes must list modes from %s' % ','.join(MODES))
+	if cls == 'reader':
+		if 'steps' in raw or 'expect' not in raw:
+			_fail(where, 'a reader case has expect and no steps')
+		_check_expect(raw['expect'], where)
+	else:
+		if 'expect' in raw or not isinstance(raw.get('steps'), list) or not raw['steps']:
+			_fail(where, 'a %s case has steps and no expect' % cls)
+		for step in raw['steps']:
+			_check_step(step, where)
+		kinds = {action_of(s) for s in raw['steps']}
+		if kinds & {'request', 'raw'} and 'argv' in kinds:
+			_fail(where, 'a case cannot mix argv steps with request or raw steps')
+	if 'after' in raw:
+		_check_after(raw['after'], where)
+	if PROBE_PREFIX in json.dumps(raw):
+		_fail(where, 'cases must not use keys starting %s' % PROBE_PREFIX)
+	return Case(raw['id'], cls, spec, raw['level'], raw['note'], requires, store, files, modes,
+		raw.get('expect'), raw.get('steps'), raw.get('after'), where.split(': ')[0])
+
+
+def load_corpus(directory=None):
+	"""Every case of every case file under `directory` (default CASES_DIR), in class order then file order; raises CorpusError."""
+	directory = directory or CASES_DIR
+	cases = []
+	for cls in CLASSES:
+		folder = os.path.join(directory, cls)
+		if not os.path.isdir(folder):
+			continue
+		for name in sorted(os.listdir(folder)):
+			if not name.endswith('.json'):
+				continue
+			path = os.path.join(folder, name)
+			where = os.path.relpath(path, HERE)
+			try:
+				with open(path, encoding='utf-8') as f:
+					data = json.load(f)
+			except (OSError, ValueError) as e:
+				raise CorpusError('%s: %s' % (where, e))
+			if not isinstance(data, dict) or set(data) != {'format', 'class', 'cases'}:
+				_fail(where, 'a case file is {"format": 1, "class": ..., "cases": [...]}')
+			if data['format'] != CASES_FORMAT:
+				_fail(where, 'format %r is not %d' % (data['format'], CASES_FORMAT))
+			if data['class'] != cls:
+				_fail(where, 'class %r does not match its folder %s' % (data['class'], cls))
+			if not isinstance(data['cases'], list):
+				_fail(where, 'cases must be a list')
+			cases.extend(validate_case(raw, cls, where) for raw in data['cases'])
+	return cases
+
+
+def all_cases(directory=None):
+	"""The corpus plus the procedural checks; ids must be unique across both."""
+	cases = load_corpus(directory) + list(CHECKS)
+	seen = {}
+	for case in cases:
+		if case.id in seen:
+			raise CorpusError('%s: id %s is also used in %s' % (case.source, case.id, seen[case.id]))
+		seen[case.id] = case.source
+	return cases
+
+
+def case_modes(case):
+	"""The modes a case can run in (design section 1.6.1), before claims are applied."""
+	if case.func:
+		return ('files',)
+	steps = case.steps or []
+	kinds = {action_of(s) for s in steps}
+	if kinds & {'request', 'raw'}:
+		allowed = ['socket']
+	elif 'argv' in kinds or 'check' in kinds or is_loose(case.store):
+		allowed = ['files']
+	else:
+		allowed = list(MODES)
+		if not case.store.endswith('.tsvz') and any('stdin' in s and 'body' not in s for s in steps):
+			allowed.remove('socket')
+	if case.cls == 'handler' and 'files' in allowed and len(allowed) > 1:
+		allowed.remove('files')
+	if case.modes:
+		allowed = [m for m in allowed if m in case.modes]
+	return tuple(allowed)

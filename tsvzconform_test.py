@@ -140,3 +140,85 @@ def test_the_probe_shows_the_final_marker_state(tmp_path):
 	path.write_text('#_strip_trailing_whites_#\tfalse\n#_fill_empty_with_default_#\ttrue\n#_defaults_#\td1\td2\td3\td4\n')
 	probe = tc.observe(str(path)).probe
 	assert probe == [['tsvzconform-probe-1', 'v  ', 'd2', 'd3', 'd4'], ['tsvzconform-probe-2 ', 'w', 'd2', 'd3', 'd4']]
+
+
+# --- case files ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('raw, problem', [
+	({'id': 'nope', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}}, 'CLAUSE-slug'),
+	({'id': '9.2-x', 'spec': ['9.3'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}}, 'must be listed'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MAY', 'note': 'n', 'expect': {'len': 0}}, 'level'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}, 'requires': ['gzip']}, 'requires'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}, 'store': '../s.tsvz'}, 'relative'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}, 'store': 's.txt'}, 'variant'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'nope': 0}}, 'expect takes'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'read': [['tsvzconform-probe-1']]}}, 'must not use'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'steps': [{'op': ['set']}]}, 'has expect'),
+	({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}, 'extra': 1}, 'unknown fields'),
+])
+def test_bad_reader_cases_are_refused(raw, problem):
+	with pytest.raises(tc.CorpusError, match=problem):
+		tc.validate_case(raw, 'reader', 'x.json')
+
+
+@pytest.mark.parametrize('steps, problem', [
+	([{'op': ['serve']}], 'not op steps'),
+	([{'op': ['nope']}], 'unknown operation'),
+	([{'op': ['set'], 'argv': []}], 'exactly one'),
+	([{'op': ['set'], 'stdout': {'rows': 'x'}}], 'list of lists'),
+	([{'op': ['set'], 'stderr': 'some'}], 'stderr'),
+	([{'argv': []}, {'raw': 'len\n'}], 'cannot mix'),
+	([{'check': {'bytes': ['nope']}}], 'byte rule'),
+	([{'append': 'x'}], 'needs content and a path'),
+])
+def test_bad_steps_are_refused(steps, problem):
+	raw = {'id': '20.2-x', 'spec': ['20.2'], 'level': 'MUST', 'note': 'n', 'steps': steps}
+	with pytest.raises(tc.CorpusError, match=problem):
+		tc.validate_case(raw, 'cli', 'x.json')
+
+
+def test_case_files_load_in_class_and_file_order(tmp_path):
+	for cls, name, ids in (('reader', '02.json', ['9.2-b']), ('reader', '01.json', ['9.2-a']), ('cli', '01.json', ['20.2-c'])):
+		folder = tmp_path / cls
+		folder.mkdir(exist_ok=True)
+		key = 'expect' if cls == 'reader' else 'steps'
+		value = {'len': 0} if cls == 'reader' else [{'op': ['len']}]
+		cases = [{'id': i, 'spec': [i.split('-')[0]], 'level': 'MUST', 'note': 'n', key: value} for i in ids]
+		(folder / name).write_text(json.dumps({'format': 1, 'class': cls, 'cases': cases}))
+	assert [c.id for c in tc.load_corpus(str(tmp_path))] == ['9.2-a', '9.2-b', '20.2-c']
+	(tmp_path / 'cli' / '02.json').write_text(json.dumps({'format': 1, 'class': 'cli', 'cases': [
+		{'id': '9.2-a', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'steps': [{'op': ['len']}]}]}))
+	with pytest.raises(tc.CorpusError, match='also used'):
+		tc.all_cases(str(tmp_path))
+
+
+def test_a_bad_case_file_stops_loading(tmp_path):
+	folder = tmp_path / 'reader'
+	folder.mkdir()
+	(folder / '01.json').write_text('{"format": 2, "class": "reader", "cases": []}')
+	with pytest.raises(tc.CorpusError, match='format'):
+		tc.load_corpus(str(tmp_path))
+	(folder / '01.json').write_text('{"format": 1, "class": "writer", "cases": []}')
+	with pytest.raises(tc.CorpusError, match='folder'):
+		tc.load_corpus(str(tmp_path))
+	(folder / '01.json').write_text('{"format": 1, ')
+	with pytest.raises(tc.CorpusError, match='01.json'):
+		tc.load_corpus(str(tmp_path))
+
+
+def case(**fields):
+	"""A cli case with these fields, validated."""
+	return tc.validate_case(dict({'id': '20.2-x', 'spec': ['20.2'], 'level': 'MUST', 'note': 'n'}, **fields), 'cli', 'x.json')
+
+
+def test_case_modes():
+	assert tc.case_modes(tc.validate_case({'id': '9.2-x', 'spec': ['9.2'], 'level': 'MUST', 'note': 'n', 'expect': {'len': 0}}, 'reader', 'x')) == tc.MODES
+	assert tc.case_modes(case(steps=[{'argv': ['-h']}])) == ('files',)
+	assert tc.case_modes(case(steps=[{'op': ['len']}, {'check': {'rows': []}}])) == ('files',)
+	assert tc.case_modes(case(steps=[{'op': ['set', '-'], 'stdin': 'a,b\n'}], store='s.csvz')) == ('files', 'forwarded')
+	assert tc.case_modes(case(steps=[{'op': ['set', '-'], 'stdin': 'a,b\n', 'body': ['a\tb']}], store='s.csvz')) == tc.MODES
+	assert tc.case_modes(case(steps=[{'op': ['len']}], store='s.tsv')) == ('files',)
+	assert tc.case_modes(case(steps=[{'op': ['len']}], modes=['files', 'socket'])) == ('files', 'socket')
+	handler = tc.validate_case({'id': '21.8-x', 'spec': ['21.8'], 'level': 'MUST', 'note': 'n', 'steps': [{'op': ['len']}]}, 'handler', 'x')
+	assert tc.case_modes(handler) == ('socket', 'forwarded')
+	assert tc.case_modes(case(steps=[{'raw': 'len\n'}])) == ('socket',)
