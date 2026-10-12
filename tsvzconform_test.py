@@ -486,3 +486,118 @@ def test_a_handler_that_ignores_stop_is_killed(tmp_path):
 	with pytest.raises(ProcessLookupError):
 		os.kill(pid, 0)
 	assert not tc.LIVE_HANDLERS and pid not in tc.LIVE_GROUPS
+
+
+# --- running cases ---------------------------------------------------------------------------
+
+FAKE = r'''
+import os, re, socket, subprocess, sys, time
+mode, reference = sys.argv[1], sys.argv[2]
+args = sys.argv[3:]
+ops = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts', 'has', 'len', 'keys', 'pop', 'popitem', 'setdefault', 'serve', 'stop')
+op = next((a for a in args if a in ops), None)
+store = args[args.index(op) + 1] if op and args.index(op) + 1 < len(args) else None
+if mode == 'hang' and op == 'read':
+	child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+	with open(os.environ['FAKE_PIDFILE'], 'w') as f:
+		f.write(str(child.pid))
+	time.sleep(60)
+if mode == 'crash' and op == 'len':
+	raise RuntimeError('crashed')
+if mode == 'decoy' and op == 'get':
+	try:
+		lines = open(store + '.serve').read().split('\n')
+		address = dict(l.split('\t', 1) for l in lines[1:] if '\t' in l)['address']
+		if address.startswith('unix:'):
+			s = socket.socket(socket.AF_UNIX)
+			s.connect(address[5:])
+		else:
+			host, port = address.split(':')[1:]
+			s = socket.create_connection((host, int(port)))
+		s.close()
+	except Exception:
+		pass
+if mode == 'rename' and op == 'scrub':
+	subprocess.run([sys.executable, reference] + args, check=True)
+	data = open(store, 'rb').read()
+	with open(store + '.tmp', 'wb') as f:
+		f.write(data)
+	os.replace(store + '.tmp', store)
+	sys.exit(0)
+if mode == 'nomarkers' and op == 'scrub':
+	rows = subprocess.run([sys.executable, reference, '--format', 'records', 'read', store], stdout=subprocess.PIPE).stdout
+	with open(store, 'r+b') as f:
+		f.write(b'#_version_#\t1\n' + rows)
+		f.truncate()
+	sys.exit(0)
+data = sys.stdin.buffer.read() if args[-1:] == ['-'] else b''
+done = subprocess.run([sys.executable, reference] + args, input=data, stdout=subprocess.PIPE)
+out, code = done.stdout, done.returncode
+if mode == 'drop' and op == 'read':
+	out = b''.join(out.splitlines(True)[:-1])
+if mode == 'nodelim' and op == 'read':
+	out = re.sub(rb'\t+\n', b'\n', out)
+if mode == 'exit0' and op == 'get':
+	code = 0
+sys.stdout.buffer.write(out)
+sys.exit(code)
+'''
+
+
+def fake(tmp_path, mode):
+	"""The command line of a fake implementation that wraps the reference and breaks one thing."""
+	script = tmp_path / 'fake.py'
+	script.write_text(FAKE)
+	return '%s %s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), mode, shlex.quote(REFERENCE))
+
+
+def context(work, command=REF_COMMAND, features=()):
+	os.makedirs(str(work), exist_ok=True)
+	return tc.Context(tc.Impl(command), str(work), 10.0, frozenset(features))
+
+
+DELETES = {'id': '9.2-lone-key-deletes', 'spec': ['9.2', '9.3'], 'level': 'MUST', 'note': 'A row with no delimiter deletes its key.',
+	'files': {'s.tsvz': 'a\tx\nb\ty\na\n'}, 'expect': {'read': [['b', 'y']], 'len': 1, 'get': [{'args': ['a'], 'rows': [['a']], 'exit': 3}]}}
+WRITES = {'id': '13.3-set-and-check', 'spec': ['13.3'], 'level': 'MUST', 'note': 'set writes an encoded record and appends only.',
+	'files': {'s.tsvz': '#hdr\na\tx\n'},
+	'steps': [{'op': ['set', 'k', 'v<w', 'l\nf']}, {'op': ['get', 'k'], 'stdout': {'rows': [['k', 'v<w', 'l\nf']]}},
+		{'append': 'z\t1\n', 'path': 's.tsvz'}, {'op': ['len'], 'stdout': {'text': '3\n'}}],
+	'after': {'rows': [['a', 'x'], ['k', 'v<w', 'l\nf'], ['z', '1']], 'bytes': ['appended', 'encoded']}}
+
+
+def test_expand_expect_and_step_op():
+	steps = tc.expand_expect(DELETES['expect'])
+	assert steps == [{'op': ['read'], 'exit': 0, 'stdout': {'rows': [['b', 'y']]}}, {'op': ['len'], 'stdout': {'text': '1\n'}},
+		{'op': ['get', 'a'], 'exit': 3, 'stdout': {'rows': [['a']]}}]
+	assert tc.expand_expect({'read': {'rows': None, 'exit': 1}}) == [{'op': ['read'], 'exit': 1}]
+	assert tc.step_op({'argv': ['-q', 'verify', '{store}']}) == 'verify' and tc.step_op({'append': 'x'}) is None
+
+
+@pytest.mark.parametrize('raw, cls', [(DELETES, 'reader'), (WRITES, 'writer')])
+def test_cases_pass_with_the_reference_in_every_mode(tmp_path, raw, cls):
+	case = tc.validate_case(raw, cls, 'x')
+	for mode in tc.MODES:
+		result = tc.run_case(case, mode, context(tmp_path / 'work', features=['handler']))
+		assert result.result == tc.PASS, (mode, result.detail)
+	assert os.listdir(str(tmp_path / 'work')) == []
+
+
+def test_a_failing_case_keeps_its_directory_and_names_the_step(tmp_path):
+	result = tc.run_case(tc.validate_case(DELETES, 'reader', 'x'), 'files', context(tmp_path / 'work', fake(tmp_path, 'drop')))
+	assert result.result == tc.FAIL and result.detail[0].startswith('step 1  ') and 'missing' in result.detail[1]
+	assert result.kept and os.path.isdir(result.kept)
+	should = dict(DELETES, level='SHOULD')
+	assert tc.run_case(tc.validate_case(should, 'reader', 'x'), 'files', context(tmp_path / 'w2', fake(tmp_path, 'drop'))).result == tc.WARN
+
+
+def test_a_missing_tool_fails_and_a_runner_bug_is_an_error(tmp_path, monkeypatch):
+	result = tc.run_case(tc.validate_case(DELETES, 'reader', 'x'), 'files', context(tmp_path / 'work', '/nonexistent/tsvz'))
+	assert result.result == tc.FAIL and 'cannot run' in ' '.join(result.detail)
+
+	def boom(store):
+		raise RuntimeError('a bug in the runner')
+
+	monkeypatch.setattr(tc, 'observe', boom)
+	faithful = dict(WRITES, after={'fidelity': 'full'})
+	result = tc.run_case(tc.validate_case(faithful, 'writer', 'x'), 'files', context(tmp_path / 'w2'))
+	assert result.result == tc.ERROR and 'a bug in the runner' in result.detail[-1]

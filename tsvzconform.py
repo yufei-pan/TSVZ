@@ -1201,3 +1201,307 @@ class Handler(object):
 		LIVE_HANDLERS.discard(self)
 		if self.proc is not None:
 			LIVE_GROUPS.discard(self.proc.pid)
+
+
+# ---------------------------------------------------------------------------
+# Running cases
+# ---------------------------------------------------------------------------
+
+class Context(object):
+	def __init__(self, impl, work, timeout=10.0, features=frozenset()):
+		self.impl = impl
+		self.work = work
+		self.timeout = timeout
+		self.features = features
+
+
+class Result(object):
+	def __init__(self, case, mode, result, detail=(), seconds=0.0, kept=None):
+		self.case = case
+		self.mode = mode
+		self.cls = case.cls if mode == 'files' else 'handler'
+		self.result = result
+		self.detail = list(detail)
+		self.seconds = seconds
+		self.kept = kept
+
+	@property
+	def name(self):
+		return self.case.id if self.mode == 'files' or self.case.func else '%s@%s' % (self.case.id, self.mode)
+
+
+class Failed(Exception):
+	"""A case's expectation did not hold; args are the detail lines."""
+
+
+def content_bytes(content):
+	return base64.b64decode(content['b64']) if isinstance(content, dict) else content.encode('utf-8')
+
+
+def fill(text, case_dir, store):
+	return text.replace('{dir}', case_dir).replace('{store}', store)
+
+
+def fill_matcher(matcher, case_dir, store):
+	if not isinstance(matcher, dict):
+		return matcher
+	if 'text' in matcher:
+		return {'text': fill(matcher['text'], case_dir, store)}
+	name = 'rows' if 'rows' in matcher else 'lines'
+	return {name: [[fill(c, case_dir, store) for c in row] for row in matcher[name]]}
+
+
+def expand_expect(expect):
+	"""A reader case's expectations as op steps (design section 1.4)."""
+	steps = []
+	if 'read' in expect:
+		read = expect['read']
+		if isinstance(read, list):
+			read = {'rows': read}
+		step = {'op': ['read'], 'exit': read.get('exit', 0)}
+		if read.get('rows') is not None:
+			step['stdout'] = {'rows': read['rows']}
+		steps.append(step)
+	if 'keys' in expect:
+		steps.append({'op': ['keys'], 'stdout': {'lines': [[k] for k in expect['keys']]}})
+	if 'len' in expect:
+		steps.append({'op': ['len'], 'stdout': {'text': '%d\n' % expect['len']}})
+	for query in expect.get('get', []):
+		steps.append({'op': ['get'] + query['args'], 'exit': query.get('exit', 0), 'stdout': {'rows': query.get('rows', [])}})
+	if 'verify' in expect:
+		steps.append({'op': ['verify'], 'exit': expect['verify'].get('exit', 0), 'stdout': {'lines': expect['verify'].get('lines', [])}})
+	return steps
+
+
+def step_op(step):
+	"""The operation a step runs, or None."""
+	for name in ('op', 'request'):
+		if name in step:
+			return step[name][0]
+	if 'argv' in step:
+		for arg in step['argv']:
+			if arg in OPERATIONS:
+				return arg
+	return None
+
+
+def materialize(case, case_dir):
+	for rel, content in case.files.items():
+		path = os.path.join(case_dir, rel)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, 'wb') as f:
+			f.write(content_bytes(content))
+
+
+def _committed_lines(text):
+	return text[:text.rfind('\n') + 1].split('\n')[:-1] if '\n' in text else []
+
+
+class CaseRun(object):
+	"""One case in one mode, in its own directory."""
+
+	def __init__(self, case, mode, ctx, case_dir):
+		self.case = case
+		self.mode = mode
+		self.ctx = ctx
+		self.dir = case_dir
+		self.store = os.path.join(case_dir, case.store)
+		self.delimiter = delimiter_of(self.store)
+		self.handler = None
+		self.client = None
+		self.before = None
+		self.trace = []
+		self.count = 0
+
+	def run(self):
+		case = self.case
+		materialize(case, self.dir)
+		blocks = [case.after or {}] + [s['check'] for s in (case.steps or []) if 'check' in s]
+		observed = None
+		if any('fidelity' in b for b in blocks):
+			try:
+				observed = observe(self.store)
+			except CodecUnavailable as e:
+				raise Skip('the runner cannot read %s parts' % e)
+		self.before = Before(snapshot_store(self.store), observed)
+		steps = case.steps or expand_expect(case.expect)
+		problems = []
+		try:
+			if self.mode != 'files':
+				try:
+					self.handler = Handler(self.ctx.impl, self.store, self.dir).start()
+				except HandlerError as e:
+					raise Failed('serve   the handler did not start: %s' % e)
+			for step in steps:
+				self.count += 1
+				self.step(step)
+		finally:
+			if self.client is not None:
+				self.client.close()
+			if self.handler is not None:
+				problems = self.handler.stop()
+		if problems:
+			raise Failed('after   ' + '; '.join(problems))
+		if case.after:
+			found = check_after(case.after, self.store, self.dir, self.before, self.handler.exit if self.handler else None)
+			if found:
+				raise Failed(*(['after   ' + found[0]] + ['        ' + p for p in found[1:]]))
+
+	def describe(self, text):
+		self.trace.append('step %d  %s' % (self.count, text))
+
+	def fail(self, problems, stderr=b''):
+		lines = self.trace[-1:] + ['        ' + p for p in problems]
+		tail = stderr.decode('utf-8', 'replace').splitlines()[-5:]
+		if tail:
+			lines.append('stderr  ' + '\n        '.join(tail))
+		raise Failed(*lines)
+
+	def step(self, step):
+		action = action_of(step)
+		if action in ('append', 'write'):
+			path = os.path.join(self.dir, step['path'])
+			with open(path, 'ab' if action == 'append' else 'wb') as f:
+				f.write(content_bytes(step[action]))
+			self.describe('%s %s to %s' % (action, show(content_bytes(step[action])), step['path']))
+			return
+		if action == 'check':
+			self.describe('check the files')
+			found = check_after(step['check'], self.store, self.dir, self.before)
+			if found:
+				self.fail(found)
+			return
+		if self.mode == 'socket':
+			return self.socket_step(step, action)
+		if action == 'op':
+			argv = self.ctx.impl.cli(step['op'][0], self.store, step['op'][1:])
+		else:
+			argv = self.ctx.impl.argv + [fill(a, self.dir, self.store) for a in step['argv']]
+		stdin = content_bytes(step['stdin']) if 'stdin' in step else b''
+		self.describe(quote(argv) + (' < ' + show(stdin) if stdin else ''))
+		ran = run_command(argv, self.ctx.impl.cwd, self.ctx.timeout, stdin, self.dir, 'step%d' % self.count)
+		if ran.error:
+			self.fail([ran.error])
+		if ran.timed_out:
+			self.fail(['timed out after %.0f s' % self.ctx.timeout], ran.stderr)
+		problems = []
+		want = step.get('exit', 0)
+		if ran.exit != want:
+			problems.append('exit status %d, expected %d' % (ran.exit, want))
+		op = step_op(step)
+		if 'stdout' in step:
+			diff = match_stdout(fill_matcher(step['stdout'], self.dir, self.store), ran.stdout, self.delimiter,
+				live=(op == 'read'), line_delimiter='\t' if op in ('verify', 'parts') else None)
+			if diff:
+				problems.append(diff)
+		if self.mode == 'files' and 'stderr' in step:
+			if step['stderr'] == 'empty' and ran.stderr:
+				problems.append('stderr should be empty')
+			if step['stderr'] == 'nonempty' and not ran.stderr:
+				problems.append('stderr should carry a diagnostic, but is empty')
+		if problems:
+			self.fail(problems, ran.stderr)
+
+	def socket_step(self, step, action):
+		if self.client is None:
+			try:
+				self.client = self.handler.client()
+			except OSError as e:
+				self.fail(['cannot connect to the handler: %s' % e])
+		try:
+			if action == 'raw':
+				payload = fill(step['raw'], self.dir, self.store)
+				self.describe('send ' + show(payload))
+				self.client.send(payload.encode('utf-8'))
+				response = self.client.response()
+			else:
+				words = step[action]
+				fields = [words[0]] + [encode_arg(fill(a, self.dir, self.store)) for a in words[1:]]
+				options = step.get('options', [])
+				body = step.get('body')
+				if body is None and 'stdin' in step:
+					body = _committed_lines(content_bytes(step['stdin']).decode('utf-8'))
+				self.describe('request ' + show('\t'.join(options + fields)) + (' with body ' + show(body) if body is not None else ''))
+				response = self.client.request(fields, options, body)
+		except (OSError, ConnectionError) as e:
+			self.client.close()
+			self.client = None
+			self.fail(['no response: %s' % e])
+		problems = []
+		want = step.get('exit', 0)
+		if response.status != want:
+			problems.append('status #%d, expected #%d%s' % (response.status, want, (' (%s)' % response.message) if response.message else ''))
+		op = step_op(step)
+		if 'stdout' in step:
+			diff = match_stdout(fill_matcher(step['stdout'], self.dir, self.store), response.output, '\t', live=(op == 'read'))
+			if diff:
+				problems.append(diff)
+		if problems:
+			self.fail(problems)
+
+
+class CheckContext(object):
+	"""What a procedural check gets: the implementation, its own directory and helpers."""
+
+	def __init__(self, ctx, case_dir):
+		self.impl = ctx.impl
+		self.timeout = ctx.timeout
+		self.dir = case_dir
+		self.count = 0
+		self.cleanup = []
+
+	def path(self, name):
+		return os.path.join(self.dir, name)
+
+	def write(self, name, content):
+		path = self.path(name)
+		with open(path, 'wb') as f:
+			f.write(content if isinstance(content, bytes) else content.encode('utf-8'))
+		return path
+
+	def run(self, argv, stdin=b''):
+		self.count += 1
+		return run_command(argv, self.impl.cwd, self.timeout, stdin, self.dir, 'run%d' % self.count)
+
+	def handler(self, store):
+		return Handler(self.impl, store, self.dir).start()
+
+
+def run_name(case, mode):
+	return case.id if mode == 'files' else '%s@%s' % (case.id, mode)
+
+
+def run_case(case, mode, ctx):
+	"""Run one case in one mode and return its Result; a passing or skipped case's directory is removed."""
+	started = time.time()
+	case_dir = os.path.join(ctx.work, run_name(case, mode))
+	shutil.rmtree(case_dir, ignore_errors=True)
+	os.makedirs(case_dir)
+	detail = []
+	try:
+		if case.func:
+			cx = CheckContext(ctx, case_dir)
+			try:
+				problems = case.func(cx)
+			finally:
+				for undo in cx.cleanup:
+					undo()
+			result = PASS if not problems else (FAIL if case.level == 'MUST' else WARN)
+			detail = list(problems)
+		else:
+			try:
+				CaseRun(case, mode, ctx, case_dir).run()
+				result = PASS
+			except Failed as e:
+				result = FAIL if case.level == 'MUST' else WARN
+				detail = list(e.args)
+	except Skip as e:
+		result, detail = SKIP, [str(e)]
+	except Exception:
+		result, detail = ERROR, traceback.format_exc().rstrip().splitlines()
+	kept = None
+	if result in (PASS, SKIP):
+		shutil.rmtree(case_dir, ignore_errors=True)
+	else:
+		kept = case_dir
+	return Result(case, mode, result, detail, time.time() - started, kept)
