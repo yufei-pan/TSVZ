@@ -649,8 +649,9 @@ by a supported codec.
 
 16.2 The compression suffix is the **outermost** filename suffix, so that tools
 which determine the codec from the filename (rather than from magic bytes) work
-correctly. Supported suffixes: `.gz`/`.gzip`, `.bz2`/`.bzip2`, `.xz`/`.lzma`,
-`.zst`/`.zstd`. Example: `events.tsvz.<ordinal>.zst`.
+correctly. The defined suffixes are `.gz`/`.gzip` (gzip), `.bz2`/`.bzip2`
+(bzip2), `.xz`/`.lzma` (xz) and `.zst`/`.zstd` (Zstandard). Example:
+`events.tsvz.<ordinal>.zst`.
 
 16.3 Delimiter/format inference and the parsing of the ordinal and the `.rotated`
 component (§17) strip the compression suffix first.
@@ -664,6 +665,12 @@ high, and compression ratio suffers when each write becomes its own small compre
 unit. Such a writer SHOULD keep the active part uncompressed and leave compression of
 prior immutable parts to a later pass (§17.7). Where a compressed part is not held
 open as a stream, appending requires rewriting it as a whole.
+
+16.5 **Supported codecs.** A conformant reader **MUST** support gzip; support for
+the other codecs of §16.2 is optional. A reader that meets a part whose codec it
+does not support **MUST** fail to read the store rather than skip the part or read
+its bytes as uncompressed text. A command-line tool reports this as a failure
+(§20.6, status 1); a handler answers as §21.8.5 says.
 
 ---
 
