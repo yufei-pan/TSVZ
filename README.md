@@ -24,7 +24,9 @@ pip install -e .          # editable, from this directory
 
 The delimiter follows the extension: tab, comma, NUL, pipe. A trailing
 compression suffix (`.gz`, `.bz2`, `.xz`, `.zst`) is allowed on both; `.zst`
-needs Python 3.14.
+needs Python 3.14. For important or sensitive data, keep the part you write to
+uncompressed and compress parts once they no longer change: a damaged
+compressed member loses every record in it (spec §16.4.3).
 
 `TSVZed`, `TSVZedLite`, `readTabularFile`, `appendTabularFile`,
 `appendLinesTabularFile`, `clearTabularFile`, `scrubTabularFile` (and the
@@ -176,12 +178,12 @@ TSVZ warning: data.tsvz: invalid UTF-8 replaced with U+FFFD (3 occurrences, firs
 Examples: bytes after the last newline (ignored on read; truncated before the
 next append, and quoted), invalid UTF-8, a byte order mark, a newer
 `#_version_#`, a marker with a bad value, a checksum mismatch, a damaged
-compressed part (read up to the damage; repaired in place before the next
-append or scrub, with the original saved as `<part>.damaged-<time>`; a repair
-keeps what the codec verified, the whole lines of a member cut short, and
-complete members found after the damage; an append checks only the part's
-last 64 KiB, so damage further back waits for the next load or scrub), an unreadable
-part, and a delimiter or encoding argument that conflicts with the extension.
+compressed member (it is skipped and reading continues at the next complete
+member, spec §16.6; a last member cut short keeps its whole lines, and
+`TSVZed`, `TSVZedLite` and `tsvz serve` write them again with their first
+append; a scrub that drops a damaged member keeps the original part as
+`<part>.damaged-<time>`), an unreadable part, and a delimiter or encoding
+argument that conflicts with the extension.
 
 ## Breaking changes from 3.39
 
@@ -212,6 +214,7 @@ part, and a delimiter or encoding argument that conflicts with the extension.
 | S10 | Files named `x.tsvz.<hex>` beside `x.tsvz` are read as parts of the store. |
 | S11 | `lastLineOnly` reads forward (slower on large files). |
 | S12 | `TSVZedLite.clear()` and `clear_file()` raise `OSError` when the clear is refused (a part could not be read, the path names one part of a store, or the store kept changing). Memory is reloaded from the unchanged store first. |
+| S13 | Compressed parts are written in members of at most 1 MiB of records (`#_member_size_#`), Zstandard frames with a checksum; a member is read only once it passes its check, and an append never reads or repairs the part. |
 
 ### The `tsvz` command
 
@@ -240,7 +243,7 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: locking is the 3.39 exclusive `lockf` per write plus an in-process lock; readers do not lock.
+- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere it is `lockf`.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
