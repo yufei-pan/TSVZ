@@ -441,6 +441,31 @@ def test_client_reads_diagnostics_status_and_bulk_requests():
 	assert got == [b'get\tk\n', b'--sync\tset\t-\n', b'a\tx\n', b'b\ty\n', b'#\n']
 
 
+def test_a_status_line_with_non_ascii_digits_is_malformed():
+	path = os.path.join(_short_socket_dir(), 's')
+	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	server.bind(path)
+	server.listen(1)
+
+	def serve():
+		conn, _ = server.accept()
+		conn.makefile('rb').readline()
+		conn.sendall('#\u00b2\n'.encode('utf-8'))
+		conn.close()
+
+	thread = threading.Thread(target=serve)
+	thread.daemon = True
+	thread.start()
+	client = tc.Client(path, 5)
+	try:
+		with pytest.raises(ConnectionError, match='not #N'):
+			client.request(['len'])
+	finally:
+		client.close()
+		thread.join(5)
+		server.close()
+
+
 def test_handler_lifecycle_with_the_reference(tmp_path):
 	store = tmp_path / 's.tsvz'
 	store.write_text('a\tx\n')
@@ -682,6 +707,15 @@ def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
 
 
 # --- selection, report and main --------------------------------------------------------------
+
+def test_the_rerun_line_names_the_mode():
+	case = tc.validate_case(DELETES, 'reader', 'x')
+	impl = tc.Impl('tsvz')
+	assert '--mode files' in tc.rerun_command(impl, tc.Result(case, 'files', tc.FAIL), frozenset())
+	assert '--mode socket' in tc.rerun_command(impl, tc.Result(case, 'socket', tc.FAIL), frozenset(['handler']))
+	check = next(c for c in tc.CHECKS if c.id == '21.2.3-pointer-is-locked')
+	assert '--mode' not in tc.rerun_command(impl, tc.Result(check, 'files', tc.FAIL), frozenset())
+
 
 def test_matches_only():
 	assert tc.matches_only('9.2-lone-key-deletes', ())

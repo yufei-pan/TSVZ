@@ -1105,7 +1105,7 @@ class Client(object):
 			elif line.startswith(b'#'):
 				text = line.rstrip(b'\n').decode('utf-8', 'replace')
 				code, _, message = text[1:].partition('\t')
-				if not code.isdigit():
+				if not re.match(r'[0-9]+\Z', code):
 					raise ConnectionError('a status line that is not #N: %s' % show(text))
 				return Response(int(code), decode_field(message, '\t'), b''.join(output), diagnostics)
 			else:
@@ -2011,7 +2011,7 @@ def run_all(runs, ctx, jobs, fail_fast=False, progress=None):
 def rerun_command(impl, result, features):
 	prog = os.path.relpath(os.path.abspath(__file__))
 	argv = ['python3', prog, '--impl', impl.command, '--only', result.case.id]
-	if result.mode != 'files' and not result.case.func:
+	if not result.case.func:
 		argv += ['--mode', result.mode]
 	if features:
 		argv += ['--feature', ','.join(f for f in FEATURES if f in features)]
