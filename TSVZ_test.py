@@ -279,6 +279,7 @@ import gzip
 import zlib
 import io
 import random
+import errno
 import subprocess
 import threading
 from collections import OrderedDict
@@ -1399,6 +1400,197 @@ def test_lock_survives_another_descriptor_of_the_part_closing(tmp_path):
 	assert code == 3
 
 
+def _counting_reads(monkeypatch):
+	read = []
+	real_open = open
+
+	class Counting(object):
+		def __init__(self, f):
+			self._f = f
+		def read(self, *args):
+			data = self._f.read(*args)
+			read.append(len(data))
+			return data
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+	monkeypatch.setattr(TSVZ, 'open', lambda *args, **kwargs: Counting(real_open(*args, **kwargs)), raising=False)
+	return read
+
+
+def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypatch):
+	# One member per record is what per-record appends write; reading must stay linear in the part's size.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, b''.join(gzip.compress(b'k%05d\tv\n' % i) for i in range(5000)))
+	read = _counting_reads(monkeypatch)
+	assert len(TSVZ.readTabularFile(p)) == 5000
+	assert sum(read) <= 2 * os.path.getsize(p) + TSVZ._CHUNK
+
+
+def test_spec_a_member_larger_than_the_hold_limit_is_verified_then_streamed(tmp_path, monkeypatch):
+	# The reader holds at most _HOLD_LIMIT bytes of a member; a larger one is checked first, then read again.
+	monkeypatch.setattr(TSVZ, '_HOLD_LIMIT', 1000)
+	records = b''.join(b'k%05d\tv\n' % i for i in range(2000))
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + gzip.compress(records) + gzip.compress(b'z\t9\n'))
+	assert len(TSVZ.readTabularFile(p)) == 2002
+	_touch(p, gzip.compress(b'a\t1\n') + _crc_only_flip(gzip.compress(records)) + gzip.compress(b'z\t9\n'))
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'z'}
+
+
+def test_spec_cut_lines_are_tied_to_the_size_the_cut_member_was_read_at(tmp_path, monkeypatch):
+	# A member appended while the reader looked past the cut one must not count as read (spec §16.4.2).
+	p = str(tmp_path / 'm.tsvz.gz')
+	cut = gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B
+	_touch(p, cut)
+	real = TSVZ._nextCompleteMember
+
+	def append_meanwhile(*args):
+		found = real(*args)  # nothing after the cut member yet
+		with open(p, 'ab') as f:
+			f.write(gzip.compress(b'm\t2\n'))
+		return found
+	monkeypatch.setattr(TSVZ, '_nextCompleteMember', append_meanwhile)
+	_, _, infos = _replay([p])
+	assert infos[0].cutLines == b'b\t2\n' and infos[0].rawSize == len(cut)
+
+
+def _tear_first_append(monkeypatch, path):
+	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would."""
+	torn = []
+	real_open = open
+
+	class Tearing(object):
+		def __init__(self, f):
+			self._f = f
+		def write(self, data):
+			if not torn:
+				torn.append(len(data))
+				self._f.write(data[:len(data) // 2])
+				self._f.flush()
+				raise OSError(28, 'No space left on device')
+			return self._f.write(data)
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+
+	def opener(name, mode='r', *args, **kwargs):
+		f = real_open(name, mode, *args, **kwargs)
+		return Tearing(f) if name == path and 'a' in mode else f
+	monkeypatch.setattr(TSVZ, 'open', opener, raising=False)
+	return torn
+
+
+def test_spec_lite_repeats_the_cut_lines_after_its_append_tore(tmp_path, monkeypatch):
+	# Spec §16.4.2: the torn member that held the copy is debris too, so the next append repeats the lines.
+	g = str(tmp_path / 'g.tsvz.gz')
+	_touch(g, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	lite = TSVZ.TSVZedLite(g)
+	torn = _tear_first_append(monkeypatch, g)
+	with pytest.raises(OSError):
+		lite['c'] = ['c', '3']
+	monkeypatch.undo()
+	assert torn
+	lite['d'] = ['d', '4']
+	lite.close()
+	assert set(TSVZ.readTabularFile(g)) == {'a', 'b', 'd'}
+
+
+def test_engine_keeps_the_cut_lines_when_an_append_fails(tmp_path, monkeypatch):
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	store = TSVZ._ServeStore(p, create=True)
+	real = TSVZ._specAppendPayload
+
+	def refuse(*args, **kwargs):
+		raise OSError(24, 'Too many open files')
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', refuse)
+	with pytest.raises(OSError):
+		store._append(b'c\t3\n', False)
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', real)
+	store._append(b'd\t4\n', False)
+	store.close()
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'b', 'd'}
+
+
+def test_spec_header_check_of_an_append_reads_only_the_first_lines(tmp_path, monkeypatch):
+	# An append's cost must not grow with the store: the 3.39 header check decodes only what it needs.
+	p = str(tmp_path / 'big.tsvz.gz')
+	_touch(p, gzip.compress(b'#key\tvalue\n' + b''.join(b'k%d\t%s\n' % (i, os.urandom(16).hex().encode()) for i in range(200000))))
+	assert os.path.getsize(p) > 2 * TSVZ._CHUNK
+	read = _counting_reads(monkeypatch)
+	TSVZ.appendLinesTabularFile(p, [['new', 'v']], header='key\tvalue', verifyHeader=True, strict=True)
+	monkeypatch.undo()
+	assert sum(read) <= TSVZ._CHUNK + (1 << 16)
+
+
+def test_spec_strict_header_check_still_applies_when_only_the_last_member_is_cut(tmp_path):
+	# Part 0 has no line besides a marker, and its last member was cut before it decoded anything: nothing
+	# was lost, so the missing header is still a mismatch.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'#_version_#\t1\n') + gzip.compress(b'a\t1\n')[:12])
+	with pytest.raises(ValueError):
+		TSVZ.readTabularFile(p, header='key\tvalue', strict=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='open file description locks are Linux-only')
+def test_unlock_uses_the_lock_kind_that_took_the_lock(tmp_path, monkeypatch):
+	# A refused open file description lock on one file must not change how another file is unlocked.
+	import fcntl
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', TSVZ._OFD_COMMANDS)
+	p1, p2 = str(tmp_path / 'one.tsvz'), str(tmp_path / 'two.tsvz')
+	_touch(p1, b'a\t1\n')
+	_touch(p2, b'b\t2\n')
+	f1, f2 = open(p1, 'r+b'), open(p2, 'r+b')
+	try:
+		TSVZ._lockFile(f1)
+		real = fcntl.fcntl
+
+		def refuse_two(fd, cmd, arg=0):
+			if fd == f2.fileno():
+				raise OSError(errno.EINVAL, 'Invalid argument')
+			return real(fd, cmd, arg)
+		monkeypatch.setattr(fcntl, 'fcntl', refuse_two)
+		TSVZ._lockFile(f2)
+		TSVZ._unlockFile(f2)
+		monkeypatch.setattr(fcntl, 'fcntl', real)
+		TSVZ._unlockFile(f1)
+		probe = ('import fcntl, sys\nf = open(sys.argv[1], "r+b")\n'
+				 'try:\n    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError:\n    sys.exit(3)\nsys.exit(0)\n')
+		assert subprocess.call([sys.executable, '-c', probe, p1]) == 0
+	finally:
+		f1.close()
+		f2.close()
+
+
+def test_spec_scrub_backs_up_again_when_the_part_changed(tmp_path, monkeypatch):
+	# A writer appended a damaged member between the first backup and the rewrite: it needs a copy too.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT + gzip.compress(b'b\t2\n'))
+	real = TSVZ._specRewriteInPlace
+	calls = []
+
+	def changed_once(path, content, expect=None, memberSize=None):
+		if not calls:
+			calls.append(1)
+			with open(path, 'ab') as f:
+				f.write(gzip.compress(b'Q\tq\n')[:-6] + gzip.compress(b'c\t3\n'))
+			return None
+		return real(path, content, expect=expect, memberSize=memberSize)
+	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', changed_once)
+	assert TSVZ._specScrub(p, delimiter='\t')[1] is True
+	backups = sorted(n for n in os.listdir(str(tmp_path)) if n.startswith('m.tsvz.gz.damaged-'))
+	assert len(backups) == 2
+	with open(str(tmp_path / backups[-1]), 'rb') as f:
+		assert gzip.compress(b'c\t3\n') in f.read()
+
+
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
 	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
 	_block_zstd(monkeypatch)
@@ -1714,12 +1906,12 @@ def test_spec_append_writes_a_cut_members_lines_again_only_while_the_part_is_unc
 	cut = gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\nbr')[:-6]
 	_touch(g, cut)
 	reporter = TSVZ._Reporter(g)
-	assert TSVZ._specAppendPayload(g, b'c\t3\n', reporter, prefix=b'b\t2\n', prefixAtSize=len(cut)) is True
+	assert TSVZ._specAppendPayload(g, b'c\t3\n', reporter, recut=TSVZ._Recut(b'b\t2\n', len(cut))) is True
 	reporter.flush()
 	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'b': ['b', '2'], 'c': ['c', '3']}
 	assert any('again' in w for w in _tsvz_warnings(capsys))
 	_touch(g, cut)
-	assert TSVZ._specAppendPayload(g, b'c\t3\n', TSVZ._Reporter(g), prefix=b'b\t2\n', prefixAtSize=len(cut) - 1) is False
+	assert TSVZ._specAppendPayload(g, b'c\t3\n', TSVZ._Reporter(g), recut=TSVZ._Recut(b'b\t2\n', len(cut) - 1)) is False
 	assert TSVZ.readTabularFile(g) == {'a': ['a', '1'], 'c': ['c', '3']}  # the cut member is debris now
 
 def test_spec_rewrite_in_place_keeps_inode_and_skips_identical(tmp_path):
@@ -2598,7 +2790,8 @@ def test_spec_backup_never_overwrites_a_backup(tmp_path, monkeypatch, capsys):
 	monkeypatch.undo()
 	backup = g + '.damaged-20261008T120000'
 	assert open(backup, 'rb').read() == first and open(backup + '.1', 'rb').read() == second
-	assert synced == [os.stat(backup).st_ino, os.stat(backup + '.1').st_ino]
+	directory = os.stat(str(tmp_path)).st_ino  # the new name is durable too
+	assert synced == [os.stat(backup).st_ino, directory, os.stat(backup + '.1').st_ino, directory]
 	warnings = [w for w in _tsvz_warnings(capsys) if g in w]
 	assert len(warnings) == 2 and warnings[0].endswith(backup) and warnings[1].endswith(backup + '.1')
 
