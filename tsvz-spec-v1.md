@@ -842,7 +842,10 @@ append-only (§3.1).
          any other non-default stateful markers, then `#_defaults_#` last (subject
          to §19.4);
       b. one line per live key, in first-appearance order;
-      c. no tombstones, no comments, no superseded values.
+      c. no tombstones and no superseded values, and no comments, except that the
+         snapshot MAY begin with the store's header comment — the first committed
+         line of its first part, when that line is a comment — placed before the
+         markers of (a).
    4. Once _S_ is durable, apply the `#_rotate_#` action (§19.5) to the subsumed
       prefix.
    5. The worker exits. No coordination with the live process is required: the live
@@ -879,8 +882,9 @@ strategy is to emit `#_strip_trailing_whites_#` `false` and
    The action is advisory: a conservative reader or processor MAY always downgrade
    `delete` → `rename` → `keep` for safety.
 
-19.6 **Lossiness.** A snapshot is lossy with respect to history: comments,
-intermediate values, and tombstone records are discarded. The live data state and
+19.6 **Lossiness.** A snapshot is lossy with respect to history: comments (other
+than a header comment kept by §19.2), intermediate values, and tombstone records
+are discarded. The live data state and
 the active marker state are preserved exactly (subject to §19.4).
 
 19.7 **Lazy / offset-based readers.** Because the prefix is immutable, the live
