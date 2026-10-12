@@ -1,0 +1,18 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "6.4-no-version-line-means-version-1", "spec": ["6.4"], "level": "MUST",
+ "note": "A store without #_version_# is read under version 1.",
+ "files": {"s.tsvz": "#_defaults_#\td1\td2\na\tx\n"},
+ "expect": {"read": [["a", "x", "d2"]]}},
+{"id": "6.3-higher-version-reads-as-highest-known", "spec": ["6.3", "6.4"], "level": "MUST",
+ "note": "A version-1 reader applies version 1 to lines declared version 3, so version-1 markers still work.",
+ "files": {"s.tsvz": "#_version_#\t3\n#_defaults_#\td1\td2\na\tx\n"},
+ "expect": {"read": [["a", "x", "d2"]], "len": 1}},
+{"id": "6.4-version-can-switch", "spec": ["6.4"], "level": "MUST",
+ "note": "A store may switch versions 2, 1 and back to the default; every row is still read.",
+ "files": {"s.tsvz": "#_version_#\t2\na\tx\n#_version_#\t1\nb\ty\n#_version_#\nc\tz\n"},
+ "expect": {"read": [["a", "x"], ["b", "y"], ["c", "z"]]}},
+{"id": "6.4-unknown-token-from-a-higher-version", "spec": ["6.4", "13.4"], "level": "MUST",
+ "note": "A token a later version might define is passed through literally.",
+ "files": {"s.tsvz": "#_version_#\t2\na\tx<TAB>y\n"},
+ "expect": {"read": [["a", "x<TAB>y"]]}}
+]}

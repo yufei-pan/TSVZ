@@ -1,0 +1,18 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "11.1-hash-line-is-a-comment", "spec": ["11.1", "11.2"], "level": "MUST",
+ "note": "A line whose raw first field starts with # is a comment, with any fields.",
+ "files": {"s.tsvz": "#a\tx\n#\n##\nb\ty\n"},
+ "expect": {"read": [["b", "y"]], "len": 1}},
+{"id": "11.1-comment-with-trailing-space", "spec": ["11.1"], "level": "MUST",
+ "note": "Trailing whitespace does not matter to comment classification.",
+ "files": {"s.tsvz": "#foo \n#foo\t \nb\ty\n"},
+ "expect": {"read": [["b", "y"]], "len": 1}},
+{"id": "11.1-leading-space-defeats-a-comment", "spec": ["11.1", "7.3"], "level": "MUST",
+ "note": "\" #foo\" is classified on raw bytes, so it is a data key.",
+ "files": {"s.tsvz": " #foo\tx\n"},
+ "expect": {"read": [[" #foo", "x"]], "keys": [" #foo"]}},
+{"id": "11.3-header-row-is-a-comment", "spec": ["11.3"], "level": "MUST",
+ "note": "A header is just a comment and carries no data.",
+ "files": {"s.tsvz": "#key\tname\tscore\nalice\tAlice\t30\n"},
+ "expect": {"read": [["alice", "Alice", "30"]], "len": 1}}
+]}

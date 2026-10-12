@@ -763,3 +763,60 @@ def test_an_interrupt_prints_the_results_so_far(tmp_path):
 	assert b'tsvzconform ' + tc.version.encode() in out
 	with pytest.raises(ProcessLookupError):
 		os.kill(int((tmp_path / 'pid').read_text()), 0)
+
+
+# --- the corpus --------------------------------------------------------------------------------
+
+CASES = tc.all_cases()
+READER_CASES = [c for c in CASES if c.cls == 'reader']
+
+
+def test_the_corpus_loads_and_ids_are_unique():
+	assert len(CASES) == len({c.id for c in CASES})
+
+
+def test_every_clause_cited_exists_in_the_spec():
+	with open(SPEC, encoding='utf-8') as f:
+		text = f.read()
+	clauses = set(re.findall(r'^(?:#+ )?(\d+(?:\.\d+)*)[ .]', text, re.M))
+	missing = sorted({(c.id, clause) for c in CASES for clause in c.spec if clause not in clauses})
+	assert missing == []
+
+
+def _get(r, args):
+	rows, missing = [], False
+	for key in args:
+		if r.strip:
+			key = key.rstrip(' \t')
+		if key in r.entries:
+			rows.append([key] + r.resolve(key))
+		else:
+			missing = True
+			if r.missing() is not None:
+				rows.append([key] + r.missing())
+	return rows, 3 if missing else 0
+
+
+@pytest.mark.parametrize('case', READER_CASES, ids=[c.id for c in READER_CASES])
+def test_the_oracle_passes_every_reader_case(case, tmp_path):
+	"""The runner's own reader agrees with every reader case it can judge (design section 3.1.2)."""
+	read = case.expect.get('read')
+	if isinstance(read, dict) and read.get('exit', 0) != 0:
+		pytest.skip('an unreadable store: a refusal the oracle does not model')
+	tc.materialize(case, str(tmp_path))
+	try:
+		r = tc.replay_store(str(tmp_path / case.store))
+	except tc.CodecUnavailable:
+		pytest.skip('this Python has no zstd')
+	trimmed = [tc.trim_row(row) for row in r.rows()]
+	if read is not None:
+		want = read if isinstance(read, list) else read['rows']
+		assert trimmed == [tc.trim_row(row) for row in want]
+	if 'keys' in case.expect:
+		assert list(r.entries) == case.expect['keys']
+	if 'len' in case.expect:
+		assert len(r.entries) == case.expect['len']
+	for query in case.expect.get('get', []):
+		rows, code = _get(r, query['args'])
+		assert [tc.trim_row(x) for x in rows] == [tc.trim_row(x) for x in query.get('rows', [])]
+		assert code == query.get('exit', 0)
