@@ -222,3 +222,119 @@ def test_case_modes():
 	handler = tc.validate_case({'id': '21.8-x', 'spec': ['21.8'], 'level': 'MUST', 'note': 'n', 'steps': [{'op': ['len']}]}, 'handler', 'x')
 	assert tc.case_modes(handler) == ('socket', 'forwarded')
 	assert tc.case_modes(case(steps=[{'raw': 'len\n'}])) == ('socket',)
+
+
+# --- matching output and files ----------------------------------------------------------
+
+def test_rows_accept_padding_but_not_a_missing_default():
+	assert tc.match_stdout({'rows': [['b', '3']]}, b'b\t3\t\n', '\t') is None
+	assert 'row 1' in tc.match_stdout({'rows': [['b', '3', 'd']]}, b'b\t3\n', '\t')
+	assert 'tombstone' in tc.match_stdout({'rows': [['a', '']]}, b'a\n', '\t', live=True)
+	assert tc.match_stdout({'rows': [['a', '']]}, b'a\t\n', '\t', live=True) is None
+	assert 'newline' in tc.match_stdout({'rows': [['a', 'x']]}, b'a\tx', '\t')
+	assert 'missing' in tc.match_stdout({'rows': [['a', 'x'], ['b', 'y']]}, b'a\tx\n', '\t')
+	assert 'extra' in tc.match_stdout({'rows': []}, b'a\tx\n', '\t')
+	assert tc.match_stdout({'rows': [['a', 'x,y']]}, b'a,x<sep>y\n', ',') is None
+	assert tc.match_stdout({'lines': [['0', '', '/s', 'active']]}, b'0\t\t/s\tactive\n', ',', line_delimiter='\t') is None
+	assert tc.match_stdout({'text': '2\n'}, b'2\n', '\t') is None
+	assert tc.match_stdout('empty', b'x', '\t') and tc.match_stdout('nonempty', b'', '\t')
+
+
+def _rule(rule, tmp_path, before_files, after_files, store='s.tsvz'):
+	"""Apply a byte rule: write before_files, snapshot, apply after_files (bytes appended or created, None removed, 'replace' renamed over), snapshot again."""
+	for name, data in before_files.items():
+		(tmp_path / name).write_bytes(data)
+	path = str(tmp_path / store)
+	before = tc.snapshot_store(path)
+	for name, data in after_files.items():
+		if data is None:
+			os.remove(str(tmp_path / name))
+		elif data == 'replace':
+			text = (tmp_path / name).read_bytes()
+			(tmp_path / (name + '.new')).write_bytes(text)
+			os.replace(str(tmp_path / (name + '.new')), str(tmp_path / name))
+		else:
+			with open(str(tmp_path / name), 'ab' if name in before_files else 'wb') as f:
+				f.write(data)
+	return tc.byte_rule(rule, path, before, tc.snapshot_store(path))
+
+
+def test_byte_rule_encoded_judges_only_what_was_written(tmp_path):
+	assert _rule('encoded', tmp_path, {'s.tsvz': b'a<b\n'}, {'s.tsvz': b'k\tx<lt>y<sep><CR>\n'}) == []
+
+
+@pytest.mark.parametrize('written, problem', [
+	(b'k\tx\ry\n', 'carriage return'),
+	(b'\xef\xbb\xbfk\tx\n', 'byte-order mark'),
+	(b'k\tx<y\n', 'begins no token'),
+])
+def test_byte_rule_encoded_problems(tmp_path, written, problem):
+	assert problem in ' '.join(_rule('encoded', tmp_path, {}, {'s.tsvz': written}))
+
+
+def test_byte_rules_appended_last_part_unchanged_and_same_file(tmp_path):
+	two = {'s.tsvz': b'a\t1\n', 's.tsvz.1': b'b\t2\n'}
+	d = tmp_path / 'a'
+	d.mkdir()
+	assert _rule('last-part-only', d, two, {'s.tsvz.1': b'c\t3\n'}) == []
+	d = tmp_path / 'g'
+	d.mkdir()
+	assert _rule('appended', d, two, {'s.tsvz': b'c\t3\n', 's.tsvz.1': b'd\t4\n'}) == []
+	d = tmp_path / 'h'
+	d.mkdir()
+	assert 'not appended' in _rule('appended', d, two, {'s.tsvz.1': None})[0]
+	d = tmp_path / 'b'
+	d.mkdir()
+	assert 'only the last part' in _rule('last-part-only', d, two, {'s.tsvz': b'c\t3\n'})[0]
+	d = tmp_path / 'c'
+	d.mkdir()
+	assert 'parts changed' in _rule('last-part-only', d, two, {'s.tsvz.2': b'c\t3\n'})[0]
+	d = tmp_path / 'd'
+	d.mkdir()
+	assert 'modified' in _rule('unchanged', d, two, {'s.tsvz': b'x'})[0]
+	d = tmp_path / 'e'
+	d.mkdir()
+	assert 'replaced by another file' in _rule('same-file', d, two, {'s.tsvz': 'replace'})[0]
+	d = tmp_path / 'f'
+	d.mkdir()
+	assert _rule('same-file', d, two, {'s.tsvz': b'c\t3\n'}) == []
+
+
+def test_byte_rule_header_kept(tmp_path):
+	(tmp_path / 's.tsvz').write_text('#hdr\na\tx\n')
+	before = tc.snapshot_store(str(tmp_path / 's.tsvz'))
+	(tmp_path / 's.tsvz').write_text('#hdr\n#_version_#\t1\n')
+	assert tc.byte_rule('header-kept', str(tmp_path / 's.tsvz'), before, tc.snapshot_store(str(tmp_path / 's.tsvz'))) == []
+	(tmp_path / 's.tsvz').write_text('#_version_#\t1\n')
+	assert 'not the first line' in tc.byte_rule('header-kept', str(tmp_path / 's.tsvz'), before, tc.snapshot_store(str(tmp_path / 's.tsvz')))[0]
+
+
+@pytest.mark.parametrize('content, problem', [
+	('#hdr\n#_version_#\t1\n#_defaults_#\td\na\tx\n#_strip_trailing_whites_#\ttrue\n', None),
+	('#_version_#\t1\na\tx\n', None),
+	('#other\n#_version_#\t1\na\tx\n', 'not the store\'s header'),
+	('a\tx\n', '#_version_#'),
+	('#_version_#\t1\n#_defaults_#\td\n#_strip_trailing_whites_#\ttrue\na\tx\n', '#_defaults_#'),
+	('#_version_#\t1\na\tx\na\n', 'tombstone'),
+	('#_version_#\t1\na\tx\n#c\n', 'not a marker'),
+	('#_version_#\t1\na\tx\n\tz\n', 'data rows for'),
+])
+def test_snapshot_layout(tmp_path, content, problem):
+	(tmp_path / 's.tsvz').write_text('#hdr\na\tx\n')
+	before = tc.snapshot_store(str(tmp_path / 's.tsvz'))
+	(tmp_path / 's.tsvz').write_text(content)
+	found = tc.snapshot_layout(str(tmp_path / 's.tsvz'), before)
+	if problem is None:
+		assert found == []
+	else:
+		assert found and problem in found[0]
+
+
+def test_check_after_fidelity_and_paths(tmp_path):
+	store = tmp_path / 's.tsvz'
+	store.write_text('#_strip_trailing_whites_#\tfalse\na\tx \n')
+	before = tc.Before(tc.snapshot_store(str(store)), tc.observe(str(store)))
+	store.write_text('#_version_#\t1\na\tx \n')
+	found = tc.check_after({'fidelity': 'full', 'exists': ['s.tsvz'], 'absent': ['s.tsvz.serve']}, str(store), str(tmp_path), before)
+	assert len(found) == 2 and 'rows changed' in found[0] and 'final marker state' in found[1]
+	assert tc.check_after({'serve_exit': 0}, str(store), str(tmp_path), before, serve_exit=1) == ['serve exited with status 1, expected 0']

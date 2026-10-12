@@ -673,3 +673,247 @@ def case_modes(case):
 	if case.modes:
 		allowed = [m for m in allowed if m in case.modes]
 	return tuple(allowed)
+
+
+# ---------------------------------------------------------------------------
+# Matching output and files
+# ---------------------------------------------------------------------------
+
+def output_lines(data):
+	"""(lines, terminated) of a command's stdout."""
+	text = data.decode('utf-8', 'replace')
+	if not text:
+		return [], True
+	lines = text.split('\n')
+	terminated = lines[-1] == ''
+	if terminated:
+		lines.pop()
+	return lines, terminated
+
+
+def compare_lists(got, expected, what):
+	"""None when equal, else a sentence naming the first difference."""
+	for i, (g, e) in enumerate(zip(got, expected), 1):
+		if g != e:
+			return '%s %d: expected %s, got %s' % (what, i, show(e), show(g))
+	if len(got) < len(expected):
+		return '%s %d missing: expected %s (got %d %ss, expected %d)' % (what, len(got) + 1, show(expected[len(got)]), len(got), what, len(expected))
+	if len(got) > len(expected):
+		return 'extra %s %d: %s (got %d %ss, expected %d)' % (what, len(expected) + 1, show(got[len(expected)]), len(got), what, len(expected))
+	return None
+
+
+def match_stdout(matcher, data, delimiter, live=False, line_delimiter=None):
+	"""None when stdout matches, else the difference (design section 1.6.2)."""
+	if matcher == 'empty':
+		return None if not data else 'stdout should be empty; got %s' % show(data)
+	if matcher == 'nonempty':
+		return None if data else 'stdout should not be empty'
+	if 'text' in matcher:
+		return None if data == matcher['text'].encode('utf-8') else 'stdout: expected %s, got %s' % (show(matcher['text']), show(data))
+	lines, terminated = output_lines(data)
+	if not terminated:
+		return 'stdout does not end with a newline: %s' % show(data)
+	if 'rows' in matcher:
+		got = []
+		for i, line in enumerate(lines, 1):
+			fields = line.split(delimiter)
+			if live and len(fields) == 1:
+				return 'row %d %s has no delimiter, so it would read back as a tombstone (§20.3.2)' % (i, show(line))
+			got.append(trim_row([decode_field(f, delimiter) for f in fields]))
+		return compare_lists(got, [trim_row(r) for r in matcher['rows']], 'row')
+	split = line_delimiter or delimiter
+	got = [[decode_field(f, split) for f in line.split(split)] for line in lines]
+	return compare_lists(got, matcher['lines'], 'line')
+
+
+PartState = collections.namedtuple('PartState', 'raw data ino mode')
+
+
+def snapshot_store(store):
+	"""Every part's raw bytes, decompressed bytes (None if the runner cannot decompress), inode and mode."""
+	parts = {}
+	for path in store_parts(store):
+		info = os.stat(path)
+		with open(path, 'rb') as f:
+			raw = f.read()
+		try:
+			data = read_part(path)
+		except CodecUnavailable:
+			data = None
+		parts[path] = PartState(raw, data, info.st_ino, stat.S_IMODE(info.st_mode))
+	return parts
+
+
+def first_line(parts):
+	"""The first committed line of the first part, decoded, or None."""
+	for state in parts.values():
+		data = state.data or b''
+		if data.startswith(b'\xef\xbb\xbf'):
+			data = data[3:]
+		end = data.find(b'\n')
+		return data[:end].decode('utf-8', 'replace').rstrip('\r') if end >= 0 else None
+	return None
+
+
+def written_chunks(before, now):
+	"""What was written since `before`: appended bytes, or the whole part when it was rewritten or is new."""
+	chunks = []
+	for path, state in now.items():
+		old = before.get(path)
+		data = state.data or b''
+		if old and old.data is not None and state.ino == old.ino and data.startswith(old.data):
+			data = data[len(old.data):]
+		if data:
+			chunks.append((path, data))
+	return chunks
+
+
+def _is_marker_line(line, delimiter):
+	first = line.split(delimiter)[0]
+	return first.startswith('#') and is_marker_key(first)
+
+
+def snapshot_layout(store, before):
+	"""Problems with a scrubbed store's layout (§19.2.3, decisions 9 and 12)."""
+	parts = store_parts(store)
+	if len(parts) != 1:
+		return ['the scrubbed store has %d parts, expected 1' % len(parts)]
+	d = delimiter_of(store)
+	data = read_part(parts[0])
+	if data.startswith(b'\xef\xbb\xbf'):
+		data = data[3:]
+	lines = data[:data.rfind(b'\n') + 1].decode('utf-8', 'replace').split('\n')[:-1]
+	lines = [line[:-1] if line.endswith('\r') else line for line in lines]
+	i = 0
+	if lines and lines[0].startswith('#') and not _is_marker_line(lines[0], d):
+		if lines[0] != first_line(before):
+			return ['line 1 is a comment but not the store\'s header comment: %s' % show(lines[0])]
+		i = 1
+	block = []
+	while i < len(lines) and _is_marker_line(lines[i], d):
+		block.append(lines[i].split(d)[0].lower())
+		i += 1
+	if not block or block[0] != '#_version_#':
+		return ['line %d should be #_version_#, the first marker of a snapshot; got %s' % (i - len(block) + 1, show(lines[i - len(block)] if i - len(block) < len(lines) else ''))]
+	if '#_defaults_#' in block and block[-1] != '#_defaults_#':
+		return ['#_defaults_# should be the last marker before the rows; the markers are %s' % show(block)]
+	keys = []
+	while i < len(lines) and not lines[i].startswith('#'):
+		if d not in lines[i]:
+			return ['line %d is a tombstone or empty: %s' % (i + 1, show(lines[i]))]
+		keys.append(lines[i].split(d)[0])
+		i += 1
+	if len(set(keys)) != len(keys):
+		return ['a key is written twice in the rows']
+	live = len(replay_store(store).entries)
+	if len(keys) != live:
+		return ['%d data rows for %d live keys' % (len(keys), live)]
+	while i < len(lines):
+		if not _is_marker_line(lines[i], d):
+			return ['line %d after the rows is not a marker: %s' % (i + 1, show(lines[i]))]
+		i += 1
+	return []
+
+
+def byte_rule(rule, store, before, now):
+	"""Problems with one byte rule (design section 1.7)."""
+	problems = []
+	if rule == 'encoded':
+		for path, chunk in written_chunks(before, now):
+			if chunk.startswith(b'\xef\xbb\xbf') and chunk == (now[path].data or b''):
+				problems.append('%s: starts with a byte-order mark (§4.1)' % os.path.basename(path))
+			text = chunk.decode('utf-8', 'replace')
+			bare = _BARE_LT_RE.search(text)
+			if bare:
+				problems.append('%s: a "<" that begins no token: %s' % (os.path.basename(path), show(text[max(0, bare.start() - 10):bare.start() + 10])))
+			if '\r' in text:
+				at = text.index('\r')
+				problems.append('%s: a raw carriage return: %s' % (os.path.basename(path), show(text[max(0, at - 10):at + 10])))
+	elif rule == 'lf-terminated':
+		for path, chunk in written_chunks(before, now):
+			if not chunk.endswith(b'\n'):
+				problems.append('%s: the written bytes do not end with a newline: %s' % (os.path.basename(path), show(chunk[-20:])))
+	elif rule == 'appended':
+		for path, old in before.items():
+			new = now.get(path)
+			if new is None or not new.raw.startswith(old.raw):
+				problems.append('%s: earlier bytes were changed, not appended to' % os.path.basename(path))
+	elif rule == 'last-part-only':
+		paths = list(before)
+		if list(now) != paths:
+			problems.append('the parts changed: %s became %s' % (show([os.path.basename(p) for p in paths]), show([os.path.basename(p) for p in now])))
+		else:
+			for path in paths[:-1]:
+				if now[path].raw != before[path].raw:
+					problems.append('%s changed; only the last part may grow (§17.7)' % os.path.basename(path))
+			if paths and not now[paths[-1]].raw.startswith(before[paths[-1]].raw):
+				problems.append('%s: earlier bytes were changed, not appended to' % os.path.basename(paths[-1]))
+	elif rule == 'unchanged':
+		if sorted(before) != sorted(now):
+			problems.append('the parts changed: %s became %s' % (show([os.path.basename(p) for p in before]), show([os.path.basename(p) for p in now])))
+		for path, old in before.items():
+			if path in now and now[path].raw != old.raw:
+				problems.append('%s was modified' % os.path.basename(path))
+	elif rule == 'same-file':
+		for path, old in before.items():
+			new = now.get(path)
+			if new is None:
+				problems.append('%s is gone' % os.path.basename(path))
+			elif new.ino != old.ino:
+				problems.append('%s was replaced by another file (inode %d, was %d; §18.7)' % (os.path.basename(path), new.ino, old.ino))
+			elif new.mode != old.mode:
+				problems.append('%s mode is %o, was %o' % (os.path.basename(path), new.mode, old.mode))
+	elif rule == 'header-kept':
+		header = first_line(before)
+		if header is None or not header.startswith('#'):
+			problems.append('the case has no header comment to keep')
+		elif first_line(now) != header:
+			problems.append('the header comment %s is not the first line any more; it is %s' % (show(header), show(first_line(now))))
+	elif rule == 'snapshot-layout':
+		problems.extend(snapshot_layout(store, before))
+	return problems
+
+
+Before = collections.namedtuple('Before', 'parts observed')
+
+
+def check_after(block, store, case_dir, before, serve_exit=None):
+	"""Problems with an after or check block (design section 1.7)."""
+	problems = []
+	if set(block) & {'rows', 'missing', 'fidelity'}:
+		try:
+			now = observe(store)
+		except CodecUnavailable as e:
+			raise Skip('the runner cannot read %s parts' % e)
+		if 'rows' in block:
+			diff = compare_lists(now.rows, [trim_row(r) for r in block['rows']], 'row')
+			if diff:
+				problems.append('the store reads back wrong: ' + diff)
+		if 'missing' in block:
+			want = None if block['missing'] is None else trim(block['missing'])
+			if now.missing != want:
+				problems.append('a missing key reads %s, expected %s' % (show(now.missing) if now.missing is not None else 'not-found', show(want) if want is not None else 'not-found'))
+		if 'fidelity' in block:
+			was = before.observed
+			if block['fidelity'] == 'full' and now.rows != was.rows:
+				problems.append('the rows changed: ' + compare_lists(now.rows, was.rows, 'row'))
+			if block['fidelity'] == 'markers' and now.rows:
+				problems.append('rows are left: %s' % show(now.rows[0]))
+			if now.missing != was.missing:
+				problems.append('a missing key now reads %s, was %s' % (show(now.missing), show(was.missing)))
+			if now.probe != was.probe:
+				problems.append('rows appended now read differently, so the final marker state changed: %s' % compare_lists(now.probe, was.probe, 'probe row'))
+	for rel in block.get('exists', []):
+		if not os.path.lexists(os.path.join(case_dir, rel)):
+			problems.append('%s does not exist' % rel)
+	for rel in block.get('absent', []):
+		if os.path.lexists(os.path.join(case_dir, rel)):
+			problems.append('%s exists' % rel)
+	if block.get('bytes'):
+		now_parts = snapshot_store(store)
+		for rule in block['bytes']:
+			problems.extend(byte_rule(rule, store, before.parts, now_parts))
+	if 'serve_exit' in block and serve_exit != block['serve_exit']:
+		problems.append('serve exited with status %s, expected %d' % (serve_exit, block['serve_exit']))
+	return problems
