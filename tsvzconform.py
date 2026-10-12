@@ -444,11 +444,19 @@ def _gzip_unpad(region):
 	inflater = zlib.decompressobj(-15)  # the compressed data alone, to see where it ends
 	try:
 		inflater.decompress(stripped[start:])
-		if not inflater.eof:  # its last bytes may be zero bytes of its own (a handful at most: 4096 are probed)
-			fed = min(zeros, 4096)
-			inflater.decompress(b'\0' * fed)
-			if inflater.eof:
-				return stripped + b'\0' * (fed - len(inflater.unused_data))  # the trailer had not begun: padding
+		if not inflater.eof:  # its last bytes may be zero bytes of its own
+			# Fed only zeros, compressed data can end only inside a final stored block (65535 bytes, after a
+			# header of at most 5); anywhere else it fails or never ends. So 65544 zeros give the whole answer.
+			zeros = min(zeros, 65544)
+			fed = 0
+			while fed < zeros:  # in pieces, with bounded output
+				piece = b'\0' * min(1 << 16, zeros - fed)
+				inflater.decompress(piece, 1 << 16)
+				while inflater.unconsumed_tail and not inflater.eof:
+					inflater.decompress(inflater.unconsumed_tail, 1 << 16)
+				if inflater.eof:
+					return stripped + b'\0' * (fed + len(piece) - len(inflater.unused_data))  # then padding
+				fed += len(piece)
 			return stripped
 	except zlib.error:
 		return stripped  # the zero bytes are not compressed data: padding after a member cut short

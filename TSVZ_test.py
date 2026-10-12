@@ -1700,6 +1700,16 @@ def test_a_zero_byte_in_a_value_round_trips_as_a_token(tmp_path):
 	assert TSVZ.readTabularFile(p)['k'] == ['k', 'x\0y']
 
 
+def test_spec_gzip_unpad_keeps_every_zero_byte_the_compressed_data_needs():
+	# A final stored block can end in up to 65535 zero bytes of its own: they belong to the member (spec §16.6).
+	header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff'
+	stored = b'\x01' + (5000).to_bytes(2, 'little') + (0xffff - 5000).to_bytes(2, 'little') + b'\0' * 5000
+	region = header + stored + b'\0' * 100  # no trailer: cut short, then padding
+	assert len(TSVZ._gzipUnpad(region)) == len(header + stored)
+	import tsvzconform
+	assert tsvzconform._gzip_unpad(region) == TSVZ._gzipUnpad(region)
+
+
 def test_spec_decode_alone_tells_a_cut_member_from_a_corrupt_one():
 	member = gzip.compress(b''.join(b'k%05d\tv\n' % i for i in range(3000)))
 	cutShort, out, error = TSVZ._decodeAlone(member[:-8], 'gz')
