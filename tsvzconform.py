@@ -317,6 +317,7 @@ class Replay(object):
 				return
 			if item == BREAK:
 				pending = b''
+				first = False  # the part's bytes began before this point (§4.7)
 				continue
 			if isinstance(item, tuple):
 				if self.on_corruption == 'stop':
@@ -409,6 +410,54 @@ def _member(data, start, codec):
 	return 'short', out, None
 
 
+def _gzip_header_length(data):
+	"""The length of the gzip member header at the start of ``data`` (RFC 1952), or None when it is not all there."""
+	if len(data) < 10 or data[:3] != b'\x1f\x8b\x08':
+		return None
+	flags = data[3] if not isinstance(data[3], str) else ord(data[3])
+	pos = 10
+	if flags & 4:  # FEXTRA
+		if len(data) < pos + 2:
+			return None
+		pos += 2 + data[pos] + 256 * data[pos + 1]
+	for flag in (8, 16):  # FNAME, FCOMMENT: zero-terminated
+		if flags & flag:
+			end = data.find(b'\0', pos)
+			if end < 0:
+				return None
+			pos = end + 1
+	if flags & 2:  # FHCRC
+		pos += 2
+	return pos if pos <= len(data) else None
+
+
+def _gzip_unpad(region):
+	"""A damaged gzip member's bytes without the zero padding that ends them (§16.6 rule 2), keeping the zero
+	bytes that are its own: the end of its compressed data, or the rest of a trailer it has begun."""
+	stripped = region.rstrip(b'\0')
+	zeros = len(region) - len(stripped)
+	if not zeros:
+		return region
+	start = _gzip_header_length(region)
+	if start is None or start > len(stripped):
+		return stripped
+	inflater = zlib.decompressobj(-15)  # the compressed data alone, to see where it ends
+	try:
+		inflater.decompress(stripped[start:])
+		if not inflater.eof:  # its last bytes may be zero bytes of its own
+			for count in range(1, zeros + 1):
+				inflater.decompress(b'\0')
+				if inflater.eof:
+					return stripped + b'\0' * count  # the trailer had not begun: the rest is padding
+			return stripped
+	except zlib.error:
+		return stripped  # the zero bytes are not compressed data: padding after a member cut short
+	begun = len(inflater.unused_data)  # trailer bytes before the zeros
+	if 0 < begun < 8:
+		return stripped + b'\0' * min(8 - begun, zeros)
+	return stripped
+
+
 def _decode_alone(raw, codec):
 	"""A damaged member's bytes decoded on their own (§16.6 rule 2): ('short', output) when they merely end
 	before the member does, else ('corrupt', the output decoded before the failure), fed a byte at a time so
@@ -445,7 +494,7 @@ def decompress_items(data, codec):
 		following = data.find(MEMBER_MAGIC[codec], pos + 1)
 		region = data[pos:following if following >= 0 else len(data)]
 		if codec == 'gzip':
-			region = region.rstrip(b'\0')  # zero padding before the next member
+			region = _gzip_unpad(region)  # zero padding before the next member
 		kind, out = _decode_alone(region, codec)
 		items.append(out if kind == 'short' else (CORRUPT, out))
 		if following < 0:

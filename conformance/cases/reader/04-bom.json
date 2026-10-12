@@ -10,5 +10,13 @@
 {"id": "4.7-only-a-leading-bom-is-removed", "spec": ["4.7"], "level": "MUST",
  "note": "U+FEFF anywhere but the start of a part is ordinary data.",
  "files": {"s.tsvz": "a\tx\n﻿b\ty\n"},
- "expect": {"read": [["a", "x"], ["﻿b", "y"]], "keys": ["a", "﻿b"]}}
+ "expect": {"read": [["a", "x"], ["﻿b", "y"]], "keys": ["a", "﻿b"]}},
+{"id": "4.7-a-byte-order-mark-split-across-members-is-removed", "spec": ["4.7", "16.6"], "level": "MUST",
+ "note": "A byte order mark at the start of a part's bytes is removed even when its bytes span two members.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/3sPAGQQt+IBAAAAH4sIAAAAAAAC/9u9P5vTkAsA8XgmlgYAAAA="}},
+ "expect": {"read": [["k", "1"]], "len": 1}},
+{"id": "4.7-a-byte-order-mark-after-a-damaged-member-is-data", "spec": ["4.7", "16.6"], "level": "MUST",
+ "note": "Once a damaged member has been read, a byte order mark is no longer at the start of the part's bytes: it is data.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0tMAgAfiwgAAAAAAAL/e797fzanIRcA0tBgTwcAAAA="}},
+ "expect": {"read": [["﻿k", "1"]], "len": 1}}
 ]}

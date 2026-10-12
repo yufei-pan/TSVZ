@@ -74,5 +74,9 @@
 {"id": "4.10-a-member-is-judged-by-the-policy-in-force-before-it", "spec": ["4.10", "16.6"], "level": "MUST",
  "note": "A policy marker inside a corrupt member does not decide for that member: the policy in force at its first byte does.",
  "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0vkrOACABVuPKoEAAAAH4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i0vyC7iyOcu4AK/vp9gbAAABH4sIAAAAAAAC/0vmrOICABzEAzIEAAAA"}},
- "expect": {"read": [["a", "x"], ["k", "v"], ["c", "z"]], "len": 3}}
+ "expect": {"read": [["a", "x"], ["k", "v"], ["c", "z"]], "len": 3}},
+{"id": "16.6-a-length-check-failure-is-corrupt-not-cut", "spec": ["16.6", "4.10"], "level": "MUST",
+ "note": "A member that fails only its length check is corrupt: the zero bytes that end its trailer are the trailer's, not padding.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/1OOz8+LT84vKiotKMkEMpU5i0vyC7gSOSu4AEUimSkbAAAAH4sIAAAAAAAC/0virOQCALrwkqEFAAAAH4sIAAAAAAAC/0vmrOICABzEAzIEAAAA"}},
+ "expect": {"read": {"rows": [["a", "x"]], "exit": 1}}}
 ]}

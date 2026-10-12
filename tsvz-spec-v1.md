@@ -756,7 +756,10 @@ in order, as one stream, by these rules:
       that member is complete or not, or to the end of the part. A member begins
       with gzip `1F 8B 08`, bzip2 `42 5A 68` ("BZh"), xz `FD 37 7A 58 5A 00` or
       Zstandard `28 B5 2F FD`. For gzip, zero bytes that end those bytes are
-      padding and are left out. The reader decodes those bytes on their own:
+      padding and are left out, except those that complete a trailer the member
+      has begun: its compressed data has ended and some of its 8-byte trailer
+      (CRC-32 and length) precedes the zeros. The reader decodes those bytes on
+      their own:
       - when they merely end before the member does, the member is **cut short**,
         as a crash during a write leaves it: its output is used;
       - otherwise the member is **corrupt**: it fails to decode or fails its check.
