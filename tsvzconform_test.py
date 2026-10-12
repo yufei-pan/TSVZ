@@ -883,3 +883,31 @@ def test_digests_in_the_corpus_are_right():
 				assert expected == computed, case.id
 			checked += 1
 	assert checked >= 8
+
+
+# --- the reference ----------------------------------------------------------------------------
+
+def test_a_long_work_directory_path(tmp_path, capsys):
+	work = tmp_path / ('long' * 30)
+	code, results = run_main(work, REF_COMMAND, '--only', '21.2.4-refuse-wrong-first-line,21.13.1-clean-stop', '--feature', 'handler')
+	assert code == 0 and len(results) == 2 and all(r['result'] == 'pass' for r in results.values())
+
+
+def test_the_reference_matches_its_baseline(tmp_path, capsys):
+	"""Every case the reference does not pass is listed in conformance/reference-baseline.json, and nothing else (design section 8.3)."""
+	with open(BASELINE, encoding='utf-8') as f:
+		baseline = json.load(f)
+	features = list(baseline['features'])
+	if sys.version_info >= (3, 14):
+		features.append('zstd')
+	code, results = run_main(tmp_path, REF_COMMAND, '--feature', ','.join(features), '-j', str(os.cpu_count() or 4))
+	found = {key: r['result'] for key, r in results.items() if r['result'] not in ('pass', 'skip')}
+	expected = {}
+	for entry in baseline['not_passing']:
+		below = entry.get('python_below')
+		if below and sys.version_info >= tuple(below):
+			continue
+		for mode in entry['modes']:
+			expected[(entry['id'], mode)] = entry['result']
+	assert found == expected
+	assert code == (1 if expected else 0)

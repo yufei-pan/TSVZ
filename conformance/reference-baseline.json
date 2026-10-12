@@ -1,0 +1,21 @@
+{"impl": "python3 TSVZ.py",
+ "features": ["bzip2", "xz", "crc32", "sha256", "file-first", "handler"],
+ "note": "The reference also claims zstd on Python 3.14 and later. Every case it does not pass, and why; remove an entry when the reference is fixed.",
+ "not_passing": [
+  {"id": "12.4.5-marker-value-is-not-stripped", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "Marker values are stripped, so \"false \" turns stripping off; §10.4 says marker lines are not stripped, which makes the value invalid (§12.4.5)."},
+  {"id": "13.2-cr-token-decodes", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "<CR> is not decoded (decision 10)."},
+  {"id": "13.5-cr-token-at-the-end-of-a-row", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "<CR> is not decoded (decision 10)."},
+  {"id": "16.5-unsupported-zstd-part-fails", "modes": ["files", "socket", "forwarded"], "result": "FAIL", "python_below": [3, 14],
+   "reason": "Without compression.zstd a .zst part is read as plain bytes instead of failing (decision 2)."},
+  {"id": "13.3-set-encodes-carriage-returns", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "A carriage return is written raw, not as <CR> (decision 10)."},
+  {"id": "19.2-scrub-keeps-a-carriage-return", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "<CR> is not decoded, so a scrub keeps it as text (decision 10)."},
+  {"id": "20.2-parts-in-replay-order", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "parts prints the suffix gz instead of the codec name gzip (decision 14)."},
+  {"id": "20.2-parts-names-the-bzip2-codec", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "parts prints the suffix bz2 instead of the codec name bzip2 (decision 14)."}
+ ]}
