@@ -12,6 +12,8 @@
    "reason": "Without compression.zstd a .zst part is read as plain bytes instead of failing (decision 2)."},
   {"id": "13.3-set-encodes-carriage-returns", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
    "reason": "A carriage return is written raw, not as <CR> (decision 10)."},
+  {"id": "13.3-csvz-encodes-carriage-returns", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
+   "reason": "A carriage return is written raw, not as <CR>, in .csvz too (decision 10)."},
   {"id": "19.2-scrub-keeps-a-carriage-return", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
    "reason": "<CR> is not decoded, so a scrub keeps it as text (decision 10)."},
   {"id": "20.2-parts-in-replay-order", "modes": ["files", "socket", "forwarded"], "result": "FAIL",

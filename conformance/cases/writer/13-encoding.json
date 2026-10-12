@@ -60,5 +60,15 @@
 {"id": "4.1-new-store-has-no-bom", "spec": ["4.1"], "level": "MUST",
  "note": "A store created by a write does not start with a byte-order mark.",
  "steps": [{"op": ["set", "k", "v"]}],
- "after": {"rows": [["k", "v"]], "bytes": ["encoded"]}}
+ "after": {"rows": [["k", "v"]], "bytes": ["encoded"]}},
+{"id": "13.3-csvz-round-trips-a-newline-and-nul", "spec": ["13.3", "2.1"], "level": "MUST",
+ "note": "In .csvz a newline is written <LF> and a NUL needs no token; both read back.",
+ "store": "s.csvz",
+ "steps": [{"op": ["set", "-"], "stdin": "k,l<LF>f,n\u0000l\n", "body": ["k\tl<LF>f\tn\u0000l"]}],
+ "after": {"rows": [["k", "l\nf", "n\u0000l"]], "bytes": ["encoded"]}},
+{"id": "13.3-nsvz-round-trips-a-newline-and-tab", "spec": ["13.3", "2.1"], "level": "MUST",
+ "note": "In .nsvz a newline is written <LF> and a tab needs no token; both read back.",
+ "store": "s.nsvz",
+ "steps": [{"op": ["set", "-"], "stdin": "k\u0000l<LF>f\u0000t\tb\n", "body": ["k\tl<LF>f\tt<sep>b"]}],
+ "after": {"rows": [["k", "l\nf", "t\tb"]], "bytes": ["encoded"]}}
 ]}

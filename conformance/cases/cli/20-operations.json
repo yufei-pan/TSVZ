@@ -139,5 +139,13 @@
  "store": "s.tsv", "files": {"s.tsv": "a\tx\n"},
  "steps": [{"op": ["set", "k", "v"]}, {"op": ["append", "j", "w"]}, {"op": ["read"]}, {"op": ["len"], "stdout": "nonempty"},
   {"op": ["keys"]}, {"op": ["verify"], "stdout": "empty"}, {"op": ["parts"], "stdout": "nonempty"}, {"op": ["delete", "k"]},
-  {"op": ["scrub"]}, {"op": ["clear"]}]}
+  {"op": ["scrub"]}, {"op": ["clear"]}]},
+{"id": "20.4.1-parts-lines-are-tab-joined-for-csvz", "spec": ["20.4.1", "20.2"], "level": "MUST",
+ "note": "parts joins its fields with TAB whatever the store's delimiter.",
+ "store": "s.csvz", "files": {"s.csvz": "a,x\n"},
+ "steps": [{"op": ["parts"], "stdout": {"lines": [["0", "", "{store}", "active"]]}}]},
+{"id": "20.4.1-verify-lines-are-tab-joined-for-csvz", "spec": ["20.4.1", "20.2"], "level": "MUST", "requires": ["crc32"],
+ "note": "verify joins its fields with TAB whatever the store's delimiter; the marker's value is split off with the store's comma.",
+ "store": "s.csvz", "files": {"s.csvz": "#_checksum_crc32_#\na,x\n#_checksum_crc32_#,00000000\n"},
+ "steps": [{"op": ["verify"], "exit": 4, "stdout": {"lines": [["{store}", "3", "crc32", "00000000", "94baea1e"]]}}]}
 ]}

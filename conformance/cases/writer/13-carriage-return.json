@@ -8,5 +8,10 @@
  "note": "A scrub writes a carriage return as <CR>, so one ending the last value survives.",
  "files": {"s.tsvz": "a\tc<CR>\nb\tx<CR>y\n"},
  "steps": [{"op": ["scrub"]}],
- "after": {"rows": [["a", "c\r"], ["b", "x\ry"]], "fidelity": "full", "bytes": ["snapshot-layout", "same-file", "encoded"]}}
+ "after": {"rows": [["a", "c\r"], ["b", "x\ry"]], "fidelity": "full", "bytes": ["snapshot-layout", "same-file", "encoded"]}},
+{"id": "13.3-csvz-encodes-carriage-returns", "spec": ["13.3", "13.5", "2.1"], "level": "MUST",
+ "note": "In .csvz too every carriage return is written <CR>, so one ending the last value survives.",
+ "store": "s.csvz",
+ "steps": [{"op": ["set", "k", "c\rr", "x\r"]}],
+ "after": {"rows": [["k", "c\rr", "x\r"]], "bytes": ["encoded"]}}
 ]}
