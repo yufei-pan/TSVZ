@@ -115,7 +115,7 @@ def test_invalid_utf8_becomes_replacement_characters():
 
 
 @pytest.mark.parametrize('codec, pack', [
-	('gzip', lambda d: gzip.compress(d, mtime=0)),
+	('gzip', lambda d: tc._gzip_member(d)),
 	('bzip2', bz2.compress),
 	('xz', lzma.compress),
 ])

@@ -739,6 +739,9 @@ in order, as one stream, by these rules:
       any bytes after the last `\n`. If it fails to decode or fails its check, none
       of its output is used.
 
+Zero bytes before a gzip member are padding, as gzip tools treat them: the reader
+skips them, and they are neither a member nor damage.
+
 A damaged member is not an error, though a reader MAY warn about it. A tool that
 rewrites a part with damaged members (a snapshot, §19) SHOULD keep the original
 bytes first, since the damaged members' data is not in what it writes.

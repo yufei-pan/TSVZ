@@ -16,6 +16,7 @@ import bz2
 import collections
 import concurrent.futures
 import fnmatch
+import io
 import json
 import lzma
 import os
@@ -375,6 +376,9 @@ def decompress(data, codec):
 	out = []
 	pos = 0
 	while pos < len(data):
+		if codec == 'gzip' and data[pos] == 0:  # zero padding before a gzip member is skipped
+			pos = len(data) - len(data[pos:].lstrip(b'\0'))
+			continue
 		status, chunk, end = _member(data, pos, codec)
 		if status == 'complete':
 			out.append(chunk)
@@ -1623,6 +1627,15 @@ def check_terminal_default(cx):
 	return []
 
 
+def _gzip_member(data):
+	"""One gzip member holding ``data``, with a fixed timestamp (gzip.compress has no mtime before Python 3.8)."""
+	import gzip
+	buffer = io.BytesIO()
+	with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0) as member:
+		member.write(data)
+	return buffer.getvalue()
+
+
 def _members_after(data, start, codec):
 	"""(offset, output) of each complete member from ``start`` on, as a reader finds them (§16.6)."""
 	found = []
@@ -1640,8 +1653,7 @@ def _members_after(data, start, codec):
 	'More than 1 MiB of records set into a compressed part is written as members of at most 1 MiB of '
 	'uncompressed data each, ending at record boundaries.')
 def check_member_size(cx):
-	import gzip
-	first = gzip.compress(b'a\tx\n', mtime=0)
+	first = _gzip_member(b'a\tx\n')
 	store = cx.write('s.tsvz.gz', first)
 	records = b''.join(b'k%06d\t%s\n' % (i, b'v' * 40) for i in range(60000))  # about 3 MiB
 	run = cx.run(cx.impl.argv + ['set', store, '-'], stdin=records)
@@ -1947,8 +1959,7 @@ def check_line_limit(cx):
 	'A handler serving a store whose last member is cut short puts that member\'s whole lines at the start of '
 	'its first append, so they are still read once the cut member is no longer last.', requires=['handler'])
 def check_handler_recut(cx):
-	import gzip
-	store = cx.write('s.tsvz.gz', gzip.compress(b'a\tx\n', mtime=0) + gzip.compress(b'b\ty\nbr', mtime=0)[:-6])
+	store = cx.write('s.tsvz.gz', _gzip_member(b'a\tx\n') + _gzip_member(b'b\ty\nbr')[:-6])
 	handler = cx.handler(store)
 	problems = []
 	try:

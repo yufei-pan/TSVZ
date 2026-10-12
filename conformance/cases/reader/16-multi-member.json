@@ -50,5 +50,9 @@
 {"id": "16.6-unfinished-line-before-a-damaged-member-is-dropped", "spec": ["16.6", "4.3"], "level": "MUST",
  "note": "When a damaged member is skipped, the line the member before it left unfinished is dropped, not joined to the next member.",
  "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0vkrOBK4qwEABLv9YIHAAAAH4sIAAAAAAAC/wvkLOQCAPwt1YsEAAAAH4sIAAAAAAAC/0vmrOICABzEAzIEAAAA"}},
- "expect": {"read": [["a", "x"], ["c", "z"]], "len": 2}}
+ "expect": {"read": [["a", "x"], ["c", "z"]], "len": 2}},
+{"id": "16.6-zero-bytes-between-gzip-members-are-skipped", "spec": ["16.6"], "level": "MUST",
+ "note": "Zero bytes before a gzip member are padding, not damage: the members read as one stream, so a line may run across them.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAC/0vkrOBKAgB8N8kcBQAAAAAAAAAfiwgAAAAAAAL/46zkAgA8ybjuAwAAAA=="}},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}}
 ]}
