@@ -1959,8 +1959,13 @@ def select(cases, opts):
 
 
 def run_all(runs, ctx, jobs, fail_fast=False, progress=None):
-	"""Run every (case, mode), `jobs` at a time; results come back in the order of `runs`."""
+	"""Run every (case, mode), `jobs` at a time; return (results in the order of `runs`, interrupted).
+
+	After Ctrl-C the results are those finished before it: cases still running
+	then are killed, so their outcome says nothing about the implementation.
+	"""
 	results = [None] * len(runs)
+	finished = None
 	stop_early = threading.Event()
 
 	def one(index):
@@ -1985,12 +1990,14 @@ def run_all(runs, ctx, jobs, fail_fast=False, progress=None):
 					except concurrent.futures.TimeoutError:
 						continue
 		except KeyboardInterrupt:
+			finished = [r for r in results if r is not None]
 			STOP.set()
 			kill_live_groups()
 			for future in futures:
 				future.cancel()
-			raise
-	return [r for r in results if r is not None]
+	if finished is not None:
+		return finished, True
+	return [r for r in results if r is not None], False
 
 
 def rerun_command(impl, result, features):
@@ -2125,11 +2132,7 @@ def main(argv=None):
 				sys.stderr.write('\r  %d/%d' % (done[0], len(runs)))
 				sys.stderr.flush()
 
-		try:
-			results = run_all(runs, ctx, opts.jobs, opts.fail_fast, progress)
-		except KeyboardInterrupt:
-			interrupted = True
-			results = []
+		results, interrupted = run_all(runs, ctx, opts.jobs, opts.fail_fast, progress)
 		if tty:
 			sys.stderr.write('\r' + ' ' * 20 + '\r')
 		results = results + skipped

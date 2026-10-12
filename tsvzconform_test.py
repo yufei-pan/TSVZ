@@ -799,7 +799,7 @@ def test_main_usage_list_and_probe(small_corpus, tmp_path, capsys):
 def test_an_interrupt_prints_the_results_so_far(tmp_path):
 	env = dict(os.environ, FAKE_PIDFILE=str(tmp_path / 'pid'))
 	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'tsvzconform.py'), '--impl', fake(tmp_path, 'hang'),
-		'--only', '20.4.3', '--timeout', '60', '--work-dir', str(tmp_path / 'work')],
+		'--only', '20.2-len,20.4.3-terminal-output-is-a-table', '-j', '1', '--timeout', '60', '--work-dir', str(tmp_path / 'work')],
 		cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 	deadline = time.time() + 20
 	while not (tmp_path / 'pid').exists() and time.time() < deadline:
@@ -808,6 +808,7 @@ def test_an_interrupt_prints_the_results_so_far(tmp_path):
 	out, _ = proc.communicate(timeout=30)
 	assert proc.returncode == 130
 	assert b'tsvzconform ' + tc.version.encode() in out
+	assert re.search(rb'^cli +1 +0 +0 +0 +0$', out, re.M), out
 	with pytest.raises(ProcessLookupError):
 		os.kill(int((tmp_path / 'pid').read_text()), 0)
 
