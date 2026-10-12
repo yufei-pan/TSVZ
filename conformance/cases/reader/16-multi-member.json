@@ -1,0 +1,22 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "16.6-gzip-members-read-as-one-stream", "spec": ["16.6", "16.4"], "level": "MUST",
+ "note": "A gzip part holding two members reads as their concatenation.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAA/0vkrOACABVuPKoEAAAAH4sIAAAAAAAA/0virOQCALrwkqEEAAAA"}},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}},
+{"id": "16.6-bzip2-members-read-as-one-stream", "spec": ["16.6", "16.4"], "level": "MUST", "requires": ["bzip2"],
+ "note": "A bzip2 part holding two members reads as their concatenation.",
+ "store": "s.tsvz.bz2", "files": {"s.tsvz.bz2": {"b64": "QlpoOTFBWSZTWQQH8tUAAAFBgAAwIAAAQCAAIZpoM00yvF3JFOFCQBAfy1RCWmg5MUFZJlNZtmmBZwAAAUGAADAQAAAgIAAhmmgzTTK8XckU4UJC2aYFnA=="}},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}},
+{"id": "16.6-xz-members-read-as-one-stream", "spec": ["16.6", "16.4"], "level": "MUST", "requires": ["xz"],
+ "note": "A xz part holding two members reads as their concatenation.",
+ "store": "s.tsvz.xz", "files": {"s.tsvz.xz": {"b64": "/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQADYQl4CgAqJo2HZDZldAABHARvLJzBH7bzfQEAAAAABFla/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQADYgl5CgBDNSi9FNG/BgABHARvLJzBH7bzfQEAAAAABFla"}},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}},
+{"id": "16.6-zstd-members-read-as-one-stream", "spec": ["16.6", "16.4"], "level": "MUST", "requires": ["zstd"],
+ "note": "A zstd part holding two members reads as their concatenation.",
+ "store": "s.tsvz.zst", "files": {"s.tsvz.zst": {"b64": "KLUv/SAEIQAAYQl4Cii1L/0gBCEAAGIJeQo="}},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}},
+{"id": "16.6-member-cut-short-is-a-torn-tail", "spec": ["16.6", "4.5"], "level": "MUST",
+ "note": "A final member cut short after its header adds nothing, and the store still reads without error.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAA/0vkrOACABVuPKoEAAAAH4sIAAAAAAAA/w=="}},
+ "expect": {"read": [["a", "x"]], "len": 1}}
+]}

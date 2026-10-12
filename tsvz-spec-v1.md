@@ -680,14 +680,23 @@ contrast, a writer that is **not** continuously running **SHOULD NOT** open and
 close a compressed active part for each individual write: per-open/close overhead is
 high, and compression ratio suffers when each write becomes its own small compressed
 unit. Such a writer SHOULD keep the active part uncompressed and leave compression of
-prior immutable parts to a later pass (§17.7). Where a compressed part is not held
-open as a stream, appending requires rewriting it as a whole.
+prior immutable parts to a later pass (§17.7). A writer that does not hold a
+compressed part open appends to it by writing a new compressed member holding the
+new records after the part's existing bytes: a gzip member, a bzip2 stream, an xz
+stream or a Zstandard frame. It does not rewrite the part (§3.1).
 
 16.5 **Supported codecs.** A conformant reader **MUST** support gzip; support for
 the other codecs of §16.2 is optional. A reader that meets a part whose codec it
 does not support **MUST** fail to read the store rather than skip the part or read
 its bytes as uncompressed text. A command-line tool reports this as a failure
 (§20.6, status 1); a handler answers as §21.8.5 says.
+
+16.6 **Multi-member parts.** Each codec of §16.2 lets a file hold several
+compressed members one after another. A reader **MUST** read all the members of a
+part, in order, as one stream. When a part's compressed data ends early, as a
+final member cut short by a crash does, the reader keeps what it decoded before
+that point; §4.3 then discards any bytes after the last `\n`. This is not an
+error, though a reader MAY warn about it.
 
 ---
 
@@ -738,8 +747,13 @@ scheme throughout.
 
 17.7 **Writer recommendations.**
 
-   - On startup, a writer **SHOULD** open a fresh part named with a new ordinal and
-     leave existing parts untouched (treating them as immutable).
+   - On startup, a long-running writer, such as a handler (§21), **SHOULD** open a
+     fresh part named with a new ordinal and leave existing parts untouched
+     (treating them as immutable).
+   - A command-line tool (§20) writes once per invocation, so it appends to the
+     store's last part in replay order (§17.3), which is the unnumbered file when
+     that is the only part. That part is the store's **active part** for `parts`
+     and `clear` (§20.2).
    - A writer that is not continuously running **SHOULD** keep the active part
      uncompressed; a long-running writer **MAY** stream-append to a compressed
      active part (§16.4).

@@ -1,0 +1,22 @@
+{"format": 1, "class": "writer", "cases": [
+{"id": "16.4-append-to-a-gzip-store-adds-a-member", "spec": ["16.4", "3.1", "16.6"], "level": "MUST",
+ "note": "A write to a compressed part appends a new compressed member; the earlier bytes stay as they were.",
+ "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAA/0vkrOACABVuPKoEAAAA"}},
+ "steps": [{"op": ["set", "b", "y"]}, {"op": ["read"], "stdout": {"rows": [["a", "x"], ["b", "y"]]}}],
+ "after": {"rows": [["a", "x"], ["b", "y"]], "bytes": ["appended", "encoded"]}},
+{"id": "17.7-set-appends-to-the-last-part", "spec": ["17.7", "3.1"], "level": "MUST",
+ "note": "A command appends to the last part in replay order and changes no other part.",
+ "files": {"s.tsvz": "a\t1\n", "s.tsvz.f": "b\t2\n", "s.tsvz.10": "c\t3\n"},
+ "steps": [{"op": ["set", "d", "4"]}, {"op": ["delete", "a"]}],
+ "after": {"rows": [["b", "2"], ["c", "3"], ["d", "4"]], "bytes": ["last-part-only", "encoded"]}},
+{"id": "17.7-set-appends-to-a-compressed-last-part", "spec": ["17.7", "16.4"], "level": "MUST",
+ "note": "When the last part is compressed, the record goes into it as a new member.",
+ "files": {"s.tsvz": "a\t1\n", "s.tsvz.1.gz": {"b64": "H4sIAAAAAAAA/0viNOICAHRmH7IEAAAA"}},
+ "steps": [{"op": ["set", "c", "3"]}],
+ "after": {"rows": [["a", "1"], ["b", "2"], ["c", "3"]], "bytes": ["last-part-only", "encoded"]}},
+{"id": "18.8-clear-multipart-appends-tombstones", "spec": ["18.8", "20.2", "17.7"], "level": "MUST",
+ "note": "Clearing a multi-part store appends tombstones to its active part, the last one, and changes no earlier byte.",
+ "files": {"s.tsvz": "#_defaults_#\td\na\t1\n", "s.tsvz.1": "b\t2\nc\t3\n"},
+ "steps": [{"op": ["clear"]}],
+ "after": {"rows": [], "fidelity": "markers", "bytes": ["last-part-only", "encoded"]}}
+]}
