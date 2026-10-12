@@ -636,6 +636,48 @@ WRITES = {'id': '13.3-set-and-check', 'spec': ['13.3'], 'level': 'MUST', 'note':
 	'after': {'rows': [['a', 'x'], ['k', 'v<w', 'l\nf'], ['z', '1']], 'bytes': ['appended', 'encoded']}}
 
 
+FAKE_SLOW_SERVE = r'''
+import os, socket, sys, tempfile, threading, time
+args = sys.argv[1:]
+if '-V' in args:
+	print('slow 1.0')
+	sys.exit(0)
+store = args[-1]
+path = os.path.join(tempfile.mkdtemp(prefix='tc-', dir='/tmp'), 's')
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(8)
+with open(store + '.serve', 'w') as f:
+	f.write('tsvz-handler\t1\naddress\tunix:%s\nhost\t%s\npid\t%d\n' % (path, socket.gethostname(), os.getpid()))
+
+def handle(conn):
+	for line in conn.makefile('rb'):
+		if line.startswith(b'stop'):
+			conn.sendall(b'#0\n')
+			os.remove(store + '.serve')
+			os._exit(0)
+		if line.startswith(b'get'):
+			time.sleep(30)
+		conn.sendall(b'0\n#0\n')
+
+while True:
+	conn, _ = server.accept()
+	threading.Thread(target=handle, args=(conn,), daemon=True).start()
+'''
+
+
+def test_socket_steps_obey_the_timeout(tmp_path):
+	script = tmp_path / 'slow.py'
+	script.write_text(FAKE_SLOW_SERVE)
+	case = tc.validate_case({'id': '21.6.1-x', 'spec': ['21.6.1'], 'level': 'MUST', 'note': 'n', 'files': {'s.tsvz': 'k\tv\n'},
+		'steps': [{'request': ['get', 'k'], 'stdout': {'rows': [['k', 'v']]}}]}, 'handler', 'x')
+	ctx = tc.Context(tc.Impl('%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)))), str(tmp_path), 1.0, frozenset(['handler']))
+	started = time.time()
+	result = tc.run_case(case, 'socket', ctx)
+	assert result.result == tc.FAIL and 'no response' in ' '.join(result.detail)
+	assert time.time() - started < 8
+
+
 def test_expand_expect_and_step_op():
 	steps = tc.expand_expect(DELETES['expect'])
 	assert steps == [{'op': ['read'], 'exit': 0, 'stdout': {'rows': [['b', 'y']]}}, {'op': ['len'], 'stdout': {'text': '1\n'}},

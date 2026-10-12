@@ -1189,8 +1189,8 @@ class Handler(object):
 			return ''
 		return ''.join('\n    ' + line for line in lines)
 
-	def client(self):
-		return Client(self.path, self.wait)
+	def client(self, timeout=None):
+		return Client(self.path, timeout or self.wait)
 
 	def stop(self):
 		"""Send stop (§21.7.1) and reap the handler; return problems (empty when it answered #0 and exited)."""
@@ -1430,7 +1430,7 @@ class CaseRun(object):
 	def socket_step(self, step, action):
 		if self.client is None:
 			try:
-				self.client = self.handler.client()
+				self.client = self.handler.client(self.ctx.timeout)
 			except OSError as e:
 				self.fail(['cannot connect to the handler: %s' % e])
 		try:
