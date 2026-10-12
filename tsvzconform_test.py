@@ -338,3 +338,151 @@ def test_check_after_fidelity_and_paths(tmp_path):
 	found = tc.check_after({'fidelity': 'full', 'exists': ['s.tsvz'], 'absent': ['s.tsvz.serve']}, str(store), str(tmp_path), before)
 	assert len(found) == 2 and 'rows changed' in found[0] and 'final marker state' in found[1]
 	assert tc.check_after({'serve_exit': 0}, str(store), str(tmp_path), before, serve_exit=1) == ['serve exited with status 1, expected 0']
+
+
+# --- processes and the handler protocol ------------------------------------------------
+
+def test_run_command_exit_output_and_timeout(tmp_path):
+	ran = tc.run_command([sys.executable, '-c', 'import sys; print(sys.stdin.read().upper()); sys.exit(3)'], str(tmp_path), 10, b'hi', str(tmp_path))
+	assert ran.exit == 3 and ran.stdout == b'HI\n' and not ran.timed_out
+	started = time.time()
+	ran = tc.run_command([sys.executable, '-c', 'import time; time.sleep(30)'], str(tmp_path), 0.5, b'', str(tmp_path), 'slow')
+	assert ran.timed_out and time.time() - started < 10
+	assert 'cannot run' in tc.run_command(['/nonexistent/tool'], str(tmp_path), 5, b'', str(tmp_path), 'none').error
+
+
+def test_processes_left_in_the_group_are_killed(tmp_path):
+	pidfile = tmp_path / 'pid'
+	code = ('import subprocess, sys; p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); '
+		'open(%r, "w").write(str(p.pid))' % str(pidfile))
+	ran = tc.run_command([sys.executable, '-c', code], str(tmp_path), 10, b'', str(tmp_path))
+	assert ran.exit == 0
+	pid = int(pidfile.read_text())
+	time.sleep(0.2)
+	with pytest.raises(ProcessLookupError):
+		os.kill(pid, 0)
+
+
+def _short_socket_dir():
+	return tempfile.mkdtemp(prefix='tc-', dir='/tmp')
+
+
+def test_read_pointer(tmp_path):
+	store = str(tmp_path / 's.tsvz')
+	with open(store + '.serve', 'w') as f:
+		f.write('tsvz-handler\t1\naddress\tunix:/run/x<sep>y\npid\t12\nx-extra\tz\n')
+	assert tc.read_pointer(store) == {'address': 'unix:/run/x\ty', 'pid': '12', 'x-extra': 'z'}
+	with open(store + '.serve', 'w') as f:
+		f.write('tsvz-handler\t2\naddress\tunix:/x\n')
+	assert tc.read_pointer(store) is None
+	assert tc.read_pointer(str(tmp_path / 'none.tsvz')) is None
+
+
+def test_encode_arg():
+	assert tc.encode_arg('#_defaults_#') == '#_defaults_#'
+	assert tc.encode_arg('#k') == '<#>k'
+	assert tc.encode_arg('a\tb') == 'a<sep>b'
+
+
+def test_client_reads_diagnostics_status_and_bulk_requests():
+	path = os.path.join(_short_socket_dir(), 's')
+	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	server.bind(path)
+	server.listen(1)
+	got = []
+
+	def serve():
+		conn, _ = server.accept()
+		f = conn.makefile('rb')
+		got.append(f.readline())
+		conn.sendall(b'#!\tnote<sep>1\nk\tv\n#3\tgone<LF>away\n')
+		while True:
+			line = f.readline()
+			got.append(line)
+			if line == b'#\n':
+				break
+		conn.sendall(b'#0\n')
+		conn.close()
+
+	thread = threading.Thread(target=serve)
+	thread.daemon = True
+	thread.start()
+	client = tc.Client(path, 5)
+	try:
+		first = client.request(['get', 'k'])
+		assert first.status == 3 and first.message == 'gone\naway' and first.output == b'k\tv\n'
+		assert first.diagnostics == [b'#!\tnote<sep>1\n']
+		assert client.request(['set', '-'], ['--sync'], ['a\tx', 'b\ty']).status == 0
+	finally:
+		client.close()
+		thread.join(5)
+		server.close()
+	assert got == [b'get\tk\n', b'--sync\tset\t-\n', b'a\tx\n', b'b\ty\n', b'#\n']
+
+
+def test_handler_lifecycle_with_the_reference(tmp_path):
+	store = tmp_path / 's.tsvz'
+	store.write_text('a\tx\n')
+	handler = tc.Handler(tc.Impl(REF_COMMAND), str(store), str(tmp_path)).start()
+	client = handler.client()
+	try:
+		assert client.request(['get', 'a']).output == b'a\tx\n'
+	finally:
+		client.close()
+	assert handler.stop() == [] and handler.exit == 0
+	assert not os.path.exists(str(store) + '.serve')
+
+
+def test_a_handler_that_never_starts(tmp_path):
+	store = tmp_path / 's.tsvz'
+	store.write_text('')
+	impl = tc.Impl('%s -c "import sys; sys.stderr.write(\'no handler here\\n\'); sys.exit(1)"' % shlex.quote(sys.executable))
+	with pytest.raises(tc.HandlerError, match='no handler here'):
+		tc.Handler(impl, str(store), str(tmp_path)).start()
+	impl = tc.Impl('%s -c "import time; time.sleep(30)"' % shlex.quote(sys.executable))
+	with pytest.raises(tc.HandlerError, match='within'):
+		tc.Handler(impl, str(store), str(tmp_path), wait=1).start()
+	assert not tc.LIVE_HANDLERS
+
+
+FAKE_SERVE = r'''
+import os, socket, sys, tempfile
+args = sys.argv[1:]
+if '-V' in args:
+	print('stubborn 1.0')
+	sys.exit(0)
+if 'serve' not in args:
+	sys.exit(1)
+store = args[-1]
+path = os.path.join(tempfile.mkdtemp(prefix='tc-', dir='/tmp'), 's')
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(4)
+with open(store + '.serve', 'w') as f:
+	f.write('tsvz-handler\t1\naddress\tunix:%s\nhost\t%s\npid\t%d\n' % (path, socket.gethostname(), os.getpid()))
+while True:
+	conn, _ = server.accept()
+	f = conn.makefile('rb')
+	try:
+		while f.readline():
+			conn.sendall(b'0\n#0\n')
+	except OSError:
+		pass
+	conn.close()
+'''
+
+
+def test_a_handler_that_ignores_stop_is_killed(tmp_path):
+	script = tmp_path / 'stubborn.py'
+	script.write_text(FAKE_SERVE)
+	store = tmp_path / 's.tsvz'
+	store.write_text('')
+	impl = tc.Impl('%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	handler = tc.Handler(impl, str(store), str(tmp_path), wait=1).start()
+	pid = handler.proc.pid
+	started = time.time()
+	problems = handler.stop()
+	assert problems == ['the handler did not exit within 1 s of stop'] and time.time() - started < 15
+	with pytest.raises(ProcessLookupError):
+		os.kill(pid, 0)
+	assert not tc.LIVE_HANDLERS and pid not in tc.LIVE_GROUPS

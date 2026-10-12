@@ -917,3 +917,287 @@ def check_after(block, store, case_dir, before, serve_exit=None):
 	if 'serve_exit' in block and serve_exit != block['serve_exit']:
 		problems.append('serve exited with status %s, expected %d' % (serve_exit, block['serve_exit']))
 	return problems
+
+
+# ---------------------------------------------------------------------------
+# Processes
+# ---------------------------------------------------------------------------
+
+LIVE_GROUPS = set()
+
+
+def kill_group(pid, sig=signal.SIGKILL):
+	try:
+		os.killpg(pid, sig)
+	except (ProcessLookupError, PermissionError):
+		pass
+
+
+def exit_code(status):
+	if os.WIFEXITED(status):
+		return os.WEXITSTATUS(status)
+	if os.WIFSIGNALED(status):
+		return -os.WTERMSIG(status)
+	return -1
+
+
+def reap(proc, timeout, first_signal=signal.SIGKILL):
+	"""Wait for `proc`, signalling its group after `timeout` (SIGTERM first means SIGKILL 5 s later); then kill what is left of the group.
+
+	Where os.waitid exists the group is killed while the leader is a zombie, so
+	its id cannot have been reused. Returns (exit status, timed out).
+	"""
+	pid = proc.pid
+	fired = threading.Event()
+
+	def expire(sig):
+		fired.set()
+		kill_group(pid, sig)
+
+	timers = [threading.Timer(timeout, expire, (first_signal,))]
+	if first_signal != signal.SIGKILL:
+		timers.append(threading.Timer(timeout + 5.0, expire, (signal.SIGKILL,)))
+	for timer in timers:
+		timer.daemon = True
+		timer.start()
+	try:
+		if hasattr(os, 'waitid'):
+			os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+			kill_group(pid)
+			status = os.waitpid(pid, 0)[1]
+		else:
+			status = os.waitpid(pid, 0)[1]
+			kill_group(pid)
+	finally:
+		for timer in timers:
+			timer.cancel()
+	proc.returncode = exit_code(status)
+	LIVE_GROUPS.discard(pid)
+	return proc.returncode, fired.is_set()
+
+
+Ran = collections.namedtuple('Ran', 'exit timed_out stdout stderr error')
+
+
+def run_command(argv, cwd, timeout, stdin=b'', out_dir=None, name='step'):
+	"""Run one command in a session of its own, stdin from a file, stdout and stderr to files."""
+	out_dir = out_dir or tempfile.mkdtemp(prefix='tsvzconform-run-')
+	paths = [os.path.join(out_dir, name + suffix) for suffix in ('.in', '.out', '.err')]
+	with open(paths[0], 'wb') as f:
+		f.write(stdin)
+	with open(paths[0], 'rb') as fin, open(paths[1], 'wb') as fout, open(paths[2], 'wb') as ferr:
+		try:
+			proc = subprocess.Popen(argv, cwd=cwd, stdin=fin, stdout=fout, stderr=ferr, start_new_session=True)
+		except OSError as e:
+			return Ran(None, False, b'', b'', 'cannot run %s: %s' % (quote(argv), e))
+	LIVE_GROUPS.add(proc.pid)
+	code, timed_out = reap(proc, timeout)
+	with open(paths[1], 'rb') as f:
+		stdout = f.read()
+	with open(paths[2], 'rb') as f:
+		stderr = f.read()
+	return Ran(code, timed_out, stdout, stderr, None)
+
+
+class Impl(object):
+	"""The implementation under test. Its commands run from `cwd`, the directory the runner was started in."""
+
+	def __init__(self, command, cwd=None):
+		self.command = command
+		self.argv = shlex.split(command)
+		self.cwd = cwd or os.getcwd()
+		self.version = ''
+
+	def cli(self, op, store, args=()):
+		"""The canonical §20.1 command line for one operation."""
+		return self.argv + ['--format', 'records', '-q', op, store] + list(args)
+
+
+def kill_live_groups():
+	for pid in list(LIVE_GROUPS):
+		kill_group(pid)
+	for handler in list(LIVE_HANDLERS):
+		handler.kill()
+
+
+def quote(argv):
+	return ' '.join(shlex.quote(a) for a in argv)
+
+
+# ---------------------------------------------------------------------------
+# The handler protocol (§21)
+# ---------------------------------------------------------------------------
+
+class HandlerError(Exception):
+	pass
+
+
+def read_pointer(store):
+	"""The values of a store's pointer file (§21.2) as a dict, or None when it is absent or not a valid pointer."""
+	try:
+		with open(store + '.serve', 'rb') as f:
+			lines = f.read().decode('utf-8').split('\n')
+	except (OSError, UnicodeDecodeError):
+		return None
+	if lines[0] != 'tsvz-handler\t1':
+		return None
+	values = {}
+	for line in lines[1:]:
+		name, sep, value = line.partition('\t')
+		if sep:
+			values[name] = decode_field(value, '\t')
+	if not values.get('address', '').startswith('unix:'):
+		return None
+	return values
+
+
+def encode_arg(arg):
+	"""A request field for one argument: marker keys raw, anything else §13-encoded with <#> (§21.4.3)."""
+	return arg if is_marker_key(arg) else encode_field(arg, '\t', is_key=True)
+
+
+Response = collections.namedtuple('Response', 'status message output diagnostics')
+
+
+class Client(object):
+	"""One connection to a handler: a request, then its whole response (§21.3.2)."""
+
+	def __init__(self, path, timeout):
+		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			self.sock.settimeout(timeout)
+			self.sock.connect(path)
+		except BaseException:
+			self.sock.close()
+			raise
+		self.rfile = self.sock.makefile('rb')
+
+	def send(self, payload):
+		self.sock.sendall(payload)
+
+	def response(self):
+		"""Read one response (§21.6); raise ConnectionError if the handler closes first."""
+		output = []
+		diagnostics = []
+		while True:
+			line = self.rfile.readline()
+			if not line:
+				raise ConnectionError('the handler closed the connection')
+			if line.startswith(b'#!'):
+				diagnostics.append(line)
+			elif line.startswith(b'#'):
+				text = line.rstrip(b'\n').decode('utf-8', 'replace')
+				code, _, message = text[1:].partition('\t')
+				if not code.isdigit():
+					raise ConnectionError('a status line that is not #N: %s' % show(text))
+				return Response(int(code), decode_field(message, '\t'), b''.join(output), diagnostics)
+			else:
+				output.append(line)
+
+	def request(self, fields, options=(), body=None):
+		"""Send one request (fields already in the protocol encoding) and read its response."""
+		payload = '\t'.join(list(options) + list(fields)) + '\n'
+		if body is not None:
+			payload += ''.join(line + '\n' for line in body) + '#\n'
+		self.send(payload.encode('utf-8'))
+		return self.response()
+
+	def close(self):
+		try:
+			self.rfile.close()
+		finally:
+			self.sock.close()
+
+
+LIVE_HANDLERS = set()
+
+
+class Handler(object):
+	"""The implementation's own `serve STORE` (§21.13), started and stopped by the runner (design section 2.7)."""
+
+	def __init__(self, impl, store, out_dir, wait=HANDLER_WAIT):
+		self.impl = impl
+		self.store = store
+		self.out_dir = out_dir
+		self.wait = wait
+		self.proc = None
+		self.path = None
+		self.exit = None
+
+	def start(self):
+		"""Start serving; raise HandlerError when no valid pointer and answer come within the wait."""
+		if STOP.is_set():
+			raise HandlerError('interrupted')
+		with open(os.path.join(self.out_dir, 'serve.out'), 'wb') as out, open(os.path.join(self.out_dir, 'serve.err'), 'wb') as err:
+			self.proc = subprocess.Popen(self.impl.argv + ['serve', self.store], cwd=self.impl.cwd, stdin=subprocess.DEVNULL,
+				stdout=out, stderr=err, start_new_session=True)
+		LIVE_GROUPS.add(self.proc.pid)
+		LIVE_HANDLERS.add(self)
+		deadline = time.time() + self.wait
+		while True:
+			if self.proc.poll() is not None:
+				self.exit = self.proc.returncode
+				self._forget()
+				raise HandlerError('serve exited with status %d before answering%s' % (self.exit, self.stderr_tail()))
+			pointer = read_pointer(self.store)
+			if pointer:
+				try:
+					client = Client(pointer['address'][5:], self.wait)
+					try:
+						client.request(['len'])
+					finally:
+						client.close()
+					self.path = pointer['address'][5:]
+					return self
+				except (OSError, ConnectionError):
+					pass
+			if time.time() > deadline:
+				self.kill()
+				raise HandlerError('no valid pointer file and answer within %.0f s%s' % (self.wait, self.stderr_tail()))
+			time.sleep(0.01)
+
+	def stderr_tail(self):
+		try:
+			with open(os.path.join(self.out_dir, 'serve.err'), 'rb') as f:
+				lines = f.read().decode('utf-8', 'replace').splitlines()[-5:]
+		except OSError:
+			return ''
+		return ''.join('\n    ' + line for line in lines)
+
+	def client(self):
+		return Client(self.path, self.wait)
+
+	def stop(self):
+		"""Send stop (§21.7.1) and reap the handler; return problems (empty when it answered #0 and exited)."""
+		problems = []
+		if self.proc is None or self.proc.returncode is not None:
+			return problems
+		if self.path:
+			try:
+				client = self.client()
+				try:
+					response = client.request(['stop'])
+				finally:
+					client.close()
+				if response.status != 0:
+					problems.append('stop answered #%d' % response.status)
+			except (OSError, ConnectionError) as e:
+				problems.append('stop failed: %s' % e)
+		else:
+			kill_group(self.proc.pid, signal.SIGTERM)
+		self.exit, timed_out = reap(self.proc, self.wait, signal.SIGTERM)
+		self._forget()
+		if timed_out:
+			problems.append('the handler did not exit within %.0f s of stop' % self.wait)
+		return problems
+
+	def kill(self):
+		if self.proc is not None and self.proc.returncode is None:
+			kill_group(self.proc.pid)
+			self.exit = reap(self.proc, 5)[0]
+		self._forget()
+
+	def _forget(self):
+		LIVE_HANDLERS.discard(self)
+		if self.proc is not None:
+			LIVE_GROUPS.discard(self.proc.pid)
