@@ -580,8 +580,9 @@ implementation-defined.
 
 15.2 **Marker.** `#_checksum_<algo>_#`, where `<algo>` names a digest algorithm
 (§15.2.1). `<algo>` is part of the case-insensitive reserved key and matches the
-inner character class of §12.2.1. The value is the lowercase hexadecimal expected
-digest, or empty.
+inner character class of §12.2.1. The value is the expected digest in hexadecimal,
+or empty. A writer **MUST** write it in lowercase; a reader compares it ignoring
+ASCII case.
 
 15.2.1 **Algorithms.** This specification defines these names:
 

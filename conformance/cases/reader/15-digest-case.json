@@ -1,0 +1,10 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "15.2-uppercase-digest-matches", "spec": ["15.2"], "level": "MUST", "requires": ["crc32"],
+ "note": "A reader compares the digest ignoring ASCII case.",
+ "files": {"s.tsvz": "#_checksum_crc32_#\na\tx\nb\ty\n#_checksum_crc32_#\tC1EC8234\n"},
+ "expect": {"verify": {"lines": [], "exit": 0}}},
+{"id": "15.2-digests-are-printed-in-lowercase", "spec": ["15.2", "20.2"], "level": "MUST", "requires": ["crc32"],
+ "note": "verify prints the expected and computed digests in lowercase, whatever the marker holds.",
+ "files": {"s.tsvz": "#_checksum_crc32_#\na\tx\nb\ty\n#_checksum_crc32_#\tABCDEF01\n"},
+ "expect": {"verify": {"lines": [["{store}", "4", "crc32", "abcdef01", "c1ec8234"]], "exit": 4}}}
+]}
