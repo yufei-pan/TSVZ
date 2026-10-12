@@ -1042,6 +1042,24 @@ def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):
 	assert 'mismatch: expected deadbeef, computed 00000000' in warnings[0] and 'm.tsvz.f line 3' in warnings[0]
 
 
+def test_spec_marker_values_are_not_stripped(capsys):
+	# Marker lines are not stripped (spec §10.4), so a value with a space around it is invalid and ignored (§12.4.5).
+	_, state, reporter = _process(['#_strip_trailing_whites_#\tfalse ', '#_fill_empty_with_default_#\t true'])
+	reporter.flush()
+	assert state.strip is True and state.fillEmpty is False
+	assert 'invalid value' in _tsvz_warnings(capsys)[0]
+
+
+def test_spec_a_checksum_value_with_a_space_is_a_mismatch(tmp_path, capsys):
+	import zlib
+	p = str(tmp_path / 'a.tsvz')
+	crc = '%08x' % (zlib.crc32(b'a\t1\n') & 0xffffffff)
+	_touch(p, ('#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t%s \n' % crc).encode())
+	_replay([p])
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'mismatch: expected %s , computed %s' % (crc, crc) in warnings[0]
+
+
 def test_spec_checksum_covers_other_algorithms_markers(tmp_path, capsys):
 	import zlib
 	p = str(tmp_path / 'a.tsvz')

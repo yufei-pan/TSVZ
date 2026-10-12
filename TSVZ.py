@@ -1563,7 +1563,7 @@ class _SpecState(object):
 
 def _specApplyMarker(state, keyLower, values, reporter, where):
 	"""Apply an official marker (spec §12.4). Returns False when its value was rejected."""
-	value = values[0].strip() if values else ''
+	value = values[0] if values else ''  # marker lines are not stripped (spec §10.4)
 	if keyLower == DEFAULTS_INDICATOR_KEY:
 		state.defaults = [DEFAULTS_INDICATOR_KEY] + list(values)
 		state.sawDefaults = True
@@ -1842,7 +1842,7 @@ def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
 	"""
 	if algo in state.digests:
 		fields = text.split(delimiter)
-		expected = fields[1].strip().lower() if len(fields) > 1 else ''
+		expected = fields[1].lower() if len(fields) > 1 else ''  # not stripped (spec §10.4)
 		if expected:
 			actual = state.digests[algo].hexdigest()
 			if actual != expected:

@@ -2,8 +2,6 @@
  "features": ["bzip2", "xz", "crc32", "sha256", "file-first", "handler"],
  "note": "The reference also claims zstd on Python 3.14 and later. Every case it does not pass, and why; remove an entry when the reference is fixed.",
  "not_passing": [
-  {"id": "12.4.5-marker-value-is-not-stripped", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
-   "reason": "Marker values are stripped, so \"false \" turns stripping off; §10.4 says marker lines are not stripped, which makes the value invalid (§12.4.5)."},
   {"id": "13.2-cr-token-decodes", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
    "reason": "<CR> is not decoded (decision 10)."},
   {"id": "13.5-cr-token-at-the-end-of-a-row", "modes": ["files", "socket", "forwarded"], "result": "FAIL",
