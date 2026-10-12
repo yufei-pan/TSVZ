@@ -431,23 +431,24 @@ those markers are inert.
 | `#_return_defaults_when_missing_#` | stateful | a missing-key read returns the defaults (§14) | `true` / `false` | `true` |
 | `#_rotate_#` | advisory | recommended action for superseded parts after a snapshot (§19) | `keep` / `rename` / `delete` | `keep` |
 | `#_write_ack_#` | advisory | when a writer/handler acknowledges a record (§18) | `memory` / `disk` | `memory` |
+| `#_member_size_#` | advisory | the most uncompressed data a writer puts in one compressed member (§16.7) | a single integer ≥ 1 | `1048576` |
 | `#_checksum_<algo>_#` | integrity | verify a segment digest (§15) | hex digest, or empty | off |
 
 12.4.1 A boolean value is `true` or `false`; `yes`, `on` and `1` are also accepted
 as `true`, and `no`, `off` and `0` as `false`. A writer SHOULD write `true` or
 `false`. Boolean values, enumerated values, and `<algo>` names are matched
-case-insensitively over ASCII. The value of `#_version_#` is written in ASCII
-decimal digits. An empty value resets a stateful marker to its built-in default;
-for `#_checksum_<algo>_#`, an empty value begins a new segment without
-verification (§15.3).
+case-insensitively over ASCII. The values of `#_version_#` and `#_member_size_#`
+are written in ASCII decimal digits. An empty value resets a stateful marker to its
+built-in default; for `#_checksum_<algo>_#`, an empty value begins a new segment
+without verification (§15.3).
 
 12.4.2 **`#_version_#`** — see §6. **`#_defaults_#`, `#_fill_empty_with_default_#`,
 `#_return_defaults_when_missing_#`** — see §14. **`#_strip_trailing_whites_#`** —
 see §10. **`#_rotate_#`** — see §19. **`#_write_ack_#`** — see §18.
-**`#_checksum_<algo>_#`** — see §15.
+**`#_member_size_#`** — see §16.7. **`#_checksum_<algo>_#`** — see §15.
 
-12.4.3 **Advisory** markers (`#_rotate_#`, `#_write_ack_#`) are hints to writers
-and processors and have **no effect on reconstructed data**. **Integrity** markers
+12.4.3 **Advisory** markers (`#_rotate_#`, `#_write_ack_#`, `#_member_size_#`) are
+hints to writers and processors and have **no effect on reconstructed data**. **Integrity** markers
 (`#_checksum_<algo>_#`) affect only verification and have no effect on
 reconstructed data (§15).
 
@@ -683,7 +684,29 @@ unit. Such a writer SHOULD keep the active part uncompressed and leave compressi
 prior immutable parts to a later pass (§17.7). A writer that does not hold a
 compressed part open appends to it by writing a new compressed member holding the
 new records after the part's existing bytes: a gzip member, a bzip2 stream, an xz
-stream or a Zstandard frame. It does not rewrite the part (§3.1).
+stream or a Zstandard frame. It does not rewrite the part (§3.1), and it need not
+check the part for damage first: a reader skips a damaged member (§16.6).
+
+16.4.1 **Acknowledging records on disk.** A writer that holds a member open and
+acknowledges records once they are on disk (`#_write_ack_#` `disk`, §18) **MUST**
+make each record decodable from the disk before it acknowledges it: with gzip or
+Zstandard it flushes the codec (a gzip sync flush, a Zstandard block flush) and
+syncs the file; bzip2 and xz cannot be flushed within a member, so it ends the
+member instead and starts a new one for the next record.
+
+16.4.2 **Restarting after a crash.** A writer that crashes while it holds a member
+open leaves that member cut short (§16.6), and a reader keeps its whole lines only
+while it is the part's last member. A long-running writer — one that reads the
+store and then keeps appending to it — that finds the part's last member cut short
+**SHOULD** therefore put that member's whole lines again at the start of the first
+member it appends, provided the part has not grown since it read it. Readers then
+skip the cut member as debris and read the copy, so no acknowledged record is lost.
+
+16.4.3 **Compressed active parts.** Writing records directly into a compressed
+part is **NOT RECOMMENDED** for important or sensitive data: one damaged member
+loses every record in it, and with `#_write_ack_#` `disk` each record costs a flush
+or a member of its own, which defeats compression. Such a store SHOULD keep its
+active part uncompressed and compress parts once they are immutable (§17.7).
 
 16.5 **Supported codecs.** A conformant reader **MUST** support gzip; support for
 the other codecs of §16.2 is optional. A reader that meets a part whose codec it
@@ -692,11 +715,46 @@ its bytes as uncompressed text. A command-line tool reports this as a failure
 (§20.6, status 1); a handler answers as §21.8.5 says.
 
 16.6 **Multi-member parts.** Each codec of §16.2 lets a file hold several
-compressed members one after another. A reader **MUST** read all the members of a
-part, in order, as one stream. When a part's compressed data ends early, as a
-final member cut short by a crash does, the reader keeps what it decoded before
-that point; §4.3 then discards any bytes after the last `\n`. This is not an
-error, though a reader MAY warn about it.
+compressed members one after another. A reader **MUST** read the members of a part
+in order, as one stream, by these rules:
+
+   1. A member is **complete** when it decodes to its end and passes its codec's
+      integrity check: the gzip CRC-32 and length, the bzip2 block and stream
+      CRCs, the xz check, and the Zstandard content checksum when the frame has one
+      (§16.8). A reader uses a member's records only once the member is complete,
+      except as rule 3 allows; it holds the member's output until then.
+   2. A member that is not complete is **damaged**: it fails to decode, fails its
+      check, or its bytes end before it does. The reader then looks for the next
+      complete member: the first offset after the damaged member's start where a
+      member of the part's codec begins (gzip `1F 8B 08`, bzip2 `42 5A 68` "BZh",
+      xz `FD 37 7A 58 5A 00`, Zstandard `28 B5 2F FD`) and is complete. If there is
+      one, the reader uses none of the damaged member's output and continues at
+      that offset; bytes after the last `\n` before the damaged member are
+      discarded, as at the end of a part (§4.3). A damaged member with more data
+      after it is debris from a write that never finished, or corrupted data; a
+      writer appends after it without repairing it (§16.4).
+   3. When no complete member follows, the damaged member is the part's last. If
+      its bytes merely end before it does, as a final member cut short by a crash
+      does, the reader keeps what it decoded before that point; §4.3 then discards
+      any bytes after the last `\n`. If it fails to decode or fails its check, none
+      of its output is used.
+
+A damaged member is not an error, though a reader MAY warn about it. A tool that
+rewrites a part with damaged members (a snapshot, §19) SHOULD keep the original
+bytes first, since the damaged members' data is not in what it writes.
+
+16.7 **Member size.** A writer SHOULD keep each compressed member it writes to at
+most `#_member_size_#` bytes of uncompressed data (§12.4), ending members at record
+boundaries; a single record longer than that is written as one member. A batch
+append or a snapshot that holds more is written as several members. The size is
+1048576 (1 MiB) unless the store's `#_member_size_#` marker sets another. Small
+members bound the memory a reader needs to hold a member until it is complete
+(§16.6) and limit what one damaged member takes with it. A long-running writer that
+holds a member open (§16.4) SHOULD end it at the same size.
+
+16.8 **Zstandard checksums.** A writer SHOULD set the content checksum flag on each
+Zstandard frame it writes. A reader verifies the checksum when a frame has one; a
+frame without one is complete once it decodes to its end.
 
 ---
 
@@ -1332,7 +1390,8 @@ store                    = ordered map: key -> resolved value (first-appearance 
 digests                  = {}        # armed per-algorithm accumulators (optional)
 
 # Parts are read in ordinal order as ONE concatenation; marker state and digest
-# accumulators persist across part boundaries (§17.4, §15.4).
+# accumulators persist across part boundaries (§17.4, §15.4). A compressed part
+# contributes the output of its complete members, skipping damaged ones (§16.6).
 for raw in split_records(concatenated_parts):   # split on '\n'; tolerate trailing
                                                  # '\r'; discard bytes after last '\n'
     fields = split(raw, DELIM)        # raw split; count = (#DELIM) + 1

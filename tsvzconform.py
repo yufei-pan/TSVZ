@@ -33,7 +33,7 @@ import time
 import traceback
 import zlib
 
-version = '1.0'
+version = '1.1'
 __version__ = version
 
 CASES_FORMAT = 1
@@ -339,18 +339,55 @@ def _decompressor(codec):
 	return zstd.ZstdDecompressor()
 
 
+#: The bytes a member of each codec begins with (§16.6).
+MEMBER_MAGIC = {'gzip': b'\x1f\x8b\x08', 'bzip2': b'BZh', 'xz': b'\xfd7zXZ\x00', 'zstd': b'\x28\xb5\x2f\xfd'}
+
+
+def _member(data, start, codec):
+	"""Decode the member at ``data[start:]``: ('complete', output, end), ('short', output, None) or ('bad', b'', None)."""
+	decompressor = _decompressor(codec)
+	try:
+		out = decompressor.decompress(data[start:])
+	except CodecUnavailable:
+		raise
+	except Exception:
+		return 'bad', b'', None
+	if decompressor.eof:
+		return 'complete', out, len(data) - len(decompressor.unused_data)
+	return 'short', out, None
+
+
+def _next_complete(data, start, codec):
+	"""The first complete member at or after ``start`` (§16.6 rule 2): (offset, output, end), or None."""
+	magic = MEMBER_MAGIC[codec]
+	pos = data.find(magic, start)
+	while pos >= 0:
+		status, out, end = _member(data, pos, codec)
+		if status == 'complete':
+			return pos, out, end
+		pos = data.find(magic, pos + 1)
+	return None
+
+
 def decompress(data, codec):
-	"""Every member of a compressed part as one stream; a member cut short yields what it decoded (§16.6)."""
+	"""The records of a compressed part (§16.6): its complete members in order, skipping damaged ones;
+	a last member cut short yields what it decoded."""
 	out = []
-	while data:
-		decompressor = _decompressor(codec)
-		try:
-			out.append(decompressor.decompress(data))
-		except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
+	pos = 0
+	while pos < len(data):
+		status, chunk, end = _member(data, pos, codec)
+		if status == 'complete':
+			out.append(chunk)
+			pos = end
+			continue
+		found = _next_complete(data, pos + 1, codec)
+		if found is None:
+			if status == 'short':
+				out.append(chunk)
 			break
-		if not decompressor.eof:
-			break
-		data = decompressor.unused_data
+		kept = b''.join(out)
+		out = [kept[:kept.rfind(b'\n') + 1], found[1]]  # the unfinished line before the damage is dropped
+		pos = found[2]
 	return b''.join(out)
 
 
@@ -1586,6 +1623,69 @@ def check_terminal_default(cx):
 	return []
 
 
+def _members_after(data, start, codec):
+	"""(offset, output) of each complete member from ``start`` on, as a reader finds them (§16.6)."""
+	found = []
+	pos = start
+	while pos < len(data):
+		status, out, end = _member(data, pos, codec)
+		if status != 'complete':
+			return found, 'bytes from offset %d are not a complete %s member' % (pos, codec)
+		found.append((pos, out))
+		pos = end
+	return found, None
+
+
+@procedural('16.7-a-large-write-is-split-into-members', 'writer', ['16.7', '16.4'], 'SHOULD',
+	'More than 1 MiB of records set into a compressed part is written as members of at most 1 MiB of '
+	'uncompressed data each, ending at record boundaries.')
+def check_member_size(cx):
+	import gzip
+	first = gzip.compress(b'a\tx\n', mtime=0)
+	store = cx.write('s.tsvz.gz', first)
+	records = b''.join(b'k%06d\t%s\n' % (i, b'v' * 40) for i in range(60000))  # about 3 MiB
+	run = cx.run(cx.impl.argv + ['set', store, '-'], stdin=records)
+	if run.exit != 0:
+		return ['set - exited %s: %s' % (run.exit, show(run.stderr))]
+	with open(store, 'rb') as f:
+		data = f.read()
+	if not data.startswith(first):
+		return ['the part no longer starts with its first member']
+	members, problem = _members_after(data, len(first), 'gzip')
+	problems = [problem] if problem else []
+	if b''.join(out for _, out in members) != records:
+		problems.append('the new members do not hold exactly the records set')
+	for offset, out in members:
+		if len(out) > 1048576 and out.count(b'\n') > 1:
+			problems.append('the member at offset %d holds %d bytes of records' % (offset, len(out)))
+		if not out.endswith(b'\n'):
+			problems.append('the member at offset %d does not end at a record boundary' % offset)
+	return problems
+
+
+@procedural('16.8-zstd-frames-carry-a-checksum', 'writer', ['16.8', '16.4'], 'SHOULD',
+	'A Zstandard frame a writer adds sets the content checksum flag.', requires=['zstd'])
+def check_zstd_checksum(cx):
+	first = base64.b64decode('KLUv/SAEIQAAYQl4Cg==')  # a\tx\n, no checksum
+	store = cx.write('s.tsvz.zst', first)
+	run = cx.run(cx.impl.argv + ['set', store, 'b', 'y'])
+	if run.exit != 0:
+		return ['set exited %s: %s' % (run.exit, show(run.stderr))]
+	with open(store, 'rb') as f:
+		data = f.read()
+	try:
+		members, problem = _members_after(data, len(first), 'zstd')
+	except CodecUnavailable:
+		raise Skip('this Python has no zstd to read the part with')
+	problems = [problem] if problem else []
+	if not members:
+		problems.append('set added no Zstandard frame')
+	for offset, _ in members:
+		if not data[offset + 4] & 0x04:
+			problems.append('the frame at offset %d has no content checksum flag' % offset)
+	return problems
+
+
 def _serving(cx, content='k\tv\n'):
 	store = cx.write('s.tsvz', content)
 	return store, cx.handler(store)
@@ -1840,6 +1940,26 @@ def check_line_limit(cx):
 			client.close()
 	finally:
 		problems.extend(handler.stop())
+	return problems
+
+
+@procedural('16.4.2-a-handler-writes-a-cut-members-lines-again', 'handler', ['16.4.2', '16.6'], 'SHOULD',
+	'A handler serving a store whose last member is cut short puts that member\'s whole lines at the start of '
+	'its first append, so they are still read once the cut member is no longer last.', requires=['handler'])
+def check_handler_recut(cx):
+	import gzip
+	store = cx.write('s.tsvz.gz', gzip.compress(b'a\tx\n', mtime=0) + gzip.compress(b'b\ty\nbr', mtime=0)[:-6])
+	handler = cx.handler(store)
+	problems = []
+	try:
+		response = handler.client().request(['set', 'c', 'z'])
+		if response.status != 0:
+			problems.append('set answered status %s' % response.status)
+	finally:
+		problems.extend(handler.stop())
+	rows = [trim_row(row) for row in replay_store(store).rows()]
+	if rows != [['a', 'x'], ['b', 'y'], ['c', 'z']]:
+		problems.append('the store reads %s, not a, b and c' % show(rows))
 	return problems
 
 

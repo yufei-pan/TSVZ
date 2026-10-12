@@ -728,9 +728,21 @@ def test_a_missing_tool_fails_and_a_runner_bug_is_an_error(tmp_path, monkeypatch
 
 # --- procedural checks -----------------------------------------------------------------------
 
+def _python_has_zstd():
+	try:
+		from compression import zstd  # noqa: F401 (Python 3.14+)
+	except ImportError:
+		return False
+	return True
+
+
 @pytest.mark.parametrize('check', tc.CHECKS, ids=[c.id for c in tc.CHECKS])
 def test_every_procedural_check_passes_with_the_reference(check, tmp_path):
-	result = tc.run_case(check, 'files', context(tmp_path / 'work', features=['handler']))
+	features = ['handler'] + (['zstd'] if _python_has_zstd() else [])
+	unclaimed = [r for r in check.requires if not r.startswith('!') and r not in features]
+	if unclaimed:
+		pytest.skip('the reference does not claim %s on this Python' % ', '.join(unclaimed))
+	result = tc.run_case(check, 'files', context(tmp_path / 'work', features=features))
 	assert result.result in (tc.PASS, tc.SKIP), result.detail
 
 

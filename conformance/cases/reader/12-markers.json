@@ -34,5 +34,9 @@
 {"id": "12.4.3-advisory-markers-do-not-change-data", "spec": ["12.4.3"], "level": "MUST",
  "note": "#_rotate_# and #_write_ack_# are hints with no effect on what is read.",
  "files": {"s.tsvz": "#_rotate_#\tdelete\n#_write_ack_#\tdisk\na\tx\n"},
- "expect": {"read": [["a", "x"]], "len": 1}}
+ "expect": {"read": [["a", "x"]], "len": 1}},
+{"id": "12.4-member-size-is-a-hint", "spec": ["12.4", "12.4.3", "16.7"], "level": "MUST",
+ "note": "#_member_size_# is an advisory marker: it is not a record and changes nothing that is read, whatever its value.",
+ "files": {"s.tsvz": "#_member_size_#\t4096\na\tx\n#_member_size_#\tbig\nb\ty\n"},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}}
 ]}
