@@ -208,6 +208,7 @@ part, and a delimiter or encoding argument that conflicts with the extension.
 | S9 | `clear` keeps the active markers; scrub keeps the header comment and drops other comments, custom markers and checksums. |
 | S10 | Files named `x.tsvz.<hex>` beside `x.tsvz` are read as parts of the store. |
 | S11 | `lastLineOnly` reads forward (slower on large files). |
+| S12 | `TSVZedLite.clear()` and `clear_file()` raise `OSError` when the clear is refused (a part could not be read, the path names one part of a store, or the store kept changing). Memory is reloaded from the unchanged store first. |
 
 ### The `tsvz` command
 
@@ -226,6 +227,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
 | C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line. |
+| C11 | The table shows control characters as escapes (`\r`, `\n`, `\t`, `\xNN`), so no value can move the cursor or restyle the terminal, and it sizes columns in terminal columns, so CJK text (two columns a character) lines up. |
 
 ## Spec deviations and interpretations
 

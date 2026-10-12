@@ -1017,6 +1017,19 @@ def test_spec_bz2_and_xz_parts(tmp_path):
 	assert dict(_replay([b])[0]) == dict(_replay([x])[0]) == {'a': ['a', '1'], 'b': ['b', '2']}
 
 
+@pytest.mark.parametrize('suffix', TSVZ.COMPRESSED_FILE_EXTENSIONS)
+def test_every_codec_suffix_writes_its_own_codec(tmp_path, suffix):
+	# Each spelling of a codec (.xz and .lzma, .gz and .gzip, ...) compresses with it, through every writer.
+	if not TSVZ._codecSupported(suffix):
+		pytest.skip('no {} support in this Python'.format(suffix))
+	p = str(tmp_path / ('a.tsv.' + suffix))
+	with TSVZ.openFileAsCompressed(p, 'wb') as f:
+		f.write(b'k\tv\n')
+	with open(p, 'rb') as f:
+		assert TSVZ._newDecompressor(suffix).decompress(f.read()) == b'k\tv\n'
+	assert TSVZ._newDecompressor(suffix).decompress(TSVZ._compressBytes(suffix, b'x\n')) == b'x\n'
+
+
 def _block_zstd(monkeypatch):
 	"""Make this Python look like one without compression.zstd (before 3.14)."""
 	monkeypatch.setitem(sys.modules, 'compression.zstd', None)
@@ -1110,6 +1123,37 @@ def test_spec_read_then_write_operations_refuse_an_unreadable_store(tmp_path, mo
 	assert _run('setdefault', base, 'k', 'new')[0] == 1
 	assert _run('pop', base, 'b')[0] == 1
 	assert _run('popitem', base)[0] == 1
+	with open(base + '.2', 'rb') as f:
+		assert f.read() == b'b\t2\n'
+
+
+def test_spec_strict_scrub_reports_an_unreadable_first_part_not_a_header_mismatch(tmp_path, monkeypatch, capsys):
+	# The header lives in part 0: when part 0 cannot be read, there is no header to compare.
+	_block_zstd(monkeypatch)
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1.zst', ZST_JUNK)
+	_touch(base + '.2', b'b\t2\n')
+	TSVZ.scrubTabularFile(base, header='key\tvalue', strict=True)
+	assert 'could not be read' in capsys.readouterr().err
+	with open(base + '.1.zst', 'rb') as f:
+		assert f.read() == ZST_JUNK
+	with open(base + '.2', 'rb') as f:
+		assert f.read() == b'b\t2\n'
+
+
+def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
+	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
+	_block_zstd(monkeypatch)
+	base = str(tmp_path / 'm.tsvz')
+	_touch(base + '.1.zst', ZST_JUNK)
+	_touch(base + '.2', b'b\t2\n')
+	lite = TSVZ.TSVZedLite(base)
+	try:
+		with pytest.raises(OSError, match='not cleared'):
+			lite.clear()
+		assert dict(lite) == {'b': ['b', '2']}
+	finally:
+		lite.close()
 	with open(base + '.2', 'rb') as f:
 		assert f.read() == b'b\t2\n'
 
@@ -2563,6 +2607,40 @@ def test_cli_table_prints_rows_not_a_header(tmp_path):
 	assert _run('get', q, 'alice', '--format', 'table') == (0, 'alice | Alice\n\n', '')
 
 
+def test_cli_table_shows_control_characters_as_escapes(tmp_path):
+	"""A table cell never moves the cursor or styles the terminal: control characters print as escapes."""
+	d = tmp_path / 'a\rb'
+	d.mkdir()
+	p = str(d / 'c.tsvz')
+	_touch(p, b'k\tx<CR>y<LF>z<sep>w\t\x1b[31mred\x07\n')
+	row = 'k | x\\ry\\nz\\tw | \\x1b[31mred\\x07\n\n'
+	assert _run('read', p, '--format', 'table') == (0, row, '')
+	assert _run('get', p, 'k', '--format', 'table') == (0, row, '')
+	status, out, _ = _run('parts', p, '--format', 'table')
+	assert status == 0 and '\r' not in out and 'a\\rb' in out
+
+
+def test_pretty_format_table_without_a_header():
+	assert TSVZ.pretty_format_table([['a', 'bb'], ['ccc', 'd']], header=False, full=True) == 'a   | bb\nccc | d \n'
+
+
+def test_pretty_format_table_pads_wide_characters_by_display_width():
+	# East Asian wide characters take two terminal columns, a combining mark none.
+	table = TSVZ.pretty_format_table([['name', 'v'], ['中文', '1'], ['abcd', '2'], ['é', '3']], full=True)
+	assert table == 'name | v\n-----+--\n中文 | 1\nabcd | 2\né    | 3\n'
+
+
+def test_pretty_format_table_truncates_wide_characters_to_the_terminal(monkeypatch):
+	monkeypatch.setattr(TSVZ, 'get_terminal_size', lambda: (12, 24))
+	table = TSVZ.pretty_format_table([['k', 'v'], ['a', '中文中文中文']])
+	assert table == 'k|v         \n-+----------\na|中文中文..\n'
+
+
+def test_pretty_format_table_pads_colored_cells_by_visible_width():
+	table = TSVZ.pretty_format_table([['k', 'v'], ['\x1b[31mred\x1b[0m', '1'], ['plain', '2']], full=True)
+	assert table == 'k     | v\n------+--\n\x1b[31mred\x1b[0m   | 1\nplain | 2\n'
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='needs a pseudo-terminal')
 def test_cli_prints_a_table_on_a_terminal(tmp_path):
 	"""Spec §20.4.3: without --format, a terminal gets the table and a pipe gets records."""
@@ -3926,3 +4004,20 @@ def test_serve_needs_unix_domain_sockets(tmp_path):
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
+
+
+def test_legacy_upper_case_compressed_name_is_rewritten_as_compressed(tmp_path, capsys):
+	# A codec suffix counts in any case: mapToFile rewrites DATA.TSV.GZ whole, as it does data.tsv.gz.
+	p = str(tmp_path / 'DATA.TSV.GZ')
+	d = TSVZ.TSVZed(p, header='key\tvalue')
+	d['a'] = ['a', '1']
+	d['b'] = ['b', '2']
+	d.close()
+	d = TSVZ.TSVZed(p, header='key\tvalue')
+	del d['a']
+	d.mapToFile()
+	d.close()
+	captured = capsys.readouterr()
+	assert 'Failed to write' not in captured.out + captured.err
+	with open(p, 'rb') as f:
+		assert 'b\t2' in gzip.decompress(f.read()).decode().splitlines()

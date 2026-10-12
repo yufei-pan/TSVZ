@@ -48,7 +48,9 @@ COMMIT_DATE = '2026-10-11'
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 
-COMPRESSED_FILE_EXTENSIONS = ['gz','gzip','bz2','bzip2','xz','lzma','zst','zstd']
+#: Compression suffix -> codec name (spec §16.2). Code dispatches on the name, so each spelling of a codec acts alike.
+_CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
+COMPRESSED_FILE_EXTENSIONS = list(_CODEC_NAMES)
 
 def _isCompressedFile(fileName):
 	return fileName.rpartition('.')[2].lower() in COMPRESSED_FILE_EXTENSIONS
@@ -120,48 +122,35 @@ def eprint(*args, **kwargs):
 		print(*args, **kwargs)
 
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
-	lowerFileName = fileName.lower()
-	if any(c in mode for c in 'wax+'):
+	codec = _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
+	if codec and any(c in mode for c in 'wax+'):
 		# Writing plain bytes into a compressed file destroys it: refuse when this Python lacks the codec.
-		suffix = lowerFileName.rpartition('.')[2]
-		if suffix in COMPRESSED_FILE_EXTENSIONS:
-			_requireCodec(suffix)
+		_requireCodec(codec)
 	if 'b' not in mode:
 		mode += 't'
 	kwargs = {}
 	if 'r' not in mode:
-		if lowerFileName.endswith('.xz'):
+		if codec == 'xz':
 			kwargs['preset'] = compressLevel
-		elif lowerFileName.endswith('.zst') or lowerFileName.endswith('.zstd'):
+		elif codec == 'zstd':
 			kwargs['level'] = compressLevel
 		else:
 			kwargs['compresslevel'] = compressLevel
 	if 'b' not in mode:
 		kwargs['encoding'] = encoding
-	if lowerFileName.endswith('.xz') or lowerFileName.endswith('.lzma'):
+	if codec:
 		try:
-			import lzma
-			return lzma.open(fileName, mode, **kwargs)
+			if codec == 'gzip':
+				import gzip as module
+			elif codec == 'bzip2':
+				import bz2 as module
+			elif codec == 'xz':
+				import lzma as module
+			else:
+				from compression import zstd as module
+			return module.open(fileName, mode, **kwargs)
 		except Exception:
-			__teePrintOrNot(f"Failed to open {fileName} with lzma, trying bin",teeLogger=teeLogger)
-	elif lowerFileName.endswith('.gz') or lowerFileName.endswith('.gzip'):
-		try:
-			import gzip
-			return gzip.open(fileName, mode, **kwargs)
-		except Exception:
-			__teePrintOrNot(f"Failed to open {fileName} with gzip, trying bin",teeLogger=teeLogger)
-	elif lowerFileName.endswith('.bz2') or lowerFileName.endswith('.bzip2'):
-		try:
-			import bz2
-			return bz2.open(fileName, mode, **kwargs)
-		except Exception:
-			__teePrintOrNot(f"Failed to open {fileName} with bz2, trying bin",teeLogger=teeLogger)
-	elif lowerFileName.endswith('.zst') or lowerFileName.endswith('.zstd'):
-		try:
-			from compression import zstd
-			return zstd.open(fileName, mode, **kwargs)
-		except Exception:
-			__teePrintOrNot(f"Failed to open {fileName} with zstd, trying bin",teeLogger=teeLogger)
+			__teePrintOrNot(f"Failed to open {fileName} with {codec}, trying bin",teeLogger=teeLogger)
 	if 't' in mode:
 		mode = mode.replace('t','')
 		return open(fileName, mode, encoding=encoding)
@@ -195,23 +184,54 @@ def get_terminal_size():
 	return _tsize
 
 def pretty_format_table(data, delimiter="\t", header=None, full=False):
-	version = 1.12
+	"""Format ``data`` as a text table fitted to the terminal; ``full`` keeps every cell whole.
+
+	``header`` names the columns (by default the first row does); ``header=False``
+	prints the rows alone, without a header or its rule. Widths count terminal
+	columns: an East Asian wide character takes two, a combining mark and an ANSI
+	color code none.
+	"""
+	import unicodedata
+	version = 1.13
 	_ = version
+	ansi = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
+	def char_width(ch):
+		if ch < "\u0300":  # ASCII and Latin-1
+			return 1
+		if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf") or "\u1160" <= ch <= "\u11ff":
+			return 0
+		return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 	def visible_len(s):
-		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
+		if "\x1b" in s:
+			s = ansi.sub("", s)
+		if not s or max(s) < "\u0300":
+			return len(s)
+		return sum(char_width(ch) for ch in s)
+	def pad(s, width):
+		return s + " " * (width - visible_len(s))
 	def table_width(col_widths, sep_len):
 		# total width = sum of column widths + separators between columns
 		return sum(col_widths) + sep_len * (len(col_widths) - 1)
 	def truncate_to_width(s, width):
-		# If fits, leave as is. If too long and width >= 1, keep width-1 chars + "."
-		# If width == 0, nothing fits; return empty string.
+		# A cell wider than ``width`` keeps what fits in width - 2 columns, then "..".
+		# Color codes are kept: they take no columns.
 		if visible_len(s) <= width:
 			return s
 		if width <= 0:
 			return ""
-		# Build a truncated plain string based on visible chars (no ANSI awareness for slicing)
-		# For simplicity, slice the raw string. This may cut ANSI; best to avoid ANSI in data if truncation occurs.
-		return s[: max(width - 2, 0)] + ".."
+		limit, used, out = max(width - 2, 0), 0, []
+		for i, piece in enumerate(ansi.split(s)):
+			if i % 2:
+				out.append(piece)
+				continue
+			for ch in piece:
+				w = char_width(ch)
+				if used + w > limit:
+					limit = -1  # full: no further characters
+					break
+				out.append(ch)
+				used += w
+		return "".join(out) + ".."[:width - used]
 	if not data:
 		return ""
 	# Normalize input data structure
@@ -234,12 +254,14 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	data = [[str(item) for item in row] for row in data]
 	num_cols = len(data[0])
 	# Resolve header and rows
-	using_provided_header = header is not None
-	if not using_provided_header:
+	show_header = header is not False
+	if header is None:
 		header = data[0]
 		rows = data[1:]
 	else:
-		if isinstance(header, str):
+		if header is False:
+			header = []
+		elif isinstance(header, str):
 			header = header.split(delimiter)
 		# Pad/trim header to match num_cols
 		if len(header) < num_cols:
@@ -271,16 +293,13 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	hsep = "-+-"
 	cols = get_terminal_size()[0]
 	def render(hdr, rows, col_w, sep_str, hsep_str):
-		row_fmt = sep_str.join("{{:<{}}}".format(w) for w in col_w)
-		out = []
-		out.append(row_fmt.format(*hdr))
-		out.append(hsep_str.join("-" * w for w in col_w))
+		rule = hsep_str.join("-" * w for w in col_w)
+		out = [sep_str.join(pad(cell, w) for cell, w in zip(hdr, col_w)), rule] if show_header else []
 		for row in rows:
 			if not any(row):
-				out.append(hsep_str.join("-" * w for w in col_w))
+				out.append(rule)
 			else:
-				row = [truncate_to_width(row[i], col_w[i]) for i in range(len(row))]
-				out.append(row_fmt.format(*row))
+				out.append(sep_str.join(pad(truncate_to_width(cell, w), w) for cell, w in zip(row, col_w)))
 		return "\n".join(out) + "\n"
 	if full:
 		return render(header, rows, col_widths, sep, hsep)
@@ -688,8 +707,6 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
 				_unlockFile(f)
 
 
-#: Compression suffix -> codec name (spec §16.2), as ``parts`` and error messages say it.
-_CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
 _CODEC_SUPPORT = {}
 
 
@@ -713,13 +730,14 @@ def _requireCodec(codec):
 
 def _compressBytes(codec, data, level=1):
 	"""Compress ``data`` as one complete member / stream for ``codec``."""
-	if codec in ('gz', 'gzip'):
+	name = _CODEC_NAMES.get(codec, codec)
+	if name == 'gzip':
 		import gzip
 		return gzip.compress(data, compresslevel=level)
-	if codec in ('bz2', 'bzip2'):
+	if name == 'bzip2':
 		import bz2
 		return bz2.compress(data, compresslevel=level)
-	if codec in ('xz', 'lzma'):
+	if name == 'xz':
 		import lzma
 		return lzma.compress(data, preset=level)
 	_requireCodec(codec)
@@ -1744,19 +1762,21 @@ class _PartInfo(object):
 		self.codec = _parsePartName(path).codec
 		self.tail = b''
 		self.damaged = ''
+		self.unreadable = False  # the part could not be opened, or this Python lacks its codec
 		self.goodRawEnd = 0
 		self.committed = 0  # bytes of committed lines read (decompressed bytes for a compressed part)
 		self.lines = 0  # committed lines replayed (set by _specReplay)
 
 
 def _newDecompressor(codec):
-	if codec in ('gz', 'gzip'):
+	name = _CODEC_NAMES.get(codec, codec)
+	if name == 'gzip':
 		import zlib
 		return zlib.decompressobj(wbits=47)
-	if codec in ('bz2', 'bzip2'):
+	if name == 'bzip2':
 		import bz2
 		return bz2.BZ2Decompressor()
-	if codec in ('xz', 'lzma'):
+	if name == 'xz':
 		import lzma
 		return lzma.LZMADecompressor()
 	from compression import zstd  # Python 3.14+
@@ -1773,7 +1793,7 @@ def _decompressChunks(f, info):
 	complete member.
 	"""
 	decompressor = _newDecompressor(info.codec)
-	isGzip = info.codec in ('gz', 'gzip')
+	isGzip = _CODEC_NAMES.get(info.codec) == 'gzip'
 	rawPos = 0
 	inMember = False
 	pending = b''
@@ -1817,10 +1837,12 @@ def _iterPartLines(info, reporter):
 	try:
 		f = open(info.path, 'rb')
 	except OSError as e:
+		info.unreadable = True
 		reporter.note('unreadable', None, 'skipped unreadable part {} ({})'.format(info.path, e))
 		return
 	if info.codec and not _codecSupported(info.codec):
 		# Spec §16.5: a codec this Python lacks makes the part unreadable; it is not damage to repair.
+		info.unreadable = True
 		f.close()
 		reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python'.format(info.path, _CODEC_NAMES.get(info.codec, info.codec)))
 		return
@@ -2077,7 +2099,7 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 			data[key] = offset
 		else:
 			data[key] = row
-	if headerPending:
+	if headerPending and not (result.infos and result.infos[0].unreadable):  # an unreadable part 0 hides the header
 		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
 	result.correctColumnNum = width
 	return result
@@ -3486,7 +3508,7 @@ memoryOnly:{self.memoryOnly}
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-			if self._fileName.rpartition('.')[2] in COMPRESSED_FILE_EXTENSIONS:
+			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self.hardMapToFile()
 			file = self.get_file_obj('r+b')
@@ -4113,13 +4135,17 @@ class TSVZedLite(MutableMapping):
 		return getListView(self,header=self.header,delimiter=self.delimiter)
 
 	def clear_file(self):
+		"""Clear the store. For .tsvz, raise OSError when the clear was refused (the reason is
+		reported as a warning); memory is reloaded from the store either way."""
 		if self._spec:
-			_specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter)
+			cleared = _specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter)
 			if self.fileObj is not None:
 				self.fileObj.close()
 			self.indexes.clear()
 			self._specLiteLoad(self.indexes)
 			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
+			if not cleared:
+				raise OSError('{} was not cleared: the clear was refused (see the warning above)'.format(self._fileName))
 			self._specFlushPendingDefaults()
 			return self
 		if self.fileObj is None:
@@ -6196,6 +6222,19 @@ def _cliFormat(args, stdout):
 		return 'records'
 
 
+_CLI_CONTROL_RE = re.compile('[\x00-\x1f\x7f-\x9f]')
+_CLI_CONTROL_ESCAPES = {'\t': '\\t', '\n': '\\n', '\r': '\\r'}
+
+
+def _cliTableCells(rows):
+	"""``rows`` as a table shows them: control characters as ``\\r``, ``\\n``, ``\\t`` or ``\\xNN``,
+	so no cell moves the cursor or sends the terminal an escape sequence."""
+	def escape(match):
+		ch = match.group()
+		return _CLI_CONTROL_ESCAPES.get(ch) or '\\x{:02x}'.format(ord(ch))
+	return [[_CLI_CONTROL_RE.sub(escape, str(cell)) for cell in row] for row in rows]
+
+
 def _cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=False):
 	"""Print store rows for ``read`` / ``get`` (spec §20.4): §13 records, 3.39 records or a table.
 
@@ -6204,13 +6243,13 @@ def _cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=False):
 	first row is the file's header line.
 	"""
 	if _cliFormat(args, stdout) == 'table':
+		rows = _cliTableCells(rows)
 		if headerRow or not rows:
 			_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter) + '\n')
 			return
 		width = max(len(row) for row in rows)
-		rows = [list(row) + [''] * (width - len(row)) for row in rows]
-		table = pretty_format_table(rows, delimiter=delimiter, header=[''] * width, full=True)
-		_cliWrite(stdout, table.split('\n', 2)[2] + '\n')  # drop the blank header and its rule
+		rows = [row + [''] * (width - len(row)) for row in rows]
+		_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter, header=False, full=True) + '\n')
 		return
 	if spec:
 		lines = [_specFormatRecord(row, delimiter) for row in rows]
@@ -6223,7 +6262,7 @@ def _cliEmitFields(rows, header, args, stdout):
 	"""Print ``verify`` / ``parts`` rows: TAB-joined §13-encoded fields, or a table under ``header``."""
 	if _cliFormat(args, stdout) == 'table':
 		if rows:
-			_cliWrite(stdout, pretty_format_table([header] + rows) + '\n')
+			_cliWrite(stdout, pretty_format_table(_cliTableCells([header] + rows)) + '\n')
 		return
 	_cliWrite(stdout, ''.join('\t'.join(_specEncodeField(str(field), '\t') for field in row) + '\n' for row in rows))
 
