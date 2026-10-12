@@ -483,7 +483,9 @@ writer **MUST** encode a `#` as `<#>` when it is the first character of a data k
 conformant file always begins a control token; decoding is therefore unambiguous
 and total over all UTF-8 (and arbitrary byte) field content. A reader maps the
 tokens of §13.2; a `<...>` token it does not recognize (for example, one
-introduced by a higher version) is **passed through literally**. **Field splitting
+introduced by a higher version) is **passed through literally**. Token names are
+case-sensitive: only the spellings of §13.2 are tokens, so `<lf>` or `<SEP>` is
+not recognized and passes through literally. **Field splitting
 (§7.2) occurs before token decoding**, so an encoded `<sep>` or `<LF>` never causes
 a split.
 

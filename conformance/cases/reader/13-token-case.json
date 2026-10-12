@@ -1,0 +1,6 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "13.4-token-names-are-case-sensitive", "spec": ["13.4"], "level": "MUST",
+ "note": "<lf>, <SEP>, <Lt> and <cr> are not tokens.",
+ "files": {"s.tsvz": "a\t<lf>\t<SEP>\t<Lt>\t<cr>\n"},
+ "expect": {"read": [["a", "<lf>", "<SEP>", "<Lt>", "<cr>"]]}}
+]}
