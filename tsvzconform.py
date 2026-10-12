@@ -1501,7 +1501,10 @@ def run_case(case, mode, ctx):
 	started = time.time()
 	case_dir = os.path.join(ctx.work, run_name(case, mode))
 	shutil.rmtree(case_dir, ignore_errors=True)
-	os.makedirs(case_dir)
+	try:
+		os.makedirs(case_dir)
+	except OSError as e:
+		return Result(case, mode, ERROR, ['cannot prepare the case directory %s: %s' % (case_dir, e.strerror or e)], time.time() - started)
 	detail = []
 	try:
 		if case.func:

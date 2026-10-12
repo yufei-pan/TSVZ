@@ -703,6 +703,14 @@ def test_a_failing_case_keeps_its_directory_and_names_the_step(tmp_path):
 	assert tc.run_case(tc.validate_case(should, 'reader', 'x'), 'files', context(tmp_path / 'w2', fake(tmp_path, 'drop'))).result == tc.WARN
 
 
+def test_a_case_directory_that_cannot_be_prepared_is_reported(tmp_path):
+	work = tmp_path / 'work'
+	work.mkdir()
+	(work / '9.2-lone-key-deletes').write_text('in the way')
+	result = tc.run_case(tc.validate_case(DELETES, 'reader', 'x'), 'files', context(work))
+	assert result.result == tc.ERROR and 'cannot prepare' in result.detail[0]
+
+
 def test_a_missing_tool_fails_and_a_runner_bug_is_an_error(tmp_path, monkeypatch):
 	result = tc.run_case(tc.validate_case(DELETES, 'reader', 'x'), 'files', context(tmp_path / 'work', '/nonexistent/tsvz'))
 	assert result.result == tc.FAIL and 'cannot run' in ' '.join(result.detail)
