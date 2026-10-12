@@ -1141,6 +1141,30 @@ def test_spec_strict_scrub_reports_an_unreadable_first_part_not_a_header_mismatc
 		assert f.read() == b'b\t2\n'
 
 
+GZ_CORRUPT = b'\x1f\x8b\x08\x00' + b'\xff' * 40  # a gzip header, then nothing that decodes
+
+
+def test_spec_scrub_keeps_the_bytes_of_a_damaged_compressed_part(tmp_path, capsys):
+	# A scrub compacts what can be read; the damaged original is kept as <part>.damaged-<time>, as an append does.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT)
+	TSVZ.scrubTabularFile(p)
+	backups = [name for name in os.listdir(str(tmp_path)) if name.startswith('m.tsvz.gz.damaged-')]
+	assert len(backups) == 1 and 'damaged' in capsys.readouterr().err
+	with open(str(tmp_path / backups[0]), 'rb') as f:
+		assert f.read() == gzip.compress(b'a\t1\n') + GZ_CORRUPT
+	with open(p, 'rb') as f:
+		assert gzip.decompress(f.read()).splitlines()[-1] == b'a\t1'
+
+
+def test_spec_strict_read_reports_a_damaged_first_part_not_a_header_mismatch(tmp_path, capsys):
+	# Nothing of part 0 could be decoded, so there is no header to compare.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, GZ_CORRUPT)
+	assert TSVZ.readTabularFile(p, header='key\tvalue', strict=True) == {}
+	assert 'damaged' in capsys.readouterr().err
+
+
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
 	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
 	_block_zstd(monkeypatch)
@@ -2609,15 +2633,28 @@ def test_cli_table_prints_rows_not_a_header(tmp_path):
 
 def test_cli_table_shows_control_characters_as_escapes(tmp_path):
 	"""A table cell never moves the cursor or styles the terminal: control characters print as escapes."""
-	d = tmp_path / 'a\rb'
-	d.mkdir()
-	p = str(d / 'c.tsvz')
+	p = str(tmp_path / 'c.tsvz')
 	_touch(p, b'k\tx<CR>y<LF>z<sep>w\t\x1b[31mred\x07\n')
 	row = 'k | x\\ry\\nz\\tw | \\x1b[31mred\\x07\n\n'
 	assert _run('read', p, '--format', 'table') == (0, row, '')
 	assert _run('get', p, 'k', '--format', 'table') == (0, row, '')
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='needs a control character in a file name')
+def test_cli_parts_table_shows_control_characters_in_paths_as_escapes(tmp_path):
+	d = tmp_path / 'a\rb'
+	d.mkdir()
+	p = str(d / 'c.tsvz')
+	_touch(p, b'k\tv\n')
 	status, out, _ = _run('parts', p, '--format', 'table')
 	assert status == 0 and '\r' not in out and 'a\\rb' in out
+
+
+def test_cli_table_shows_bidi_and_line_separator_characters_as_escapes(tmp_path):
+	"""U+202E and its kin would reorder the rest of the line on a bidi terminal; U+2028/9 can break it."""
+	p = str(tmp_path / 'b.tsvz')
+	_touch(p, 'k\t\u202eabc\u2066d\u2028e\u200f\n'.encode('utf-8'))
+	assert _run('read', p, '--format', 'table') == (0, 'k | \\u202eabc\\u2066d\\u2028e\\u200f\n\n', '')
 
 
 def test_pretty_format_table_without_a_header():
@@ -4001,11 +4038,6 @@ def test_serve_needs_unix_domain_sockets(tmp_path):
 	assert not os.path.exists(p + '.serve') and not os.path.exists(p)
 
 
-
-if __name__ == '__main__':
-	sys.exit(pytest.main([__file__] + sys.argv[1:]))
-
-
 def test_legacy_upper_case_compressed_name_is_rewritten_as_compressed(tmp_path, capsys):
 	# A codec suffix counts in any case: mapToFile rewrites DATA.TSV.GZ whole, as it does data.tsv.gz.
 	p = str(tmp_path / 'DATA.TSV.GZ')
@@ -4019,5 +4051,11 @@ def test_legacy_upper_case_compressed_name_is_rewritten_as_compressed(tmp_path, 
 	d.close()
 	captured = capsys.readouterr()
 	assert 'Failed to write' not in captured.out + captured.err
+	assert 'does not end with' not in captured.out + captured.err
 	with open(p, 'rb') as f:
 		assert 'b\t2' in gzip.decompress(f.read()).decode().splitlines()
+
+
+
+if __name__ == '__main__':
+	sys.exit(pytest.main([__file__] + sys.argv[1:]))

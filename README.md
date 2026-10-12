@@ -177,7 +177,7 @@ Examples: bytes after the last newline (ignored on read; truncated before the
 next append, and quoted), invalid UTF-8, a byte order mark, a newer
 `#_version_#`, a marker with a bad value, a checksum mismatch, a damaged
 compressed part (read up to the damage; repaired in place before the next
-append, with the original saved as `<part>.damaged-<time>`), an unreadable
+append or scrub, with the original saved as `<part>.damaged-<time>`), an unreadable
 part, and a delimiter or encoding argument that conflicts with the extension.
 
 ## Breaking changes from 3.39
@@ -227,7 +227,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
 | C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line. |
-| C11 | The table shows control characters as escapes (`\r`, `\n`, `\t`, `\xNN`), so no value can move the cursor or restyle the terminal, and it sizes columns in terminal columns, so CJK text (two columns a character) lines up. |
+| C11 | The table shows control characters, bidi controls and line separators as escapes (`\r`, `\n`, `\t`, `\xNN`, `\uNNNN`), so no value can move the cursor, reorder the line or restyle the terminal. It sizes columns in terminal columns, so CJK text (two columns a character) lines up. The table is for reading: a backslash in a value is shown as is, so use records for exact values. |
 
 ## Spec deviations and interpretations
 

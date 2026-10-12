@@ -212,26 +212,28 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	def table_width(col_widths, sep_len):
 		# total width = sum of column widths + separators between columns
 		return sum(col_widths) + sep_len * (len(col_widths) - 1)
-	def truncate_to_width(s, width):
-		# A cell wider than ``width`` keeps what fits in width - 2 columns, then "..".
-		# Color codes are kept: they take no columns.
-		if visible_len(s) <= width:
-			return s
-		if width <= 0:
-			return ""
-		limit, used, out = max(width - 2, 0), 0, []
+	def cut(s, width):
+		# The characters that fit in ``width`` columns, and every color code.
+		used, out = 0, []
 		for i, piece in enumerate(ansi.split(s)):
 			if i % 2:
 				out.append(piece)
 				continue
 			for ch in piece:
 				w = char_width(ch)
-				if used + w > limit:
-					limit = -1  # full: no further characters
+				if used + w > width:
+					width = -1  # full: no further characters
 					break
 				out.append(ch)
 				used += w
-		return "".join(out) + ".."[:width - used]
+		return "".join(out)
+	def truncate_to_width(s, width):
+		# A cell wider than ``width`` keeps what fits in width - 2 columns, then "..".
+		if visible_len(s) <= width:
+			return s
+		if width < 2:
+			return "."[:max(width, 0)]
+		return cut(s, width - 2) + ".."
 	if not data:
 		return ""
 	# Normalize input data structure
@@ -1078,7 +1080,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 	bool: True if the file exists, False otherwise.
 	"""
 	delimiter = get_delimiter(delimiter, file_name=fileName)
-	remainingFileName, _ ,extenstionName = fileName.rpartition('.')
+	remainingFileName, _ ,extenstionName = fileName.lower().rpartition('.')
 	if extenstionName in COMPRESSED_FILE_EXTENSIONS:
 		remainingFileName, _ ,extenstionName = remainingFileName.rpartition('.')
 	if delimiter and delimiter == '\t' and not extenstionName == 'tsv':
@@ -2099,7 +2101,8 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 			data[key] = offset
 		else:
 			data[key] = row
-	if headerPending and not (result.infos and result.infos[0].unreadable):  # an unreadable part 0 hides the header
+	if headerPending and not (result.infos and (result.infos[0].unreadable or result.infos[0].damaged)):
+		# part 0 could not be read, or was damaged before any line: there is no header to compare
 		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
 	result.correctColumnNum = width
 	return result
@@ -2592,6 +2595,11 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 				return taskDic, False
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
+			info = load.infos[0]
+			if info.codec and (info.damaged or info.tail):
+				# Keep the damaged bytes (<part>.damaged-<time>), as an append does, then compact what was read.
+				_specRepairCompressed(load.parts[0], reporter)
+				continue
 			state = load.state
 			rows = [_specScrubCells(row, state) for row in taskDic.values()]
 			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
@@ -6222,16 +6230,18 @@ def _cliFormat(args, stdout):
 		return 'records'
 
 
-_CLI_CONTROL_RE = re.compile('[\x00-\x1f\x7f-\x9f]')
+#: Control characters, plus the bidi controls and line separators a terminal may act on (Trojan Source).
+_CLI_CONTROL_RE = re.compile('[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 _CLI_CONTROL_ESCAPES = {'\t': '\\t', '\n': '\\n', '\r': '\\r'}
 
 
 def _cliTableCells(rows):
-	"""``rows`` as a table shows them: control characters as ``\\r``, ``\\n``, ``\\t`` or ``\\xNN``,
-	so no cell moves the cursor or sends the terminal an escape sequence."""
+	"""``rows`` as a table shows them: control characters as ``\\r``, ``\\n``, ``\\t``, ``\\xNN`` or
+	``\\uNNNN``, so no cell moves the cursor, reorders the line or sends the terminal an escape sequence.
+	The table is for reading; records are exact (a backslash in a value is not escaped here)."""
 	def escape(match):
 		ch = match.group()
-		return _CLI_CONTROL_ESCAPES.get(ch) or '\\x{:02x}'.format(ord(ch))
+		return _CLI_CONTROL_ESCAPES.get(ch) or ('\\x{:02x}' if ch < '\u0100' else '\\u{:04x}').format(ord(ch))
 	return [[_CLI_CONTROL_RE.sub(escape, str(cell)) for cell in row] for row in rows]
 
 
