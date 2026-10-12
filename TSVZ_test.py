@@ -276,6 +276,7 @@ def test_version_is_4_1():
 # ==========================================================================
 import contextlib
 import gzip
+import zlib
 import io
 import random
 import subprocess
@@ -1212,13 +1213,15 @@ def test_spec_tail_check_finds_a_damaged_last_member(tmp_path, suffix):
 		pytest.skip('no {} support in this Python'.format(suffix))
 	def member(data):
 		return TSVZ._compressBytes(suffix, data)
+
+	def damaged(content):
+		_touch(p, content)
+		with open(p, 'rb') as f:
+			return TSVZ._specTailDamaged(p, f)
 	p = str(tmp_path / ('m.tsvz.' + suffix))
-	_touch(p, member(b'a\t1\n') + member(b'b\t2\n'))
-	assert not TSVZ._specTailDamaged(p)
-	_touch(p, member(b'a\t1\n') + member(b'b\t2\n')[:-3])  # cut short, as a crash leaves it
-	assert TSVZ._specTailDamaged(p)
-	_touch(p, member(b'a\t1\n') + member(b'b\t2\n') + b'junk')
-	assert TSVZ._specTailDamaged(p)
+	assert not damaged(member(b'a\t1\n') + member(b'b\t2\n'))
+	assert damaged(member(b'a\t1\n') + member(b'b\t2\n')[:-3])  # cut short, as a crash leaves it
+	assert damaged(member(b'a\t1\n') + member(b'b\t2\n') + b'junk')
 
 
 def test_engine_append_after_a_damaged_compressed_part_stays_readable(tmp_path):
@@ -1230,12 +1233,44 @@ def test_engine_append_after_a_damaged_compressed_part_stays_readable(tmp_path):
 	assert set(TSVZ.readTabularFile(p)) == {'a', 'b', 'c'}
 
 
-def test_spec_read_keeps_records_before_the_damage_in_the_same_chunk(tmp_path):
-	# Member b lost the end of its trailer, so the next member's header is read as b's length: the
-	# decompressor fails there, after b's records, which a reader keeps.
+def _crc_only_flip(member):
+	"""A copy of gzip ``member`` with one bit flipped that only its checksum catches."""
+	for pos in range(10, len(member) - 8):
+		for bit in range(8):
+			bad = bytearray(member)
+			bad[pos] ^= 1 << bit
+			try:
+				zlib.decompressobj(wbits=47).decompress(bytes(bad))
+			except zlib.error as e:
+				if 'incorrect data check' in str(e):
+					return bytes(bad)
+	raise AssertionError('no bit flip that only the checksum catches')
+
+
+def test_spec_a_member_that_fails_its_checksum_is_not_repaired_into_the_store(tmp_path, monkeypatch):
+	# Its decoded bytes are wrong somewhere; re-compressing them would give them a valid checksum.
+	bad = _crc_only_flip(gzip.compress(b''.join(b'key%05d\tv\n' % i for i in range(2000))))
 	p = str(tmp_path / 'm.tsvz.gz')
-	_touch(p, gzip.compress(b'a\t1\n') + gzip.compress(b'b\t2\n')[:-4] + gzip.compress(b'c\t3\n'))
-	assert set(TSVZ.readTabularFile(p)) == {'a', 'b'}
+	_touch(p, gzip.compress(b'a\t1\n') + bad)
+	assert set(TSVZ.readTabularFile(p)) == {'a'}
+	monkeypatch.setattr(TSVZ, '_CHUNK', 64)  # small reads: a reader streams the member's output before the check
+	TSVZ.scrubTabularFile(p)
+	with open(p, 'rb') as f:
+		assert b'key' not in gzip.decompress(f.read())
+
+
+def test_spec_repair_keeps_records_appended_after_damage_the_tail_check_missed(tmp_path):
+	# A crash cut a member longer than the tail window: an append cannot see it and lands after it.
+	# The repair keeps the cut member's whole lines (spec 16.6) and the records appended after it.
+	p = str(tmp_path / 'm.tsvz.gz')
+	big = gzip.compress(b''.join(b'k%05d\t%s\n' % (i, os.urandom(8).hex().encode()) for i in range(8000)))
+	assert len(big) - 1000 > TSVZ._TAIL_WINDOW  # the cut member starts outside the window
+	_touch(p, gzip.compress(b'a\t1\n') + big[:-1000])
+	TSVZ.appendLinesTabularFile(p, [['new', 'row']])
+	assert 'new' not in TSVZ.readTabularFile(p)  # behind the damage, until a repair
+	TSVZ.scrubTabularFile(p)
+	after = TSVZ.readTabularFile(p)
+	assert after['new'] == ['new', 'row'] and 'a' in after and 'k00000' in after
 
 
 def test_spec_strict_scrub_of_a_part_damaged_before_any_line(tmp_path, capsys):
@@ -1281,6 +1316,17 @@ def test_spec_repair_leaves_no_partial_backup_when_the_copy_fails(tmp_path, monk
 	assert os.listdir(str(tmp_path)) == ['m.tsvz.gz']
 	with open(p, 'rb') as f:
 		assert f.read() == raw
+
+
+def test_spec_scrub_does_not_claim_a_repair_that_found_the_part_intact(tmp_path, monkeypatch, capsys):
+	# The unlocked read raced an append in flight; under the lock the part was whole and nothing was written.
+	monkeypatch.setattr(TSVZ, '_specRepairCompressed', lambda path, reporter: False)
+	monkeypatch.setattr(TSVZ, '_SPEC_REWRITE_ATTEMPTS', 2)
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'a\t1\n') + GZ_TRUNCATED_B)
+	assert TSVZ._specScrub(p, delimiter='\t')[1] is False
+	err = capsys.readouterr().err
+	assert 'nothing was written' in err and 'repaired' not in err
 
 
 def test_spec_read_stopped_by_an_io_error_counts_as_unreadable(tmp_path, monkeypatch, capsys):
@@ -2821,6 +2867,10 @@ def test_pretty_format_table_without_a_header():
 def test_pretty_format_table_without_a_header_drops_dict_keys():
 	assert TSVZ.pretty_format_table([{'k': 'a', 'v': '1'}], header=False, full=True) == 'a | 1\n'
 	assert TSVZ.pretty_format_table({'a': {'v': '1'}}, header=False, full=True) == 'a | 1\n'
+
+
+def test_pretty_format_table_with_a_header_drops_dict_keys():
+	assert TSVZ.pretty_format_table([{'a': 1, 'b': 2}], header=['A', 'B'], full=True) == 'A | B\n--+--\n1 | 2\n'
 
 
 def test_pretty_format_table_pads_wide_characters_by_display_width():

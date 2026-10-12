@@ -177,7 +177,10 @@ Examples: bytes after the last newline (ignored on read; truncated before the
 next append, and quoted), invalid UTF-8, a byte order mark, a newer
 `#_version_#`, a marker with a bad value, a checksum mismatch, a damaged
 compressed part (read up to the damage; repaired in place before the next
-append or scrub, with the original saved as `<part>.damaged-<time>`), an unreadable
+append or scrub, with the original saved as `<part>.damaged-<time>`; a repair
+keeps what the codec verified, the whole lines of a member cut short, and
+complete members found after the damage; an append checks only the part's
+last 64 KiB, so damage further back waits for the next load or scrub), an unreadable
 part, and a delimiter or encoding argument that conflicts with the extension.
 
 ## Breaking changes from 3.39

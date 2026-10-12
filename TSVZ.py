@@ -51,22 +51,20 @@ DEFAULTS_INDICATOR_KEY = '#_defaults_#'
 #: Compression suffix -> codec name (spec §16.2). Code dispatches on the name, so each spelling of a codec acts alike.
 _CODEC_NAMES = {'gz': 'gzip', 'gzip': 'gzip', 'bz2': 'bzip2', 'bzip2': 'bzip2', 'xz': 'xz', 'lzma': 'xz', 'zst': 'zstd', 'zstd': 'zstd'}
 COMPRESSED_FILE_EXTENSIONS = list(_CODEC_NAMES)
-#: Codec name -> the keyword its module's open() and compress() take for the compression level.
-_CODEC_LEVEL_KEYWORD = {'gzip': 'compresslevel', 'bzip2': 'compresslevel', 'xz': 'preset', 'zstd': 'level'}
+#: Codec name -> (its module, the module's decompressor class, the keyword open() and compress() take for
+#: the level, the bytes each member begins with). gzip members are decompressed with zlib, one at a time.
+_CODECS = {
+	'gzip': ('gzip', None, 'compresslevel', b'\x1f\x8b\x08'),
+	'bzip2': ('bz2', 'BZ2Decompressor', 'compresslevel', b'BZh'),
+	'xz': ('lzma', 'LZMADecompressor', 'preset', b'\xfd7zXZ\x00'),
+	'zstd': ('compression.zstd', 'ZstdDecompressor', 'level', b'\x28\xb5\x2f\xfd'),  # Python 3.14+
+}
 
 
 def _codecModule(codec):
-	"""The module for ``codec`` (a suffix or a name): gzip, bz2, lzma or compression.zstd (Python 3.14+)."""
-	name = _CODEC_NAMES.get(codec, codec)
-	if name == 'gzip':
-		import gzip as module
-	elif name == 'bzip2':
-		import bz2 as module
-	elif name == 'xz':
-		import lzma as module
-	else:
-		from compression import zstd as module
-	return module
+	"""The module for ``codec`` (a suffix or a name): gzip, bz2, lzma or compression.zstd."""
+	import importlib
+	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
 
 def _isCompressedFile(fileName):
 	return fileName.rpartition('.')[2].lower() in COMPRESSED_FILE_EXTENSIONS
@@ -146,7 +144,7 @@ def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None
 		mode += 't'
 	kwargs = {}
 	if 'r' not in mode:
-		kwargs[_CODEC_LEVEL_KEYWORD.get(codec, 'compresslevel')] = compressLevel
+		kwargs[_CODECS[codec][2] if codec else 'compresslevel'] = compressLevel
 	if 'b' not in mode:
 		kwargs['encoding'] = encoding
 	if codec:
@@ -245,7 +243,7 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 		data = [line.split(delimiter) for line in data]
 	elif isinstance(data, dict):
 		if isinstance(next(iter(data.values())), dict):
-			tempData = [["key"] + list(next(iter(data.values())).keys())] if header is not False else []
+			tempData = [["key"] + list(next(iter(data.values())).keys())] if header is None else []
 			tempData.extend([[key] + list(value.values()) for key, value in data.items()])
 			data = tempData
 		else:
@@ -253,7 +251,7 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	elif not isinstance(data, list):
 		data = list(data)
 	if isinstance(data[0], dict):
-		tempData = [list(data[0].keys())] if header is not False else []
+		tempData = [list(data[0].keys())] if header is None else []
 		tempData.extend([list(item.values()) for item in data])
 		data = tempData
 	data = [[str(item) for item in row] for row in data]
@@ -736,7 +734,7 @@ def _requireCodec(codec):
 def _compressBytes(codec, data, level=1):
 	"""Compress ``data`` as one complete member / stream for ``codec``."""
 	_requireCodec(codec)
-	return _codecModule(codec).compress(data, **{_CODEC_LEVEL_KEYWORD[_CODEC_NAMES.get(codec, codec)]: level})
+	return _codecModule(codec).compress(data, **{_CODECS[_CODEC_NAMES.get(codec, codec)][2]: level})
 
 
 def _dirMtimeNs(path):
@@ -1758,6 +1756,7 @@ class _PartInfo(object):
 		self.damaged = ''
 		self.unreadable = False  # the part could not be opened, or this Python lacks its codec
 		self.goodRawEnd = 0
+		self.goodOut = 0  # decompressed bytes up to goodRawEnd
 		self.committed = 0  # bytes of committed lines read (decompressed bytes for a compressed part)
 		self.lines = 0  # committed lines replayed (set by _specReplay)
 
@@ -1767,43 +1766,7 @@ def _newDecompressor(codec):
 	if name == 'gzip':
 		import zlib
 		return zlib.decompressobj(wbits=47)  # one gzip member; the caller starts the next
-	module = _codecModule(name)
-	if name == 'bzip2':
-		return module.BZ2Decompressor()
-	if name == 'xz':
-		return module.LZMADecompressor()
-	return module.ZstdDecompressor()
-
-
-def _salvageMember(f, codec, start, end):
-	"""What the member at raw offsets [start, end) of ``f`` decompresses to before its damage.
-
-	A decompressor that raises drops the output of the call that raised, so the
-	member is decompressed again in small pieces, and the piece that fails one
-	byte at a time.
-	"""
-	step = 1 << 16
-	def feed(sizes):
-		decompressor = _newDecompressor(codec)
-		out = []
-		fed = 0
-		f.seek(start)
-		for size in sizes:
-			piece = f.read(size)
-			if not piece:
-				break
-			try:
-				out.append(decompressor.decompress(piece))
-			except Exception:
-				return b''.join(out), fed
-			fed += len(piece)
-			if decompressor.eof:
-				break
-		return b''.join(out), None
-	out, failed = feed([step] * ((end - start) // step + 1))
-	if failed is not None:
-		out = feed([step] * (failed // step) + [1] * step)[0]
-	return out
+	return getattr(_codecModule(name), _CODECS[name][1])()
 
 
 def _decompressChunks(f, info):
@@ -1812,14 +1775,15 @@ def _decompressChunks(f, info):
 	Zero padding between gzip members is skipped, as Python's gzip module does.
 	A truncated trailing member still yields what it decompresses to
 	(``info.damaged = 'truncated'``); a corrupt member ends the stream
-	(``'corrupt (...)'``) after what it decompressed to before the damage.
-	``info.goodRawEnd`` is the raw offset after the last complete member.
+	(``'corrupt (...)'``), and the output of the read that failed its checks
+	is dropped. ``info.goodRawEnd`` is the raw offset after the last complete
+	member, and ``info.goodOut`` the output up to it: what the codec verified.
 	"""
 	decompressor = _newDecompressor(info.codec)
 	isGzip = _CODEC_NAMES.get(info.codec) == 'gzip'
 	rawPos = 0
 	inMember = False
-	memberStart = memberOut = 0
+	outPos = 0
 	pending = b''
 	while True:
 		chunk = pending or f.read(_CHUNK)
@@ -1832,24 +1796,20 @@ def _decompressChunks(f, info):
 			if not stripped:
 				continue
 			chunk = stripped
-		if not inMember:
-			memberStart, memberOut = rawPos, 0
 		inMember = True
 		try:
 			out = decompressor.decompress(chunk)
 		except Exception as e:
 			info.damaged = 'corrupt ({})'.format(e)
-			out = _salvageMember(f, info.codec, memberStart, rawPos + len(chunk))[memberOut:]
-			if out:
-				yield out
 			return
 		if out:
-			memberOut += len(out)
+			outPos += len(out)
 			yield out
 		if decompressor.eof:
 			pending = decompressor.unused_data
 			rawPos += len(chunk) - len(pending)
 			info.goodRawEnd = rawPos
+			info.goodOut = outPos
 			inMember = False
 			decompressor = _newDecompressor(info.codec)
 		else:
@@ -2247,76 +2207,110 @@ def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=F
 	return taskDic
 
 
+def _specRecoverMembers(raw, codec):
+	"""What a repair keeps of ``raw``, the bytes from a damaged member on, in order; whole lines only.
+
+	Later members are found by their magic bytes and kept when they decode to
+	their end, so the codec checked them; a last one cut short keeps what it
+	decoded, as a reader keeps it (spec §16.6). The damaged member itself, up to
+	the next member, is kept the same way when it is merely cut short (a crash,
+	then appends after it), and dropped when it fails its checks.
+	"""
+	name = _CODEC_NAMES[codec]
+	magic = _CODECS[name][3]
+	found = []
+	first = None
+	pos = raw.find(magic, 1)  # the damaged member starts at 0
+	while pos >= 0:
+		decompressor = _newDecompressor(name)
+		try:
+			out = decompressor.decompress(raw[pos:])
+		except Exception:
+			pos = raw.find(magic, pos + 1)
+			continue
+		if not decompressor.eof and not out:
+			pos = raw.find(magic, pos + 1)  # magic bytes inside other data
+			continue
+		if first is None:
+			first = pos
+		found.append(out[:out.rfind(b'\n') + 1])
+		if not decompressor.eof:
+			break
+		pos = raw.find(magic, len(raw) - len(decompressor.unused_data))
+	damaged = raw[:first] if first is not None else raw
+	if name == 'gzip':
+		damaged = damaged.lstrip(b'\0')
+	try:
+		out = _newDecompressor(name).decompress(damaged)
+	except Exception:
+		out = b''  # it failed its checks: what it decoded may be wrong
+	return [out[:out.rfind(b'\n') + 1]] + found
+
+
+def _specRepairLocked(f, path, reporter):
+	"""``_specRepairCompressed`` on ``f``, the part opened 'r+b' under its locks."""
+	info = _PartInfo(path)
+	f.seek(0)
+	content = b''.join(_decompressChunks(f, info))
+	recovered = []
+	if info.damaged:
+		# Keep what the codec verified, then sort out the damaged member and what follows it: output
+		# from a member that failed its checks may be wrong, and re-compressing it would give it a valid
+		# checksum; a member cut short may have had members appended after it, which a reader decodes
+		# as more of it.
+		content = content[:info.goodOut]
+		f.seek(info.goodRawEnd)
+		recovered = _specRecoverMembers(f.read(), info.codec)
+	keep = content[:content.rfind(b'\n') + 1]
+	if not info.damaged and len(keep) == len(content):
+		return False
+	first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+	suffix = 0
+	while True:
+		try:
+			copy = open(backup, 'xb')  # never overwrite an earlier backup
+			break
+		except FileExistsError:
+			suffix += 1
+			backup = '{}.{}'.format(first, suffix)
+	try:
+		with copy:
+			f.seek(0)
+			shutil.copyfileobj(f, copy)
+			copy.flush()
+			os.fsync(copy.fileno())  # the backup is durable before the part is overwritten
+	except BaseException:
+		os.remove(backup)  # a partial copy is no backup; the part is untouched
+		raise
+	keep += b''.join(recovered)
+	raw = _compressBytes(info.codec, keep) if keep else b''
+	f.seek(0)
+	f.write(raw)
+	f.truncate()
+	f.flush()
+	os.fsync(f.fileno())
+	message = 'repaired a damaged compressed part in place; the original bytes are in {}'.format(backup)
+	if any(recovered[1:]):
+		message += '; records found after the damage were kept'
+	reporter.note('repaired', None, message)
+	return True
+
+
 def _specRepairCompressed(path, reporter):
-	"""Re-encode a damaged compressed part in place, keeping every committed record.
+	"""Re-encode a damaged compressed part in place, keeping every record the codec verified.
 
 	The original raw bytes are first copied to a new file
 	``<path>.damaged-<timestamp>`` (``.1``, ``.2``, ... appended when that name
-	is taken) and synced to disk. Returns False when the part turned out to be
-	intact.
+	is taken) and synced to disk. Complete members after a corrupt one (records
+	appended after the damage) are kept too. Returns False when the part turned
+	out to be intact.
 	"""
-	info = _PartInfo(path)
-	_requireCodec(info.codec)  # a part this Python cannot decode is not damaged; it is left alone
+	_requireCodec(_parsePartName(path).codec)  # a part this Python cannot decode is not damaged; it is left alone
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
 			_lockFile(f)
 			try:
-				content = b''.join(_decompressChunks(f, info))
-				keep = content[:content.rfind(b'\n') + 1]
-				if not info.damaged and len(keep) == len(content):
-					return False
-				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
-				suffix = 0
-				while True:
-					try:
-						copy = open(backup, 'xb')  # never overwrite an earlier backup
-						break
-					except FileExistsError:
-						suffix += 1
-						backup = '{}.{}'.format(first, suffix)
-				try:
-					with copy:
-						f.seek(0)
-						shutil.copyfileobj(f, copy)
-						copy.flush()
-						os.fsync(copy.fileno())  # the backup is durable before the part is overwritten
-				except BaseException:
-					os.remove(backup)  # a partial copy is no backup; the part is untouched
-					raise
-				raw = _compressBytes(info.codec, keep) if keep else b''
-				f.seek(0)
-				f.write(raw)
-				f.truncate()
-				f.flush()
-				os.fsync(f.fileno())
-			finally:
-				_unlockFile(f)
-	reporter.note('repaired', None, 'repaired a damaged compressed part in place; the original bytes are in {}'.format(backup))
-	return True
-
-
-def _specAppendPayload(path, payload, reporter, repair=False, fsync=False):
-	"""Append whole records to a spec part (design §5.4).
-
-	Uncompressed: an uncommitted tail is truncated first. Compressed: the
-	payload becomes a new member, after ``_specRepairCompressed`` when
-	``repair`` is set. A missing part is created.
-	"""
-	codec = _parsePartName(path).codec
-	if not codec:
-		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
-		return
-	_requireCodec(codec)
-	if repair and os.path.exists(path):
-		_specRepairCompressed(path, reporter)
-	with _pathLock(path):
-		with open(path, 'ab') as f:
-			_lockFile(f)
-			try:
-				f.write(_compressBytes(codec, payload))
-				f.flush()
-				if fsync:
-					os.fsync(f.fileno())
+				return _specRepairLocked(f, path, reporter)
 			finally:
 				_unlockFile(f)
 
@@ -2326,46 +2320,88 @@ _TAIL_WINDOW = 1 << 16
 #: The most a damage check decodes from that member before it calls the answer unknown.
 _TAIL_OUTPUT_LIMIT = 1 << 20
 
-#: The bytes each codec's members begin with (gzip: ID1 ID2 and CM = deflate).
-_CODEC_MAGIC = {'gzip': b'\x1f\x8b\x08', 'bzip2': b'BZh', 'xz': b'\xfd7zXZ\x00', 'zstd': b'\x28\xb5\x2f\xfd'}
 
-
-def _specTailDamaged(path):
+def _specTailDamaged(path, f):
 	"""True when a compressed part provably ends in a damaged member, as a crash during an append leaves it.
 
-	Only the last ``_TAIL_WINDOW`` bytes are read and at most
-	``_TAIL_OUTPUT_LIMIT`` bytes decoded, so an append costs the same whatever
-	the part's size. The last member is found by its magic bytes. When no
-	member starts in the window, or it decodes to more than the limit, nothing
-	is proven: False.
+	``f`` is the part, open for reading. Only its last ``_TAIL_WINDOW`` bytes
+	are read and at most ``_TAIL_OUTPUT_LIMIT`` bytes decoded, so the check
+	costs the same whatever the part's size. The last member is found by its
+	magic bytes. When no member starts in the window, or it decodes to more
+	than the limit, nothing is proven: False. Damage further back is found by a
+	full read (a load, a scrub).
 	"""
 	name = _CODEC_NAMES[_parsePartName(path).codec]
 	if not _codecSupported(name):
 		return False  # the write that follows refuses it (spec §16.5)
-	try:
-		with open(path, 'rb') as f:
-			f.seek(0, os.SEEK_END)
-			f.seek(max(0, f.tell() - _TAIL_WINDOW))
-			tail = f.read()
-	except OSError:
-		return False
+	f.seek(0, os.SEEK_END)
+	f.seek(max(0, f.tell() - _TAIL_WINDOW))
+	tail = f.read()
 	end = len(tail)
 	while True:
-		start = tail.rfind(_CODEC_MAGIC[name], 0, end)
+		start = tail.rfind(_CODECS[name][3], 0, end)
 		if start < 0:
 			return False
 		end = start
 		decompressor = _newDecompressor(name)
 		try:
-			decompressor.decompress(tail[start:], _TAIL_OUTPUT_LIMIT)
+			out = decompressor.decompress(tail[start:], _TAIL_OUTPUT_LIMIT)
 		except Exception:
 			continue  # magic bytes inside compressed data, or a corrupt member: look further back
 		if decompressor.eof:
 			left = decompressor.unused_data  # bytes after the last complete member
 			return bool(left.strip(b'\0') if name == 'gzip' else left)  # readers skip zero padding after gzip
+		if not out:
+			continue  # a header that never ends is more likely magic bytes inside data: look further back
 		if name == 'gzip':
 			return not decompressor.unconsumed_tail  # all input taken and the member never ended
 		return decompressor.needs_input
+
+
+def _specAppendPayload(path, payload, reporter, repair=False, checkTail=False, fsync=False):
+	"""Append whole records to a spec part (design §5.4).
+
+	Uncompressed: an uncommitted tail is truncated first. Compressed: the
+	payload becomes a new member. Under the part's lock, the part is repaired
+	first when ``repair`` is set, or when ``checkTail`` is set and its tail
+	shows damage (``_specTailDamaged``, which reads a bounded tail). A missing
+	part is created.
+	"""
+	codec = _parsePartName(path).codec
+	if not codec:
+		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
+		return
+	_requireCodec(codec)
+	member = _compressBytes(codec, payload)
+	with _pathLock(path):
+		if repair or checkTail:
+			try:
+				f = open(path, 'r+b')
+			except FileNotFoundError:
+				f = None
+			if f is not None:
+				with f:
+					_lockFile(f)
+					try:
+						if repair or _specTailDamaged(path, f):
+							_specRepairLocked(f, path, reporter)
+						f.seek(0, os.SEEK_END)
+						f.write(member)
+						f.flush()
+						if fsync:
+							os.fsync(f.fileno())
+					finally:
+						_unlockFile(f)
+				return
+		with open(path, 'ab') as f:
+			_lockFile(f)
+			try:
+				f.write(member)
+				f.flush()
+				if fsync:
+					os.fsync(f.fileno())
+			finally:
+				_unlockFile(f)
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -2512,10 +2548,8 @@ def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), c
 	if any(header) and verifyHeader:
 		_specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger)
 	_, active = _storeParts(fileName, reporter)
-	# A member appended after a damaged one is out of every reader's reach: repair first. Only the
-	# part's tail is checked, so the append costs the same whatever the part's size.
-	repair = bool(_parsePartName(active).codec) and os.path.exists(active) and _specTailDamaged(active)
-	_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter, repair=repair)
+	# A member appended after a damaged one is out of every reader's reach: the tail is checked first.
+	_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter, checkTail=True)
 	if verbose:
 		__teePrintOrNot(f"Appended {len(records)} lines to {fileName}",teeLogger=teeLogger)
 	return True
@@ -2558,7 +2592,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				if tombstones:
 					info = load.infos[-1]
 					_specAppendPayload(load.active, tombstones.encode('utf-8'), attempt,
-									   repair=bool(info.codec and (info.damaged or info.tail)))
+									   repair=bool(info.codec and (info.damaged or info.tail)), checkTail=True)
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
 				cleared = True
 				break
@@ -2688,14 +2722,15 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if info.codec and (info.damaged or info.tail):
 				# Keep the damaged bytes (<part>.damaged-<time>), as an append does, then compact what was read.
 				try:
-					_specRepairCompressed(load.parts[0], reporter)
+					fixed = _specRepairCompressed(load.parts[0], reporter)
 				except OSError as e:
 					attempt.note('refused', None, 'scrub skipped: the damaged part could not be repaired ({}); nothing was written'.format(e))
 					return taskDic, False
-				if not repaired:
-					tries -= 1  # the first repair is not a failed attempt
-				repaired = True
-				continue
+				if fixed:
+					if not repaired:
+						tries -= 1  # the first repair is not a failed attempt
+					repaired = True
+				continue  # read again: repaired, or found whole under the lock (the read raced an append)
 			state = load.state
 			rows = [_specScrubCells(row, state) for row in taskDic.values()]
 			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
@@ -3324,7 +3359,7 @@ class TSVZed(OrderedDict):
 			payload = ''.join(item + '\n' for item in items).encode('utf-8', errors='replace')
 			info = self._activeInfo
 			repair = bool(self._forceRepair or (info is not None and info.codec and (info.damaged or info.tail)))
-			_specAppendPayload(self._activePath, payload, reporter, repair=repair, fsync=True)
+			_specAppendPayload(self._activePath, payload, reporter, repair=repair, checkTail=True, fsync=True)
 			self._forceRepair = False
 			self._activeInfo = None
 			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
@@ -4157,9 +4192,14 @@ class TSVZedLite(MutableMapping):
 		data = (line + '\n').encode('utf-8', errors='replace')
 		if self.fileObj is None:
 			reporter = _Reporter(self._activePath)
-			_specAppendPayload(self._activePath, data, reporter, repair=self._pendingRepair)
+			try:
+				_specAppendPayload(self._activePath, data, reporter, repair=self._pendingRepair, checkTail=True)
+			except Exception:
+				self._pendingRepair = True  # a failed append may have left a torn member
+				raise
+			finally:
+				reporter.flush()
 			self._pendingRepair = False
-			reporter.flush()
 			return None
 		f = self.fileObj
 		with _pathLock(self._activePath):
@@ -4796,6 +4836,7 @@ class _ServeStore(object):
 		self.data = OrderedDict()
 		self.unreadable = False
 		self.pendingRepair = False  # the active part is a damaged compressed part: repair before appending
+		self.repairLock = threading.Lock()  # pendingRepair is set by reload and taken by the writer thread
 		if create:
 			self._create(header, self.defaults if createDefaults is None else createDefaults)
 		self.reload(teeLogger)
@@ -4849,7 +4890,8 @@ class _ServeStore(object):
 			self.parts = load.parts
 			self.stamps = {}
 		info = load.infos[-1] if load.infos else None
-		self.pendingRepair = bool(info is not None and info.codec and (info.damaged or info.tail))
+		with self.repairLock:
+			self.pendingRepair = bool(info is not None and info.codec and (info.damaged or info.tail))
 		self.offset = info.committed if info is not None else 0
 		self.lineNo = info.lines if info is not None else 0
 		self.tailSeen = info.tail if info is not None else b''
@@ -5163,8 +5205,15 @@ class _ServeStore(object):
 		reporter = _Reporter(self.path, self.teeLogger)
 		try:
 			if self.spec:
-				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, repair=self.pendingRepair, fsync=fsync)
-				self.pendingRepair = False
+				with self.repairLock:
+					repair, self.pendingRepair = self.pendingRepair, False
+				try:
+					_specAppendPayload(_storeParts(self.path)[1], payload, reporter, repair=repair, checkTail=True,
+									   fsync=fsync)
+				except Exception:
+					with self.repairLock:
+						self.pendingRepair = True  # a failed append may have left a torn member
+					raise
 			elif _isCompressedFile(self.path):
 				with openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger) as f:
 					f.write(payload)
