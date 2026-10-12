@@ -78,9 +78,9 @@ t.close()
 
 | Language | Package | Read | Write | CLI §20 | Handler §21 | Version | Links |
 |---|---|---|---|---|---|---|---|
-| Python (reference) | `tsvz` on PyPI | ✓ | ✓ | ✓ | ✓ | 4.3+ | [GitHub](https://github.com/yufei-pan/TSVZ) · [PyPI](https://pypi.org/project/TSVZ/) · [Notes](https://github.com/yufei-pan/TSVZ#spec-deviations-and-interpretations) |
+| Python (reference) | `tsvz` on PyPI | ✓ | ✓ | ✓ | ✓ | 4.4+ | [GitHub](https://github.com/yufei-pan/TSVZ) · [PyPI](https://pypi.org/project/TSVZ/) · [Notes](https://github.com/yufei-pan/TSVZ#spec-deviations-and-interpretations) |
 
-TSVZ 4.2 is the first Python release that follows spec v1, and 4.3 the first
+TSVZ 4.2 is the first Python release that follows spec v1, and 4.4 the first
 that passes the whole conformance suite. Earlier releases (3.x) read `.tsvz`
 files under older rules.
 
