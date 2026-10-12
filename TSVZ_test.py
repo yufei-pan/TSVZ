@@ -1020,6 +1020,8 @@ def test_spec_bz2_and_xz_parts(tmp_path):
 def test_spec_part_in_an_unsupported_codec_is_unreadable_and_never_repaired(tmp_path, monkeypatch):
 	# Spec §16.5: a reader without a part's codec fails; it neither skips the part nor reads or repairs its bytes.
 	monkeypatch.setitem(sys.modules, 'compression.zstd', None)
+	if 'compression' in sys.modules:  # Python 3.14+: an earlier import left zstd as an attribute of the package
+		monkeypatch.delattr(sys.modules['compression'], 'zstd', raising=False)
 	z = str(tmp_path / 'a.tsvz.zst')
 	raw = b'\x28\xb5\x2f\xfdjunk'
 	_touch(z, raw)
