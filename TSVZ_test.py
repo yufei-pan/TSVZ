@@ -833,7 +833,7 @@ def test_l3_tsvzedlite_hash_keys_are_readable(tmp_path):
 # ==========================================================================
 def test_spec_field_codec_roundtrip_every_variant():
 	for d in ('\t', ',', '\0', '|'):
-		for value in ['a' + d + 'b', '<sep>', '<LF>', 'a<b', '#x', 'x\ny', '<lt>', '<#>', '', 'é<中>']:
+		for value in ['a' + d + 'b', '<sep>', '<LF>', 'a<b', '#x', 'x\ny', '<lt>', '<#>', '', 'é<中>', 'c\rr', 'x\r', '<CR>']:
 			assert TSVZ._specDecodeField(TSVZ._specEncodeField(value, d), d) == value, (d, value)
 			assert TSVZ._specDecodeField(TSVZ._specEncodeField(value, d, isKey=True), d) == value, (d, value)
 
@@ -848,6 +848,8 @@ def test_spec_13_5_examples():
 	assert E('a<b', '\t') == 'a<lt>b'
 	assert D('<future>', '\t') == '<future>'
 	assert D('</sep/>', '\t') == '</sep/>'
+	assert E('a\rb', '\t') == 'a<CR>b' and E('x\r', '\t') == 'x<CR>' and E('<CR>', '\t') == '<lt>CR>'
+	assert D('a<CR>b', '\t') == 'a\rb' and D('<cr>', '\t') == '<cr>'
 
 
 def test_spec_format_record():

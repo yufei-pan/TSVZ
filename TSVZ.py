@@ -1488,8 +1488,8 @@ MAX_SPEC_VERSION = 1
 _MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
 _CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
 _ASCII_DIGITS_RE = re.compile(r'^[0-9]+$')
-_SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|lt|#)>')
-_SPEC_TOKENS = {'<LF>': '\n', '<lt>': '<', '<#>': '#'}
+_SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|CR|lt|#)>')
+_SPEC_TOKENS = {'<LF>': '\n', '<CR>': '\r', '<lt>': '<', '<#>': '#'}
 _RowState = namedtuple('_RowState', 'defaults strip fillEmpty')
 _BOOL_VALUES = {'true': True, 'yes': True, 'on': True, '1': True,
 				'false': False, 'no': False, 'off': False, '0': False}
@@ -1518,6 +1518,8 @@ def _specEncodeField(value, delimiter, isKey=False):
 		value = value.replace(delimiter, '<sep>')
 	if '\n' in value:
 		value = value.replace('\n', '<LF>')
+	if '\r' in value:
+		value = value.replace('\r', '<CR>')
 	if isKey and value.startswith('#'):
 		value = '<#>' + value[1:]
 	return value
