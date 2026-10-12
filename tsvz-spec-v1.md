@@ -103,7 +103,8 @@ guaranteed** to be of any fixed width; a reader MAY validate, pad, or trim.
 
 ## 4. File encoding and framing
 
-4.1 A file is encoded in **UTF-8** with no byte-order mark.
+4.1 A file is encoded in **UTF-8** with no byte-order mark. A writer **MUST NOT**
+write a byte-order mark.
 
 4.2 Records are separated by a line feed, `U+000A` (`\n`). A reader **MUST**
 tolerate a single carriage return (`U+000D`, `\r`) immediately preceding the
@@ -128,6 +129,11 @@ conditioned on "fails to parse" would admit corruption.)
 
 4.6 An empty file (zero bytes), and a file containing only comments and markers,
 are valid and represent an empty store.
+
+4.7 **Byte-order mark.** A reader **MUST** remove one UTF-8 byte-order mark (the
+bytes `EF BB BF`) at the start of each part before it frames records. The mark is
+not part of the part's first line, is not fed into any integrity accumulator
+(§15.4), and does not change line numbering. A reader MAY warn about it.
 
 > Recovery at §4.3–§4.5 handles truncation at end-of-file. Avoiding torn records
 > in the *middle* of a part is the writer's responsibility; see §18.

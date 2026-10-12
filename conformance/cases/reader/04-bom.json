@@ -1,0 +1,14 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "4.7-leading-bom-is-removed", "spec": ["4.7"], "level": "MUST",
+ "note": "A byte-order mark is not part of the first line, so the marker on that line still applies.",
+ "files": {"s.tsvz": "﻿#_fill_empty_with_default_#\ttrue\n#_defaults_#\td\na\t\n"},
+ "expect": {"read": [["a", "d"]], "len": 1, "keys": ["a"]}},
+{"id": "4.7-bom-is-removed-in-every-part", "spec": ["4.7", "17.4"], "level": "MUST",
+ "note": "Each part may start with its own byte-order mark; a later part's mark does not turn a comment into data.",
+ "files": {"s.tsvz": "a\tx\n", "s.tsvz.1": "﻿#c\tz\nb\ty\n"},
+ "expect": {"read": [["a", "x"], ["b", "y"]], "len": 2}},
+{"id": "4.7-only-a-leading-bom-is-removed", "spec": ["4.7"], "level": "MUST",
+ "note": "U+FEFF anywhere but the start of a part is ordinary data.",
+ "files": {"s.tsvz": "a\tx\n﻿b\ty\n"},
+ "expect": {"read": [["a", "x"], ["﻿b", "y"]], "keys": ["a", "﻿b"]}}
+]}
