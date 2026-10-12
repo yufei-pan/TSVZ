@@ -1654,7 +1654,7 @@ def test_spec_scrub_backs_up_again_when_the_part_changed(tmp_path, monkeypatch):
 
 def test_cli_stop_policy_fails_the_read_but_lets_scrub_rewrite(tmp_path):
 	# Spec §4.10 stop: the read fails (exit 1) and changes based on it are refused; a scrub may rewrite
-	# what was read, keeping the original bytes.
+	# what was read, keeping the original bytes, and still exits 1.
 	p = str(tmp_path / 's.tsvz')
 	raw = b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\nd\t4\n'
 	_touch(p, raw)
@@ -1663,7 +1663,7 @@ def test_cli_stop_policy_fails_the_read_but_lets_scrub_rewrite(tmp_path):
 	assert _run('clear', p)[0] == 1
 	with open(p, 'rb') as f:
 		assert f.read() == raw
-	assert _run('scrub', p)[0] == 0
+	assert _run('scrub', p)[0] == 1
 	assert TSVZ.readTabularFile(p) == {'a': ['a', '1']}
 	assert any(n.startswith('s.tsvz.damaged-') for n in os.listdir(str(tmp_path)))
 
@@ -1708,6 +1708,42 @@ def test_spec_decode_alone_tells_a_cut_member_from_a_corrupt_one():
 	assert not cutShort and 'incorrect data check' in error and out.endswith(b'k02999\tv\n')
 
 
+def test_engine_reloads_a_stopped_store_that_was_rewritten(tmp_path):
+	# Reading stopped at the zero-filled line, so a rewrite of the bytes before it must be noticed.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\nb\t2\n\0\0\0c\t3\nd\t4\n')
+	store = TSVZ._ServeStore(p, create=True)
+	assert store.stopped and store.offset > 0
+	TSVZ.scrubTabularFile(p)  # in place, same file: what was read, without the damage
+	store.sync(None)
+	assert not store.stopped and store.read(None) == [['a', '1'], ['b', '2']]
+	store.close()
+
+
+def test_lite_offset_after_a_byte_order_mark_and_zero_fill(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'\xef\xbb\xbf\0\0\0\0a\t1\n')
+	lite = TSVZ.TSVZedLite(p)
+	try:
+		assert lite['a'] == ['a', '1']
+	finally:
+		lite.close()
+
+
+def test_marker_values_fold_ascii_case_only(tmp_path):
+	# KELVIN SIGN lowercases to k under Unicode rules; spec §12.4.1 folds ASCII only, so 'sKip' is no policy.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, '#_on_corruption_#\ts\u212aip\na\t1\n\0\0c\t3\n'.encode('utf-8'))
+	assert set(TSVZ.readTabularFile(p)) == {'a', 'c'}
+
+
+def test_spec_a_byte_order_mark_after_dropped_bytes_is_data(tmp_path):
+	# Spec §4.7: only a mark at the start of a part's bytes is removed.
+	p = str(tmp_path / 'm.tsvz.gz')
+	_touch(p, gzip.compress(b'abc')[:-8] + gzip.compress(b'\xef\xbb\xbfk\t1\n'))
+	assert list(TSVZ.readTabularFile(p)) == ['\ufeffk']
+
+
 def test_spec_lite_clear_raises_when_the_clear_is_refused(tmp_path, monkeypatch):
 	# A refused clear leaves the store as it was; the caller is told, and memory still matches the store.
 	_block_zstd(monkeypatch)
@@ -1734,11 +1770,11 @@ def test_spec_clear_and_scrub_retry_when_a_part_vanishes_during_the_read(tmp_pat
 	original = TSVZ._iterPartLines
 	gone = []
 
-	def vanishing(info, reporter):
+	def vanishing(info, reporter, *args):
 		if info.path.endswith('.1') and not gone:
 			gone.append(info.path)
 			os.remove(info.path)
-		return original(info, reporter)
+		return original(info, reporter, *args)
 
 	monkeypatch.setattr(TSVZ, '_iterPartLines', vanishing)
 	if operation == 'clear':

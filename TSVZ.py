@@ -1686,6 +1686,11 @@ class _SpecState(object):
 		return state
 
 
+def _asciiLower(text):
+	"""``text`` lowercased over ASCII only (spec §12.4.1): other letters keep their case."""
+	return ''.join(c.lower() if c < '\x80' else c for c in text)
+
+
 def _specApplyMarker(state, keyLower, values, reporter, where):
 	"""Apply an official marker (spec §12.4). Returns False when its value was rejected."""
 	value = values[0] if values else ''  # marker lines are not stripped (spec §10.4)
@@ -1712,8 +1717,8 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 		attr, default = _BOOL_MARKERS[keyLower]
 		if not value:
 			setattr(state, attr, default)
-		elif value.lower() in _BOOL_VALUES:
-			setattr(state, attr, _BOOL_VALUES[value.lower()])
+		elif _asciiLower(value) in _BOOL_VALUES:
+			setattr(state, attr, _BOOL_VALUES[_asciiLower(value)])
 		else:
 			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
 			return False
@@ -1735,8 +1740,8 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 		attr, choices = _ENUM_MARKERS[keyLower]
 		if not value:
 			setattr(state, attr, choices[0])
-		elif value.lower() in choices:
-			setattr(state, attr, value.lower())
+		elif _asciiLower(value) in choices:
+			setattr(state, attr, _asciiLower(value))
 		else:
 			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
 			return False
@@ -1943,11 +1948,13 @@ def _readMember(src, codec):
 	return 'short', b''.join(out), start, src.offset(), None
 
 
-def _nextCompleteMember(f, codec, start):
-	"""The first complete member at or after raw offset ``start`` (spec §16.6 rule 2), as
-	``(offset, output, end)``, or None. Members are found by their codec's magic bytes."""
+def _nextMemberStart(f, codec, start):
+	"""The first raw offset at or after ``start`` where a member of ``codec`` begins (its magic bytes), or None.
+
+	Whether that member is complete does not matter: a damaged member's bytes
+	end there (spec §16.6 rule 2).
+	"""
 	magic = _CODECS[_CODEC_NAMES[codec]][3]
-	src = _PartBytes(f)
 	offset = start
 	while True:
 		f.seek(offset)
@@ -1955,14 +1962,9 @@ def _nextCompleteMember(f, codec, start):
 		if len(window) < len(magic):
 			return None
 		i = window.find(magic)
-		if i < 0:
-			offset += len(window) - len(magic) + 1
-			continue
-		src.seek(offset + i)
-		status, out, _, end, _ = _readMember(src, codec)
-		if status == 'complete':
-			return offset + i, out, end
-		offset += i + 1
+		if i >= 0:
+			return offset + i
+		offset += len(window) - len(magic) + 1
 
 
 #: Yielded by _decompressChunks, returned by _specZeroFill: a stop policy ended the read (spec §4.10).
@@ -2005,12 +2007,12 @@ def _decompressChunks(f, info):
 	"""Yield what a compressed part contributes (spec §16.6), member by member.
 
 	A complete member's output is used. A damaged member's bytes, up to the next
-	complete member, are decoded on their own: a member cut short contributes
-	what it decoded; a corrupt one follows the corruption policy in force
-	(spec §4.10): its output before the failure (recover), nothing (skip), or
-	``_STOP`` (stop). None is yielded before the next complete member, so the
-	caller drops the line left unfinished at the damage. Damage is recorded on
-	``info``.
+	member start (complete or not; gzip zero padding left out), are decoded on
+	their own: a member cut short contributes what it decoded; a corrupt one
+	follows the corruption policy in force at its first byte (spec §4.10): its
+	output before the failure (recover), nothing (skip), or ``_STOP`` (stop).
+	None is yielded before the next member, so the caller drops the line left
+	unfinished at the damage. Damage is recorded on ``info``.
 	"""
 	src = _PartBytes(f)
 	while True:
@@ -2021,14 +2023,17 @@ def _decompressChunks(f, info):
 			if out:
 				yield out
 			continue
-		found = _nextCompleteMember(f, info.codec, start + 1)
-		if found is None:
+		following = _nextMemberStart(f, info.codec, start + 1)
+		if following is None:
 			f.seek(0, os.SEEK_END)
 			stop = f.tell()
 		else:
-			stop = found[0]
+			stop = following
 		f.seek(start)
-		cutShort, out, error = _decodeAlone(f.read(stop - start), info.codec)
+		raw = f.read(stop - start)
+		if _CODEC_NAMES[info.codec] == 'gzip':
+			raw = raw.rstrip(b'\0')  # zero padding before the next member (spec §16.6)
+		cutShort, out, error = _decodeAlone(raw, info.codec)
 		if cutShort:
 			info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
 			if out:
@@ -2046,20 +2051,19 @@ def _decompressChunks(f, info):
 				info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
 				if out:
 					yield out
-		if found is None:
+		if following is None:
 			break
 		yield None
-		_, out, end = found
-		if out:
-			yield out
-		src.seek(end)  # the search moved the file
+		src.seek(following)  # the next member, damaged or not; the search moved the file
 
 
-def _iterPartLines(info, reporter):
+def _iterPartLines(info, reporter, label=''):
 	"""Yield ``(rawLine, offset)`` for each committed line of one part (spec §4.3).
 
-	Bytes after the last b'\\n' are not yielded; they are kept on ``info.tail``
-	and reported, as is any damage. An unreadable part is reported and skipped.
+	A byte order mark at the start of the part's bytes is removed (spec §4.7);
+	offsets still count it. Bytes after the last b'\\n' are not yielded; they
+	are kept on ``info.tail`` and reported, as is any damage. An unreadable part
+	is reported and skipped. ``label`` prefixes locations in reports.
 	"""
 	try:
 		f = open(info.path, 'rb')
@@ -2074,6 +2078,7 @@ def _iterPartLines(info, reporter):
 		reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python'.format(info.path, _CODEC_NAMES.get(info.codec, info.codec)))
 		return
 	rest = b''
+	atStart = True
 	with f:
 		chunks = _decompressChunks(f, info) if info.codec else iter(lambda: f.read(_CHUNK), b'')
 		offset = 0
@@ -2087,6 +2092,12 @@ def _iterPartLines(info, reporter):
 					rest = b''  # nothing after the stop is read
 					break
 				data = rest + chunk if rest else chunk
+				if atStart:
+					atStart = False
+					if data.startswith(b'\xef\xbb\xbf'):
+						data = data[3:]
+						offset = 3
+						reporter.note('bom', '{}line 1'.format(label), 'stripped a UTF-8 byte order mark')
 				start = 0
 				while True:
 					nl = data.find(b'\n', start)
@@ -2143,10 +2154,12 @@ def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
 def _specZeroFill(raw, delimiter, state, reporter, where):
 	"""Apply spec §4.9 to one committed line: the bytes to replay, None to ignore the line, or ``_STOP``.
 
-	A zero byte in a record (at its start, for .nsvz) is zero-fill damage, handled
-	by the corruption policy in force (spec §4.10).
+	A zero byte in a .tsvz, .csvz or .psvz record is zero-fill damage, handled by
+	the corruption policy in force (spec §4.10).
 	"""
-	cut = len(raw) - len(raw.lstrip(b'\0')) if delimiter == '\0' else raw.rfind(b'\0') + 1
+	if delimiter == '\0':
+		return raw  # the zero byte is the .nsvz delimiter: zero fill cannot be told from data
+	cut = raw.rfind(b'\0') + 1
 	if not cut:
 		return raw
 	policy = state.onCorruption
@@ -2176,20 +2189,21 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 		infos.append(info)
 		label = os.path.basename(path) + ' ' if multi else ''
 		lineNo = 0
-		for raw, offset in _iterPartLines(info, reporter):
+		for raw, offset in _iterPartLines(info, reporter, label):
 			lineNo += 1
 			where = '{}line {}'.format(label, lineNo)
-			if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
-				raw = raw[3:]
-				reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+			whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
 			fill = _specZeroFill(raw, delimiter, state, reporter, where)
 			if fill is not raw:
 				info.lost = True
 				if fill is _STOP:
 					info.stopped = True
 					info.lines = lineNo
+					info.committed = offset  # where reading stopped: a follower checks the bytes before it
 					return
 				if fill is None:
+					for digest in state.digests.values():
+						digest.update(whole)
 					continue
 				offset += len(raw) - len(fill)
 				raw = fill
@@ -2198,7 +2212,7 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 			algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
 			for name, digest in state.digests.items():
 				if name != algo:
-					digest.update(raw)
+					digest.update(whole)
 			if algo:
 				_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
 				continue
@@ -2222,15 +2236,20 @@ def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter):
 	if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
 		raw = raw[3:]
 		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
+	whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
 	raw = _specZeroFill(raw, delimiter, state, reporter, where)
-	if raw is None or raw is _STOP:
+	if raw is _STOP:
 		return raw
+	if raw is None:
+		for digest in state.digests.values():
+			digest.update(whole)
+		return None
 	text = _decodeLine(raw, reporter, where)
 	check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
 	algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
 	for name, digest in state.digests.items():
 		if name != algo:
-			digest.update(raw)
+			digest.update(whole)
 	if algo:
 		_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
 		return None
@@ -2908,7 +2927,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
 	never compacted away. ``done`` is False when nothing was written because
 	the store is missing, has several parts (or the path names one part), or
-	kept changing.
+	kept changing, and also when the read stopped at damaged data (spec
+	§4.10): the part is then rewritten from what was read, the original kept.
 	"""
 	if taskDic is None:
 		taskDic = {}
@@ -2970,7 +2990,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 				continue  # another writer committed after the read
 			if verbose:
 				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
-			return taskDic, True
+			# A read that stopped at damaged data was rewritten as far as it went, but it still failed (spec §4.10).
+			return taskDic, not attempt.has('stopped')
 		attempt.note('changing', None, 'scrub skipped: the store kept changing while it was being compacted; nothing was written')
 	finally:
 		reporter.flush()
