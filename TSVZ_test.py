@@ -1884,6 +1884,43 @@ def test_classes_pop_a_key_ending_in_space_by_its_own_tombstone(tmp_path, make):
 	assert dict(TSVZ.readTabularFile(p)) == {'k': ['k', 'v2']}
 
 
+@pytest.mark.parametrize('make', [lambda p: TSVZ.TSVZed(p, rewrite_on_load=False), TSVZ.TSVZedLite,
+								  lambda p: TSVZ.TSVZClient(p)], ids=['TSVZed', 'TSVZedLite', 'TSVZClient'])
+def test_classes_name_the_live_key_equal_to_a_requested_key(tmp_path, make):
+	# Spec §20.2.7: a lookup names the live key equal to it, else the key right-stripped; setting still strips.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\nx\tv3\n')
+	t = make(p)
+	try:
+		assert t['k '] == ['k ', 'v1'] and t['k'] == ['k', 'v2'] and t['x  '] == ['x', 'v3']
+		assert 'k ' in t and t.get('k ') == ['k ', 'v1']
+		assert t.setdefault('k ', ['z']) == ['k ', 'v1']
+		assert t.pop('k ') == ['k ', 'v1']
+		assert list(t.keys()) == ['k', 'x']
+		t['n '] = ['v4']
+		assert list(t.keys()) == ['k', 'x', 'n']
+		for key in list(t.keys()):
+			del t[key]
+		assert len(t) == 0
+	finally:
+		t.close()
+	assert dict(TSVZ.readTabularFile(p)) == {}
+
+
+def test_tsvzed_lookups_by_key_iterate_and_delete_every_key(tmp_path):
+	# The bug §20.2.7 fixes in the classes: deleting each key by name deleted k twice and left k<space>.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False)
+	try:
+		for key in list(t):
+			del t[key]
+		assert dict(t) == {}
+	finally:
+		t.close()
+	assert dict(TSVZ.readTabularFile(p)) == {}
+
+
 def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')

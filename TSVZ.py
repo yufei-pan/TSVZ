@@ -3676,14 +3676,19 @@ class TSVZed(OrderedDict):
 		# else:
 		#     self.appendEvent.set()
 
+	def _nameKey(self, key):
+		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7)."""
+		key = str(key)
+		return key if OrderedDict.__contains__(self, key) else key.rstrip()
+
 	def __getitem__(self, key):
-		return super().__getitem__(str(key).rstrip())
-		
+		return super().__getitem__(self._nameKey(key))
+
 
 	def __delitem__(self,key):
 		if self._spec:
 			return self._specDelItem(key)
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = [DEFAULTS_INDICATOR_KEY]
 			if self.verbose:
@@ -3787,7 +3792,7 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = get_time_ns()
 
 	def _specDelItem(self, key):
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		if _MARKER_RE.match(key):
 			# A lone marker key resets that marker (spec §12.1).
 			self._specSetMarker(key, [key])
@@ -3962,7 +3967,7 @@ memoryOnly:{self.memoryOnly}
 		is raised.
 
 		'''
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		if key not in self:
 			if default is self.__marker:
 				raise KeyError(key)
@@ -3977,7 +3982,7 @@ memoryOnly:{self.memoryOnly}
 		'''Move an existing element to the end (or beginning if last is false).
 		Raise KeyError if the element does not exist.
 		'''
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		super().move_to_end(key, last)
 		if self._spec:
 			_warnOnce(self, 'move_to_end', self._fileName,
@@ -4500,9 +4505,14 @@ class TSVZedLite(MutableMapping):
 		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
 		return 'tsvz' if self._spec else 'tsv'
 
+	def _nameKey(self, key):
+		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7)."""
+		key = str(key)
+		return key if key in self.indexes else key.rstrip()
+
 	def __contains__(self, key):
 		if self._spec:
-			return str(key).rstrip() in self.indexes
+			return self._nameKey(key) in self.indexes
 		return MutableMapping.__contains__(self, key)
 
 	def get(self, key, default=None):
@@ -4880,7 +4890,7 @@ class TSVZedLite(MutableMapping):
 
 	# Implement basic __getitem__, __setitem__, __delitem__, __iter__, and __len__. needed for MutableMapping
 	def __getitem__(self,key):
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		if key not in self.indexes:
 			if key == DEFAULTS_INDICATOR_KEY:
 				return self.defaults
@@ -4959,7 +4969,7 @@ class TSVZedLite(MutableMapping):
 		self.indexes[key] = self.__writeValues(value)
 		
 	def __delitem__(self,key):
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		if self._spec:
 			if _MARKER_RE.match(key):
 				# A lone marker key resets that marker (spec §12.1).
@@ -5017,7 +5027,7 @@ class TSVZedLite(MutableMapping):
 
 	__marker = object()
 	def pop(self, key, default=__marker, return_pos = False):
-		key = str(key).rstrip()
+		key = self._nameKey(key)
 		try:
 			pos = self.indexes.pop(key)
 		except KeyError:
@@ -6576,6 +6586,8 @@ class TSVZClient(MutableMapping):
 		cells = self._cells(key, default)
 		if len(cells) < 2:
 			return self.get(key)
+		if str(key) != cells[0] and str(key) in self:
+			return self.get(key)  # the handler names the live key equal to it (spec §20.2.7); cells[0] is stripped
 		lines = self._request(['setdefault'] + self._fields(cells), write=True, retry=False)[0]
 		return _serveDecodeLine(lines[0]) if lines else None
 
