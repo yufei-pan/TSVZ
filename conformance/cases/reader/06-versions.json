@@ -14,5 +14,9 @@
 {"id": "6.4-unknown-token-from-a-higher-version", "spec": ["6.4", "13.4"], "level": "MUST",
  "note": "A token a later version might define is passed through literally.",
  "files": {"s.tsvz": "#_version_#\t2\na\tx<TAB>y\n"},
- "expect": {"read": [["a", "x<TAB>y"]]}}
+ "expect": {"read": [["a", "x<TAB>y"]]}},
+{"id": "6.1-meta-grammar-holds-under-any-version", "spec": ["6.1", "6.3"], "level": "MUST",
+ "note": "Under a declared version no reader knows, records, CRLF, the commit rule, fields, tokens, comments, markers and the empty-key rule work as in version 1.",
+ "files": {"s.tsvz": "#_version_#\t9\n#comment\na<sep>b\tx<LF>y<lt>z\r\n\tq\n<#>k\tv\n#__ext__#\tw\nd\ttail"},
+ "expect": {"read": [["a\tb", "x\ny<z"], ["#k", "v"]], "keys": ["a\tb", "#k"], "len": 2}}
 ]}

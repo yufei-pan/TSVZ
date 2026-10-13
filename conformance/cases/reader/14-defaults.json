@@ -1,5 +1,5 @@
 {"format": 1, "class": "reader", "cases": [
-{"id": "14-appendix-c-worked-example", "spec": ["14", "3.4", "9.2"], "level": "MUST",
+{"id": "14-appendix-c-worked-example", "spec": ["14", "3.4", "9.2", "14.6"], "level": "MUST",
  "note": "The spec's Appendix C: alice and carol are live, bob is deleted and reads as the defaults.",
  "files": {"s.tsvz": "#_version_#\t1\n#_defaults_#\tguest\t0\nalice\tAlice\t30\nbob\tBob\ncarol\t\t25\nalice\tAlice\t31\nbob\n"},
  "expect": {"read": [["alice", "Alice", "31"], ["carol", "", "25"]], "len": 2, "keys": ["alice", "carol"],
@@ -12,7 +12,7 @@
  "note": "With fill-empty off (its default), a written empty cell stays empty.",
  "files": {"s.tsvz": "#_defaults_#\td1\td2\na\t\tq\n"},
  "expect": {"read": [["a", "", "q"]]}},
-{"id": "14.2-fill-empty-takes-the-default", "spec": ["14.2"], "level": "MUST",
+{"id": "14.2-fill-empty-takes-the-default", "spec": ["14.2", "14.7"], "level": "MUST",
  "note": "With fill-empty on, a written empty cell takes its default.",
  "files": {"s.tsvz": "#_fill_empty_with_default_#\ttrue\n#_defaults_#\td1\td2\na\t\tq\n"},
  "expect": {"read": [["a", "d1", "q"]]}},

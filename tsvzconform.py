@@ -1763,6 +1763,36 @@ def check_terminal_default(cx):
 	return []
 
 
+# Rows for the read | set - copy: tokens, a leading #, defaults to bake in, and a row of only empty cells,
+# which must still print with a delimiter or the copy reads it as a tombstone.
+_COPY_ROWS = [['a', 'x'], ['#h', '#v<'], ['t\tk', 'l\nm', 'c,p|n'], ['e', ''], ['z', '', ''], [' s', 'ü']]
+
+
+@procedural('20.3.2-read-piped-into-set-copies-the-rows', 'cli', ['20.3.2', '20.3.1', '20.4.1'], 'MUST',
+	'What read prints, piped into set - of a new store of the same variant, gives that store the same live rows, in every variant.')
+def check_read_into_set(cx):
+	problems = []
+	for ext, d in sorted(VARIANTS.items()):
+		lines = ['#_defaults_#' + d + d + 'd2'] + [d.join([encode_field(row[0], d, is_key=True)] + [encode_field(c, d) for c in row[1:]])
+			for row in _COPY_ROWS]
+		source = cx.write('a' + ext, '\n'.join(lines) + '\n')
+		target = cx.path('b' + ext)
+		read = cx.run(cx.impl.cli('read', source))
+		if read.exit != 0:
+			problems.append('%s: read exited %s' % (ext, read.exit))
+			continue
+		copy = cx.run(cx.impl.cli('set', target, ['-']), stdin=read.stdout)
+		if copy.exit != 0:
+			problems.append('%s: set - exited %s: %s' % (ext, copy.exit, show(copy.stderr)))
+			continue
+		want = [trim_row(r) for r in replay_store(source).rows()]
+		got = [trim_row(r) for r in replay_store(target).rows()]
+		diff = compare_lists(got, want, 'row')
+		if diff:
+			problems.append('%s: read printed %s, and the copy reads back wrong: %s' % (ext, show(read.stdout), diff))
+	return problems
+
+
 def _gzip_member(data):
 	"""One gzip member holding ``data``, with a fixed timestamp (gzip.compress has no mtime before Python 3.8)."""
 	import gzip
@@ -2109,7 +2139,7 @@ def check_cut_off_bulk(cx):
 	return problems
 
 
-@procedural('21.8.2-concurrent-pop-is-atomic', 'handler', ['21.8.2'], 'MUST',
+@procedural('21.8.2-concurrent-pop-is-atomic', 'handler', ['21.8.2', '20.2.5'], 'MUST',
 	'Eight clients pop one key at once: exactly one gets the row, the others status 3, and one tombstone is written.', requires=['handler'])
 def check_atomic_pop(cx):
 	store, handler = _serving(cx, 'k\tv\n')

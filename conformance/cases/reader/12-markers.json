@@ -7,7 +7,7 @@
  "note": "#_defaults_#x does not match the reserved pattern as a whole, so it is a comment.",
  "files": {"s.tsvz": "#_defaults_#x\tq\na\tx\n"},
  "expect": {"read": [["a", "x"]], "get": [{"args": ["m"], "rows": [["m"]], "exit": 3}]}},
-{"id": "12.3-unknown-markers-are-ignored", "spec": ["12.3", "12.2.2"], "level": "MUST",
+{"id": "12.3-unknown-markers-are-ignored", "spec": ["12.3", "12.2.2", "12.3.1"], "level": "MUST",
  "note": "Unrecognized official-form and extension-form markers have no effect and are not data.",
  "files": {"s.tsvz": "#_frobnicate_#\tx\n#__ext__#\ty\na\tz\n"},
  "expect": {"read": [["a", "z"]], "len": 1}},

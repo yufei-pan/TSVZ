@@ -46,5 +46,9 @@
 {"id": "16.5-unsupported-zstd-part-fails", "spec": ["16.5", "20.6"], "level": "MUST", "requires": ["!zstd"],
  "note": "A reader without zstd fails rather than skip the part or read it as text.",
  "files": {"s.tsvz": "a\tx\n", "s.tsvz.1.zst": {"b64": "KLUv/SAEIQAAYgl5Cg=="}},
- "expect": {"read": {"rows": null, "exit": 1}}}
+ "expect": {"read": {"rows": null, "exit": 1}}},
+{"id": "16.1-marker-state-crosses-a-compressed-part", "spec": ["16.1", "17.4", "12.1"], "level": "MUST",
+ "note": "Compression only wraps a part's bytes: markers set inside a gzip part apply to the plain part after it, and a tombstone there deletes a key from it.",
+ "files": {"s.tsvz.1.gz": {"b64": "H4sIAAAAAAAC/1OOT0lNSyzNKSmOV+ZMMeRMMeJSjk/LzMmJT80tKKmML88syYApAaooKSpN5Urk5AIA62f+bjcAAAA="}, "s.tsvz.2": "b\t\nc\tx\na\n"},
+ "expect": {"read": [["b", "d1", "d2"], ["c", "x", "d2"]], "keys": ["b", "c"]}}
 ]}

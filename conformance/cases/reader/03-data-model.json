@@ -1,0 +1,7 @@
+{"format": 1, "class": "reader", "cases": [
+{"id": "3.2-a-first-row-of-column-names-is-data", "spec": ["3.2", "11.3"], "level": "MUST",
+ "note": "There is no header: a first line that names columns, without a leading #, is an ordinary data row with its own key.",
+ "files": {"s.tsvz": "name\tage\nalice\t30\nbob\t41\n"},
+ "expect": {"read": [["name", "age"], ["alice", "30"], ["bob", "41"]], "keys": ["name", "alice", "bob"],
+  "get": [{"args": ["name"], "rows": [["name", "age"]]}]}}
+]}

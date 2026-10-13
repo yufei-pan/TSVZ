@@ -62,5 +62,13 @@
 {"id": "15.3-unclaimed-blake3-is-inert", "spec": ["15.3"], "level": "MUST", "requires": ["!blake3"],
  "note": "A reader that does not implement blake3 treats its markers as inert.",
  "files": {"s.tsvz": "#_checksum_blake3_#\na\tx\n#_checksum_blake3_#\t00000000\n"},
- "expect": {"verify": {"lines": [], "exit": 0}}}
+ "expect": {"verify": {"lines": [], "exit": 0}}},
+{"id": "15.7-segment-spans-a-compressed-part", "spec": ["15.7", "15.4", "16.1"], "level": "MUST", "requires": ["crc32"],
+ "note": "Compression is per part but integrity is over the decompressed concatenation, so a segment runs from a gzip part into a plain one.",
+ "files": {"s.tsvz.1.gz": {"b64": "H4sIAAAAAAAC/1OOT85ITc4uLs2NTy5KNjaKV+ZK5KzgAgDYlozdFwAAAA=="}, "s.tsvz.2": "b\ty\n#_checksum_crc32_#\tc1ec8234\n"},
+ "expect": {"verify": {"lines": [], "exit": 0}, "read": [["a", "x"], ["b", "y"]]}},
+{"id": "15.7-mismatch-across-a-compressed-part", "spec": ["15.7", "15.4", "20.2"], "level": "MUST", "requires": ["crc32"],
+ "note": "A wrong digest over a segment that starts in a gzip part is reported against the plain part holding the closing marker.",
+ "files": {"s.tsvz.1.gz": {"b64": "H4sIAAAAAAAC/1OOT85ITc4uLs2NTy5KNjaKV+ZK5KzgAgDYlozdFwAAAA=="}, "s.tsvz.2": "b\ty\n#_checksum_crc32_#\t00000000\n"},
+ "expect": {"verify": {"lines": [["{store}.2", "2", "crc32", "00000000", "c1ec8234"]], "exit": 4}}}
 ]}

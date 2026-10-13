@@ -1,5 +1,5 @@
 {"format": 1, "class": "writer", "cases": [
-{"id": "19.2-scrub-layout-and-fidelity", "spec": ["19.2", "19.4", "19.8", "20.2"], "level": "MUST",
+{"id": "19.2-scrub-layout-and-fidelity", "spec": ["19.2", "19.4", "19.8", "20.2", "19.6", "18.7"], "level": "MUST",
  "note": "scrub rewrites the part as markers then one row per live key, drops tombstones and other comments, and reads the same.",
  "files": {"s.tsvz": "#key\tval\n#_version_#\t1\n#_defaults_#\td1\td2\na\tx\nb\ty\n#note\na\tz\nb\nc\t\t\n"},
  "steps": [{"op": ["scrub"], "stdout": "empty"}],

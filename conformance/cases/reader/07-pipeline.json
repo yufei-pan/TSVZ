@@ -27,7 +27,7 @@
  "note": "Trailing spaces are stripped from the raw field, then tokens are decoded, so an encoded newline survives.",
  "files": {"s.tsvz": "a\tx<LF> \n"},
  "expect": {"read": [["a", "x\n"]]}},
-{"id": "7.10-update-keeps-first-position", "spec": ["7.10", "3.4"], "level": "MUST",
+{"id": "7.10-update-keeps-first-position", "spec": ["7.10", "3.4", "8.1"], "level": "MUST",
  "note": "A later record changes a key's value, not its order.",
  "files": {"s.tsvz": "b\t1\na\t2\nb\t3\n"},
  "expect": {"read": [["b", "3"], ["a", "2"]], "keys": ["b", "a"]}},
@@ -38,5 +38,9 @@
 {"id": "8.3-escaped-marker-name-is-a-data-key", "spec": ["8.3", "12.2.1"], "level": "MUST",
  "note": "<#>_defaults_# is a data key named #_defaults_#, not a marker.",
  "files": {"s.tsvz": "<#>_defaults_#\tq\na\tx\n"},
- "expect": {"read": [["#_defaults_#", "q"], ["a", "x"]], "len": 2}}
+ "expect": {"read": [["#_defaults_#", "q"], ["a", "x"]], "len": 2}},
+{"id": "7.4-every-kind-of-line-is-digested", "spec": ["7.4", "7.5", "15.4"], "level": "MUST", "requires": ["crc32"],
+ "note": "Markers, comments, an empty-key row, a CRLF row, encoded fields, a tombstone and another algorithm's marker all feed the crc32 segment as raw bytes; the checksum lines themselves are not data.",
+ "files": {"s.tsvz": "#_checksum_crc32_#\n#_defaults_#\td\n#__ext__#\tz\n# comment\n\tempty key\na\tx\r\nb<sep>c\ty<lt>\na\n#_checksum_sha256_#\n#_checksum_crc32_#\t711bb461\n"},
+ "expect": {"verify": {"lines": [], "exit": 0}, "read": [["b\tc", "y<"]], "len": 1}}
 ]}

@@ -19,7 +19,7 @@
  "note": "In .csvz a tab, a pipe and NUL are data.",
  "store": "s.csvz", "files": {"s.csvz": "a,x\ty|z<NUL>w\n"},
  "expect": {"read": [["a", "x\ty|z\u0000w"]]}},
-{"id": "5.1-other-delimiters-are-data-in-nsvz", "spec": ["5.1", "2.1"], "level": "MUST",
+{"id": "5.1-other-delimiters-are-data-in-nsvz", "spec": ["5.1", "2.1", "5.4"], "level": "MUST",
  "note": "In .nsvz a tab, a comma and a pipe are data.",
  "store": "s.nsvz", "files": {"s.nsvz": "a\u0000x\ty,z|w\n"},
  "expect": {"read": [["a", "x\ty,z|w"]]}},

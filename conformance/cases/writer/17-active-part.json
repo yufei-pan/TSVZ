@@ -4,7 +4,7 @@
  "store": "s.tsvz.gz", "files": {"s.tsvz.gz": {"b64": "H4sIAAAAAAAA/0vkrOACABVuPKoEAAAA"}},
  "steps": [{"op": ["set", "b", "y"]}, {"op": ["read"], "stdout": {"rows": [["a", "x"], ["b", "y"]]}}],
  "after": {"rows": [["a", "x"], ["b", "y"]], "bytes": ["appended", "encoded"]}},
-{"id": "17.7-set-appends-to-the-last-part", "spec": ["17.7", "3.1"], "level": "MUST",
+{"id": "17.7-set-appends-to-the-last-part", "spec": ["17.7", "3.1", "19.9"], "level": "MUST",
  "note": "A command appends to the last part in replay order and changes no other part.",
  "files": {"s.tsvz": "a\t1\n", "s.tsvz.f": "b\t2\n", "s.tsvz.10": "c\t3\n"},
  "steps": [{"op": ["set", "d", "4"]}, {"op": ["delete", "a"]}],

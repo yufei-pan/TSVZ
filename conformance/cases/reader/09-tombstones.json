@@ -27,7 +27,7 @@
  "note": "Rows without a delimiter are all tombstones, so the store is empty.",
  "files": {"s.tsvz": "a\nb\n"},
  "expect": {"read": [], "len": 0}},
-{"id": "9.1-tombstone-deletes-the-resolved-key", "spec": ["9.1"], "level": "MUST",
+{"id": "9.1-tombstone-deletes-the-resolved-key", "spec": ["9.1", "7.8"], "level": "MUST",
  "note": "A tombstone's key is stripped and decoded, so <#>a and a<sep>b delete #a and a<TAB>b.",
  "files": {"s.tsvz": "<#>a\tx\na<sep>b\ty\nc\tz\n<#>a  \na<sep>b\n"},
  "expect": {"read": [["c", "z"]], "len": 1}}

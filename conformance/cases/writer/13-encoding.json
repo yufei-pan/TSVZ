@@ -48,7 +48,7 @@
  "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\n"},
  "steps": [{"op": ["set", "k", "v "]}],
  "after": {"rows": [["k", "v "]]}},
-{"id": "3.1-set-only-appends", "spec": ["3.1", "18.2"], "level": "MUST",
+{"id": "3.1-set-only-appends", "spec": ["3.1", "18.2", "3.5"], "level": "MUST",
  "note": "A write appends a record; no earlier byte changes.",
  "files": {"s.tsvz": "#hdr\na\tx\n"},
  "steps": [{"op": ["set", "b", "y"]}, {"op": ["delete", "a"]}],

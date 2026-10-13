@@ -770,6 +770,13 @@ def test_a_command_that_follows_a_bad_pointer_fails(tmp_path):
 	assert result.result == tc.FAIL and 'must not use' in result.detail[0]
 
 
+def test_a_read_that_prints_an_empty_row_as_a_lone_key_breaks_the_copy(tmp_path):
+	"""§20.3.2: a row of only empty cells printed without a delimiter is copied as a tombstone."""
+	check = next(c for c in tc.CHECKS if c.id == '20.3.2-read-piped-into-set-copies-the-rows')
+	result = tc.run_case(check, 'files', context(tmp_path / 'work', fake(tmp_path, 'nodelim')))
+	assert result.result == tc.FAIL and len(result.detail) == 1 and result.detail[0].startswith('.tsvz:')
+
+
 # --- selection, report and main --------------------------------------------------------------
 
 def test_the_rerun_line_names_the_mode():
