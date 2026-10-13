@@ -3677,12 +3677,31 @@ class TSVZed(OrderedDict):
 		#     self.appendEvent.set()
 
 	def _nameKey(self, key):
-		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7)."""
-		key = str(key)
+		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7).
+
+		The fallback strips every trailing whitespace whatever the stripping
+		marker says, as ``__setitem__`` strips every key it writes.
+		"""
+		if not isinstance(key, str):
+			key = str(key)
 		return key if OrderedDict.__contains__(self, key) else key.rstrip()
 
+	# The lookups below inline _nameKey: they are the hot path.
 	def __getitem__(self, key):
-		return super().__getitem__(self._nameKey(key))
+		if not OrderedDict.__contains__(self, key):
+			key = str(key).rstrip()
+		return OrderedDict.__getitem__(self, key)
+
+	def __contains__(self, key):
+		# OrderedDict.setdefault asks this before it reads or writes, so it names keys as t[key] does.
+		return OrderedDict.__contains__(self, key) or OrderedDict.__contains__(self, str(key).rstrip())
+
+	def get(self, key, default=None):
+		if not OrderedDict.__contains__(self, key):
+			key = str(key).rstrip()
+			if not OrderedDict.__contains__(self, key):
+				return default
+		return OrderedDict.__getitem__(self, key)
 
 
 	def __delitem__(self,key):
@@ -4506,8 +4525,13 @@ class TSVZedLite(MutableMapping):
 		return 'tsvz' if self._spec else 'tsv'
 
 	def _nameKey(self, key):
-		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7)."""
-		key = str(key)
+		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7).
+
+		The fallback strips every trailing whitespace whatever the stripping
+		marker says, as ``__setitem__`` strips every key it writes.
+		"""
+		if not isinstance(key, str):
+			key = str(key)
 		return key if key in self.indexes else key.rstrip()
 
 	def __contains__(self, key):
@@ -6560,7 +6584,9 @@ class TSVZClient(MutableMapping):
 
 	def __delitem__(self, key):
 		"""Delete ``key``; a missing key is not an error (as in ``TSVZed``)."""
-		self._request(['delete', _serveEncode(str(key))], write=True)
+		key = str(key)
+		# Resending the delete of a key ending in whitespace could name, and delete, the stripped key (spec §20.2.7).
+		self._request(['delete', _serveEncode(key)], write=True, retry=not key.endswith((' ', '\t')))
 
 	_marker = object()
 
@@ -6586,8 +6612,11 @@ class TSVZClient(MutableMapping):
 		cells = self._cells(key, default)
 		if len(cells) < 2:
 			return self.get(key)
-		if str(key) != cells[0] and str(key) in self:
-			return self.get(key)  # the handler names the live key equal to it (spec §20.2.7); cells[0] is stripped
+		if str(key) != cells[0]:
+			# cells[0] is stripped as set strips it; a live key equal to ``key`` wins first (spec §20.2.7).
+			row = self.get(key)
+			if row is not None:
+				return row
 		lines = self._request(['setdefault'] + self._fields(cells), write=True, retry=False)[0]
 		return _serveDecodeLine(lines[0]) if lines else None
 

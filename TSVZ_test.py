@@ -1894,7 +1894,9 @@ def test_classes_name_the_live_key_equal_to_a_requested_key(tmp_path, make):
 	try:
 		assert t['k '] == ['k ', 'v1'] and t['k'] == ['k', 'v2'] and t['x  '] == ['x', 'v3']
 		assert 'k ' in t and t.get('k ') == ['k ', 'v1']
+		assert 'x  ' in t and t.get('x  ') == ['x', 'v3'] and 'y ' not in t and t.get('y ') is None
 		assert t.setdefault('k ', ['z']) == ['k ', 'v1']
+		assert t.setdefault('x  ', ['z']) == ['x', 'v3'], 'setdefault must not overwrite the key it names'
 		assert t.pop('k ') == ['k ', 'v1']
 		assert list(t.keys()) == ['k', 'x']
 		t['n '] = ['v4']
@@ -1905,6 +1907,17 @@ def test_classes_name_the_live_key_equal_to_a_requested_key(tmp_path, make):
 	finally:
 		t.close()
 	assert dict(TSVZ.readTabularFile(p)) == {}
+
+
+def test_client_does_not_resend_a_delete_that_could_name_another_key(tmp_path, monkeypatch):
+	# Spec §20.2.7: once k<space> is deleted, a resent `delete 'k '` would name, and delete, k.
+	c = TSVZ.TSVZClient(str(tmp_path / 's.tsvz'))
+	sent = []
+	monkeypatch.setattr(c, '_request', lambda fields, write=False, bulk=None, retry=True: sent.append((fields, retry)))
+	del c['k ']
+	del c['k']
+	assert sent == [(['delete', 'k '], False), (['delete', 'k'], True)]
+	c.close()
 
 
 def test_tsvzed_lookups_by_key_iterate_and_delete_every_key(tmp_path):

@@ -375,9 +375,9 @@ tombstone with stripping disabled — for example between
 `#_strip_trailing_whites_#<d>false` and `#_strip_trailing_whites_#<d>true` — so
 that it deletes the key itself and leaves stripping enabled after it.
 
-The guard and the tombstone are one batch, appended in one write (§18.2). If a
-crash or a full disk cuts that write after its first or second line (§4.3, §16.6),
-stripping stays disabled for every later record. A reader cannot tell this from a
+The guard and the tombstones inside it are one batch, appended in one write
+(§18.2). If a crash or a full disk cuts that write anywhere before its closing
+marker (§4.3, §16.6), stripping stays disabled for every later record. A reader cannot tell this from a
 store whose stripping was disabled on purpose; appending
 `#_strip_trailing_whites_#<d>true` repairs it.
 
@@ -1140,13 +1140,13 @@ While stripping is in force at the end of the store (§10), a KEY that ends in a
 space or tab MUST name the live key equal to it, if there is one; otherwise a tool
 SHOULD name the key a reader resolves it to (§7.7): the KEY without the trailing
 spaces and tabs of its encoded form (§13). While stripping is not in force, a KEY
-names itself. (While stripping is in force, a live key can end in a space or tab
-only if it was written while stripping was disabled, §9.6.)
+names itself. (While stripping is in force, a live key whose encoded form ends in
+a space or tab was written while stripping was disabled, §9.6.)
 
-   - `delete` writes the tombstone of the key named, per §9.6 when that key ends
-     in a space or tab. When it has to read the store to name a KEY and a part
-     cannot be read or the read stops at damaged data (§4.10), it writes nothing
-     and exits with status 1.
+   - `delete` writes the tombstone of the key named, per §9.6 when that key's
+     encoded form ends in a space or tab. When it has to read the store to name
+     a KEY and a part cannot be read or the read stops at damaged data (§4.10),
+     it writes nothing and exits with status 1.
    - The KEYs of one `delete` are all named against the store as it was before
      the delete, so a KEY given twice names the same key both times.
    - In a store where stripping is in force and both `k ` (written while
