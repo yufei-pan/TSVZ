@@ -60,5 +60,7 @@
 {"id": "20.3.1-append-reads-stdin", "spec": ["20.3.1", "20.2"], "level": "MUST",
  "note": "append - reads records from standard input like set -.",
  "steps": [{"op": ["append", "-"], "stdin": "a\tx\n"}],
- "after": {"rows": [["a", "x"]]}}
+ "after": {"rows": [["a", "x"]]}},
+{"id": "20.2.7-keys-piped-into-delete-deletes-every-key", "spec": ["20.2.7", "20.3.1", "20.2"], "level": "MUST", "note": "keys prints k<space> and k; fed to delete -, each line names its own key, so both are deleted.", "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n"}, "steps": [{"op": ["keys"], "stdout": {"lines": [["k "], ["k"]]}}, {"op": ["delete", "-"], "stdin": "k \nk\n", "stdout": "empty"}, {"op": ["len"], "stdout": {"text": "0\n"}}], "after": {"rows": []}},
+{"id": "20.2.7-a-stripping-reset-in-a-bulk-delete", "spec": ["20.2.7", "9.6", "20.3.1"], "level": "MUST", "note": "Stripping is off before the batch, so 'k ' names k<space>; the batch resets stripping first, so its tombstone must still delete k<space>.", "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\nk \tv1\nk\tv2\n"}, "steps": [{"op": ["delete", "-"], "stdin": "#_strip_trailing_whites_#\nk \n", "stdout": "empty"}], "after": {"rows": [["k", "v2"]]}}
 ]}

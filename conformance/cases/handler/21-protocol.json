@@ -99,5 +99,6 @@
  "note": "A refused scrub of a multi-part store gets #1, writes nothing, and the same connection keeps working.",
  "files": {"s.tsvz": "a\t1\n", "s.tsvz.1": "b\t2\n"},
  "steps": [{"request": ["scrub"], "exit": 1}, {"request": ["get", "b"], "stdout": {"rows": [["b", "2"]]}}],
- "after": {"rows": [["a", "1"], ["b", "2"]], "bytes": ["unchanged"]}}
+ "after": {"rows": [["a", "1"], ["b", "2"]], "bytes": ["unchanged"]}},
+{"id": "20.2.7-a-handler-names-the-live-key-ending-in-a-space", "spec": ["20.2.7", "21.7.1", "21.8.2"], "level": "MUST", "note": "Through a handler, delete 'k ' (one key, then bulk) deletes the live key k<space>, not k.", "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n"}, "steps": [{"request": ["delete", "k "]}, {"request": ["keys"], "stdout": {"lines": [["k"]]}}, {"request": ["set", "-"], "body": ["#_strip_trailing_whites_#\tfalse", "m \tv3", "#_strip_trailing_whites_#\ttrue"]}, {"request": ["delete", "-"], "body": ["m "]}, {"request": ["read"], "stdout": {"rows": [["k", "v2"]]}}], "after": {"rows": [["k", "v2"]]}}
 ]}

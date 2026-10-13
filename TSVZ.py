@@ -1669,8 +1669,7 @@ def _specTombstones(keys, delimiter, strip):
 	(spec §9.6).
 	"""
 	rows = [([key], False) for key in keys]
-	if strip and any(key.endswith((' ', '\t')) and _specEncodeField(key, delimiter, isKey=True).endswith((' ', '\t'))
-					 for key in keys):
+	if strip and any(_specStrippable(key, delimiter) for key in keys):
 		rows.insert(0, (['#_strip_trailing_whites_#', 'false'], True))
 		rows.append((['#_strip_trailing_whites_#', 'true'], True))
 	return rows
@@ -1685,6 +1684,55 @@ def _specTombstoneLines(key, delimiter, strip):
 	"""The tombstone of ``key`` (spec §9.6) as lines joined by '\\n', without a last '\\n'."""
 	return '\n'.join(_specFormatRecord(cells, delimiter, marker=marker)
 					 for cells, marker in _specTombstones([key], delimiter, strip))
+
+
+def _specStrippable(key, delimiter):
+	"""True when a reader that strips (spec §7.7) would change ``key``: its encoded form ends in a space or tab."""
+	return key.endswith((' ', '\t')) and _specEncodeField(key, delimiter, isKey=True).endswith((' ', '\t'))
+
+
+def _specNameKey(key, delimiter, strip, live):
+	"""The key that a requested ``key`` names (spec §20.2.7) in a store whose stripping is ``strip``.
+
+	While stripping is on, a key a reader would strip names the live key equal
+	to it (``live`` holds the live keys), else the key a reader resolves it to.
+	"""
+	if not strip or key in live or not _specStrippable(key, delimiter):
+		return key
+	return _specDecodeField(_specEncodeField(key, delimiter, isKey=True).rstrip(' \t'), delimiter)
+
+
+def _specNamesKeys(rows, delimiter):
+	"""True when naming the keys of ``delete`` rows (``[(cells, marker), ...]``) needs the store (spec §20.2.7)."""
+	return any(not marker and _specStrippable(cells[0], delimiter) for cells, marker in rows)
+
+
+def _specDeleteRows(rows, delimiter, strip, live):
+	"""The batch ``delete`` appends for ``rows`` (``[(cells, marker), ...]``, spec §20.2, §20.3).
+
+	Every key names a key of the store as it was before the batch, whose
+	stripping was ``strip`` and whose live keys are ``live`` (§20.2.7). The
+	tombstone of a key a reader would strip is written with stripping off
+	(§9.6). A reset of ``#_strip_trailing_whites_#`` in the batch turns
+	stripping back on (§10.3, §12.1).
+	"""
+	batch = []
+	named = strip
+	guarded = False
+	for cells, marker in rows:
+		if marker:
+			if cells[0].lower() == '#_strip_trailing_whites_#':
+				strip, guarded = True, False
+			batch.append((cells, marker))
+			continue
+		key = _specNameKey(cells[0], delimiter, named, live)
+		if strip and not guarded and _specStrippable(key, delimiter):
+			batch.append((['#_strip_trailing_whites_#', 'false'], True))
+			guarded = True
+		batch.append(([key], False))
+	if guarded:
+		batch.append((['#_strip_trailing_whites_#', 'true'], True))
+	return batch
 
 
 class _SpecState(object):
@@ -5430,9 +5478,9 @@ class _ServeStore(object):
 			return not self.parts
 
 	def resolve(self, key):
-		"""A requested key as a reader resolves it (spec §7.7; 3.39 rstrip for loose files)."""
+		"""The key a requested key names (spec §20.2.7; 3.39 rstrip for loose files)."""
 		if self.spec:
-			return key.rstrip(' \t') if self.state.strip else key
+			return _specNameKey(key, self.delimiter, self.state.strip, self.data)
 		return key.rstrip()
 
 	def read(self, log):
@@ -5528,10 +5576,27 @@ class _ServeStore(object):
 			self.writer.wait(queued[0])
 
 	def write(self, rows, sync, log, written=False):
-		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set``, ``delete`` and bulk input."""
+		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set`` and its bulk input."""
 		with self.lock:
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
+
+	def delete(self, rows, sync, log, written=False):
+		"""Append the tombstones of ``delete`` (``[(cells, marker), ...]``) as one batch (spec §20.2.7).
+
+		Naming a key a reader would strip needs the store as it is now, read
+		under the lock, so that delete is atomic (spec §21.8.2). Returns False,
+		having written nothing, when that read could not be completed.
+		"""
+		with self.lock:
+			if self.spec and _specNamesKeys(rows, self.delimiter):
+				self._fresh(log)
+				if self.unreadable:
+					return False
+				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
+			queued = self._submit(rows, sync, log)
+		self._ack(queued, written)
+		return True
 
 	def pop(self, key, sync, log):
 		"""Atomically return the row of ``key`` and append its tombstone; None when it is missing."""
@@ -5781,7 +5846,10 @@ def _serveDispatch(store, line, bulk, log):
 			rows = [([key], bool(_MARKER_RE.match(field))) for key, field in zip(args, raw)]
 		else:
 			rows = [(args, bool(_MARKER_RE.match(raw[0])))]
-		store.write(rows, sync, log, written)
+		if not keysOnly:
+			store.write(rows, sync, log, written)
+		elif not store.delete(rows, sync, log, written):
+			return 1, [], _SERVE_UNREADABLE + '; nothing was written'
 		return 0, [], ''
 	if operation in ('pop', 'popitem'):
 		if operation == 'pop':
@@ -6953,7 +7021,7 @@ def _cliRead(args, delimiter, logger, stdin, stdout):
 def _cliGet(args, delimiter, logger, stdin, stdout):
 	"""``get STORE KEY ...`` (spec §20.2): each KEY's row in argument order; exit 3 when one is missing.
 
-	Keys resolve as a reader resolves them (§7.7). For a missing key of a
+	Each KEY names a key as §20.2.7 says. For a missing key of a
 	spec store this prints what ``TSVZed`` returns for it (§14.5): the key and
 	the active defaults while ``#_return_defaults_when_missing_#`` is true,
 	else nothing. A missing key of a loose file prints nothing.
@@ -6972,7 +7040,7 @@ def _cliGet(args, delimiter, logger, stdin, stdout):
 	missing = False
 	for key in args.args:
 		if spec:
-			key = key.rstrip(' \t') if state.strip else key
+			key = _specNameKey(key, delimiter, state.strip, data)
 		else:
 			key = key.rstrip()
 		row = data.get(key)
@@ -7018,15 +7086,20 @@ def _cliStdinBatch(args, delimiter, logger, stdin, keysOnly):
 	so is a line with an empty key (reported). ``keysOnly`` keeps the first
 	field only: a tombstone, or a marker reset.
 	"""
-	spec = _isSpecPath(args.store)
-	source = _Reporter('<stdin>', logger)
-	try:
-		rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, spec, keysOnly, source)
-	finally:
-		source.flush()
-	if not spec:
+	rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly)
+	if not _isSpecPath(args.store):
 		return [cells for cells, marker in rows]
 	return [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows]
+
+
+def _cliStdinRows(args, delimiter, logger, stdin, keysOnly):
+	"""Standard input for ``set STORE -`` / ``delete STORE -`` as ``[(cells, marker), ...]`` (spec §20.3)."""
+	source = _Reporter('<stdin>', logger)
+	try:
+		return _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store), keysOnly,
+								 source)
+	finally:
+		source.flush()
 
 
 def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
@@ -7091,12 +7164,33 @@ def _cliDelete(args, delimiter, logger, stdin, stdout):
 	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended in one write.
 
 	``delete STORE -`` deletes the first field of every line on standard input (§20.3).
+	A key that a reader would strip names a key of the store (§20.2.7), so the
+	store is read first; when it cannot be read whole nothing is written and
+	the exit status is 1.
 	"""
-	if args.args == ['-']:
-		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
+	if not _isSpecPath(args.store):
+		if args.args == ['-']:
+			_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
+		else:
+			appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
+								   createIfNotExist=True, verbose=args.verbose, strict=args.strict,
+								   delimiter=delimiter)
 		return _cliWritten(args, logger)
-	appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
-						   createIfNotExist=True, verbose=args.verbose, strict=args.strict, delimiter=delimiter)
+	if args.args == ['-']:
+		rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly=True)
+	else:
+		rows = [([key], bool(_MARKER_RE.match(key))) for key in args.args]
+	if _specNamesKeys(rows, delimiter):
+		strip, live = True, {}  # a store delete creates starts with stripping on (spec §10.3)
+		if _cliStoreExists(args.store):
+			load, readable = _cliSpecLoad(args, delimiter, logger)
+			if not readable:
+				logger.teelog('tsvz: {}: could not read every part of the store; nothing was written'.format(
+					args.store), 'error')
+				return 1
+			strip, live = load.state.strip, load.data
+		rows = _specDeleteRows(rows, delimiter, strip, live)
+	_cliAppendBatch(args, delimiter, logger, [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows])
 	return _cliWritten(args, logger)
 
 

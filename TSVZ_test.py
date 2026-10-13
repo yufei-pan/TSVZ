@@ -1825,6 +1825,53 @@ def test_only_a_tombstone_stripping_would_change_is_guarded():
 	assert TSVZ._specTombstoneLines('k ', '\t', True) == '#_strip_trailing_whites_#\tfalse\nk \n#_strip_trailing_whites_#\ttrue'
 
 
+def test_a_requested_key_names_the_live_key_equal_to_it():
+	# Spec §20.2.7: while stripping is on, the live key equal to a KEY wins; else the key a reader resolves it to.
+	assert TSVZ._specNameKey('k ', '\t', True, {'k ': 1, 'k': 2}) == 'k '
+	assert TSVZ._specNameKey('k ', '\t', True, {'k': 2}) == 'k'
+	assert TSVZ._specNameKey('k \t ', ',', True, {}) == 'k'
+	assert TSVZ._specNameKey('k\t', '\t', True, {}) == 'k\t'  # written k<sep>: not stripped
+	assert TSVZ._specNameKey('#h <', '\t', True, {}) == '#h <'  # encoded <#>h <lt>: nothing to strip
+	assert TSVZ._specNameKey('#h ', '\t', True, {}) == '#h'  # encoded <#>h<space>, decoded again
+	assert TSVZ._specNameKey('k ', '\t', False, {}) == 'k '
+
+
+def test_delete_rows_name_keys_before_the_batch_and_guard_only_what_stripping_changes():
+	off, on = (['#_strip_trailing_whites_#', 'false'], True), (['#_strip_trailing_whites_#', 'true'], True)
+	reset = (['#_Strip_Trailing_Whites_#'], True)
+	live = {'k ': 1, 'k': 2}
+	# Both name k<space> (the store before the batch), inside one guard; a plain key joins it unchanged.
+	assert TSVZ._specDeleteRows([(['k '], False), (['a'], False), (['k '], False)], '\t', True, live) == \
+		[off, (['k '], False), (['a'], False), (['k '], False), on]
+	assert TSVZ._specDeleteRows([(['x '], False)], '\t', True, live) == [(['x'], False)]
+	# Stripping off before the batch: k<space> names itself, and needs a guard only after a reset turns stripping on.
+	assert TSVZ._specDeleteRows([(['k '], False), reset, (['k '], False)], '\t', False, {}) == \
+		[(['k '], False), reset, off, (['k '], False), on]
+	# A reset inside a guard closes it; the next key that needs one opens another.
+	assert TSVZ._specDeleteRows([(['k '], False), reset, (['k '], False)], '\t', True, live) == \
+		[off, (['k '], False), reset, off, (['k '], False), on]
+	assert not TSVZ._specNamesKeys([(['k\t'], False), (['#_x_# '], True)], '\t')
+	assert TSVZ._specNamesKeys([(['k\t'], False)], ',')
+
+
+def test_cli_delete_names_keys_and_refuses_a_store_it_cannot_read(tmp_path):
+	# Spec §20.2.7: naming 'k ' reads the store; a read stopped at damaged data writes nothing and exits 1.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n')
+	assert _run('keys', p)[:2] == (0, 'k \nk\n')
+	assert _run('delete', p, '-', stdin='k \nk\n')[0] == 0
+	assert _run('read', p)[:2] == (0, '')
+	assert _run('set', p, 'k', 'v3')[0] == 0
+	assert _run('read', p)[:2] == (0, 'k\tv3\n'), 'stripping is on again after the guard'
+	damaged = str(tmp_path / 'd.tsvz')
+	original = b'#_on_corruption_#\tstop\nk\t1\n\x00\x00c\t3\n'
+	_touch(damaged, original)
+	assert _run('delete', damaged, 'k ')[0] == 1
+	with open(damaged, 'rb') as f:
+		assert f.read() == original
+	assert _run('delete', damaged, 'k')[0] == 0, 'a key that names itself needs no read'
+
+
 @pytest.mark.parametrize('make', [lambda p: TSVZ.TSVZed(p, rewrite_on_load=False), TSVZ.TSVZedLite],
 						 ids=['TSVZed', 'TSVZedLite'])
 def test_classes_pop_a_key_ending_in_space_by_its_own_tombstone(tmp_path, make):

@@ -375,6 +375,12 @@ tombstone with stripping disabled — for example between
 `#_strip_trailing_whites_#<d>false` and `#_strip_trailing_whites_#<d>true` — so
 that it deletes the key itself and leaves stripping enabled after it.
 
+The guard and the tombstone are one batch, appended in one write (§18.2). If a
+crash or a full disk cuts that write after its first or second line (§4.3, §16.6),
+stripping stays disabled for every later record. A reader cannot tell this from a
+store whose stripping was disabled on purpose; appending
+`#_strip_trailing_whites_#<d>true` repairs it.
+
 ---
 
 ## 10. Whitespace
@@ -887,7 +893,9 @@ last `\n`" recovery does not catch.
 18.2 **Whole-record appends.** Every append `write()` SHOULD contain only complete
 records and end with `\n`; a record MUST NOT be split across `write()` calls. A
 record larger than the platform's atomic-write bound may still tear at end-of-file
-on a crash; the trailing-bytes discard of §4.3 handles that case.
+on a crash; the trailing-bytes discard of §4.3 handles that case. A write of
+several records can likewise be cut between two of them, which leaves the first
+ones in force; for the §9.6 guard that means stripping stays disabled.
 
 18.3 **Multiprocess: a dedicated write handler.** In a multi-process environment,
 all writes SHOULD be routed through a single dedicated handler process that owns
@@ -1093,10 +1101,10 @@ effect and exit status (§20.6).
 | Operation | Arguments | Effect |
 |---|---|---|
 | `read` | `STORE` | Print every live key's resolved row (§7, §14) in first-appearance order (§3.4). |
-| `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. A tool SHOULD resolve a requested key as §7.7 resolves a key (trailing space and tab removed while stripping is in force) before looking it up. |
+| `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. Each KEY names a key as §20.2.7 says. |
 | `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key. `-` reads records from standard input (§20.3). |
 | `append` | as `set` | Alias of `set`, with identical behaviour. |
-| `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`. It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
+| `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`, for the key it names (§20.2.7). It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
 | `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). |
 | `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store; it then writes nothing and exits with status 1. |
 | `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: the part path; the line number, which is the 1-based line, within that part, of the `#_checksum_<algo>_#` marker that closes the segment; the algorithm name in lowercase; the expected digest; and the computed digest. Both digests are printed in lowercase hexadecimal. |
@@ -1119,12 +1127,32 @@ MUST exit with status 1.
 (§5.2); their data semantics are implementation-defined. On a loose file, `verify`
 has nothing to check and `parts` lists the file itself.
 
-20.2.5 `pop`, `popitem` and `setdefault` read and then write. A tool that performs
-them on the files need not make them atomic with respect to other writers; through
-a handler they are atomic (§21.8).
+20.2.5 `pop`, `popitem` and `setdefault` read and then write, and so can `delete`
+(§20.2.7). A tool that performs them on the files need not make them atomic with
+respect to other writers; through a handler they are atomic (§21.8).
 
 20.2.6 `serve` and `stop` are defined by §21.13. A tool that does not provide a
 handler MUST exit with status 1 and a diagnostic for them.
+
+20.2.7 **Naming a key.** The KEY arguments of `get`, `has`, `pop`, `delete` and
+`setdefault`, and the keys that `delete -` reads (§20.3), name keys of the store.
+While stripping is in force at the end of the store (§10), a KEY that ends in a
+space or tab MUST name the live key equal to it, if there is one; otherwise a tool
+SHOULD name the key a reader resolves it to (§7.7): the KEY without the trailing
+spaces and tabs of its encoded form (§13). While stripping is not in force, a KEY
+names itself. (While stripping is in force, a live key can end in a space or tab
+only if it was written while stripping was disabled, §9.6.)
+
+   - `delete` writes the tombstone of the key named, per §9.6 when that key ends
+     in a space or tab. When it has to read the store to name a KEY and a part
+     cannot be read or the read stops at damaged data (§4.10), it writes nothing
+     and exits with status 1.
+   - The KEYs of one `delete` are all named against the store as it was before
+     the delete, so a KEY given twice names the same key both times.
+   - In a store where stripping is in force and both `k ` (written while
+     stripping was disabled) and `k` are live, `get STORE 'k '` prints the row of
+     `k `, `delete STORE 'k '` deletes `k ` and `delete STORE 'k'` deletes `k`;
+     `keys STORE` piped into `delete STORE -` deletes both.
 
 ### 20.3 Bulk input
 
@@ -1137,9 +1165,9 @@ input as a TSVZ stream in the target store's variant:
 - For `set`, each data line is handled exactly as `set` with those fields (a lone
   key is a tombstone). A line whose first field matches the reserved pattern
   (§12.2) is a marker write. Comment lines and empty lines are skipped.
-- For `delete`, the first field of each non-empty line is one key. A line whose
-  first field matches the reserved pattern resets that marker. Comment lines are
-  skipped.
+- For `delete`, the first field of each non-empty line is one key, named as
+  §20.2.7 says. A line whose first field matches the reserved pattern resets that
+  marker. Comment lines are skipped.
 - All records of one invocation MUST be appended as a single batch (§18.2).
 
 20.3.2 Because `read` prints records in the store's own variant (§20.4),
@@ -1353,7 +1381,8 @@ the request, and every record committed to the store's files (§4.3) before it
 received the request, subject to the file system's visibility rules.
 
 21.8.2 `pop`, `popitem` and `setdefault` are atomic: no other request's write is
-applied between their read and their write.
+applied between their read and their write. So is a `delete` that reads the store
+to name a key (§20.2.5, §20.2.7).
 
 21.8.3 Writes received on one connection are applied in the order received.
 
