@@ -185,7 +185,8 @@ def get_terminal_size():
 			import struct
 			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
-			_tsize = struct.unpack('HHHH', packed)[:2]
+			rows, columns = struct.unpack('HHHH', packed)[:2]
+			_tsize = (columns, rows)
 		except Exception:
 			import shutil
 			_tsize = shutil.get_terminal_size(fallback=(240, 50))

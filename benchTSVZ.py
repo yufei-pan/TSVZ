@@ -34,7 +34,8 @@ def get_terminal_size():
 			import struct
 			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
-			return struct.unpack('HHHH', packed)[:2]
+			rows, columns = struct.unpack('HHHH', packed)[:2]
+			return columns, rows
 		except Exception:
 			return shutil.get_terminal_size(fallback=(240, 50))
 
