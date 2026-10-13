@@ -1668,6 +1668,17 @@ def test_cli_stop_policy_fails_the_read_but_lets_scrub_rewrite(tmp_path):
 	assert any(n.startswith('s.tsvz.damaged-') for n in os.listdir(str(tmp_path)))
 
 
+def test_cli_every_reading_operation_fails_after_a_stop(tmp_path):
+	# Spec §4.10, §20.6: a read that stopped at damaged data has failed, whatever the operation;
+	# it still prints what was read before the damage (§21.8.5).
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\nd\t4\n')
+	for args, out in ((('read',), 'a\t1\n'), (('get', 'a'), 'a\t1\n'), (('has', 'a'), ''), (('len',), '1\n'),
+					  (('keys',), 'a\n'), (('verify',), '')):
+		status, got, _ = _run(args[0], p, *args[1:])
+		assert (status, got) == (1, out), args
+
+
 def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')

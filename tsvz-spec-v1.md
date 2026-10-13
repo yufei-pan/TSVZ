@@ -1355,8 +1355,8 @@ writer (§18.6).
 
 21.8.5 The handler's state is what a conformant reader returns for the store's
 files at that moment. When a part cannot be read, or the read stops at damaged
-data (§4.10), `read`, `get`, `has` and `verify` answer with status 1 and still
-return what could be read.
+data (§4.10), `read`, `get`, `has`, `len`, `keys` and `verify` answer with status
+1 and still return what could be read.
 
 ### 21.9 Acknowledgement
 

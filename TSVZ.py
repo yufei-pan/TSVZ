@@ -5634,9 +5634,13 @@ def _serveDispatch(store, line, bulk, log):
 		found = store.has(args[0], log)
 		return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
 	if operation == 'len':
-		return 0, [str(store.length(log))], ''
+		count = store.length(log)
+		status = unreadable if store.unreadable else (0, '')  # spec §4.10, §20.6: a stopped read failed
+		return status[0], [str(count)], status[1]
 	if operation == 'keys':
-		return 0, [_specEncodeField(key, '\t', isKey=True) for key in store.keys(log)], ''
+		lines = [_specEncodeField(key, '\t', isKey=True) for key in store.keys(log)]
+		status = unreadable if store.unreadable else (0, '')
+		return status[0], lines, status[1]
 	if operation in ('set', 'append', 'delete'):
 		keysOnly = operation == 'delete'
 		if isBulk:

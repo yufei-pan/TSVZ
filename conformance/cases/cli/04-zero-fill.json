@@ -2,5 +2,11 @@
 {"id": "4.9-a-checksum-covers-the-zero-bytes", "spec": ["4.9", "15.4", "20.2"], "level": "MUST",
  "note": "A digest covers a zero-filled line as written, zero bytes included, though recover reads only what follows them.",
  "files": {"s.tsvz": "#_checksum_crc32_#\na\t1\n\u0000\u0000c\t3\n#_checksum_crc32_#\taee75282\n"},
- "steps": [{"op": ["verify"], "stdout": "empty"}, {"op": ["read"], "stdout": {"rows": [["a", "1"], ["c", "3"]]}}]}
+ "steps": [{"op": ["verify"], "stdout": "empty"}, {"op": ["read"], "stdout": {"rows": [["a", "1"], ["c", "3"]]}}]},
+{"id": "4.10-a-stopped-read-fails-every-reading-operation", "spec": ["4.10", "20.6", "21.8.5"], "level": "MUST",
+ "note": "Under stop the read has failed, so every operation that reads the store exits 1, and still prints what was read before the damage.",
+ "files": {"s.tsvz": "#_on_corruption_#\tstop\na\t1\n\u0000\u0000c\t3\nd\t4\n"},
+ "steps": [{"op": ["read"], "exit": 1, "stdout": {"rows": [["a", "1"]]}}, {"op": ["get", "a"], "exit": 1, "stdout": {"rows": [["a", "1"]]}},
+  {"op": ["has", "a"], "exit": 1, "stdout": "empty"}, {"op": ["len"], "exit": 1, "stdout": {"text": "1\n"}},
+  {"op": ["keys"], "exit": 1, "stdout": {"lines": [["a"]]}}, {"op": ["verify"], "exit": 1, "stdout": "empty"}]}
 ]}
