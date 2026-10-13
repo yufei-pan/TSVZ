@@ -1679,6 +1679,20 @@ def test_cli_every_reading_operation_fails_after_a_stop(tmp_path):
 		assert (status, got) == (1, out), args
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX permission bits')
+@pytest.mark.parametrize('part_mode', [0o600, 0o6777])
+def test_a_backup_copy_is_never_more_open_than_its_part(tmp_path, part_mode):
+	# The <part>.damaged-<time> copy holds the part's data: readable only by whoever could read the
+	# part, writable only by its owner, and never setuid, setgid, sticky or executable.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n')
+	os.chmod(p, part_mode)
+	assert _run('scrub', p)[0] == 1
+	backup = [n for n in os.listdir(str(tmp_path)) if n.startswith('s.tsvz.damaged-')][0]
+	mode = os.stat(str(tmp_path / backup)).st_mode & 0o7777
+	assert mode & ~(part_mode & 0o644) == 0, '%o' % mode
+
+
 def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')

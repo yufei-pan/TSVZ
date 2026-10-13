@@ -2605,10 +2605,14 @@ def _specBackupPart(path, reporter):
 			_lockFile(f)
 			try:
 				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+				# Readable by whoever could read the part, writable by its owner only, never setuid,
+				# setgid, sticky or executable (the umask still applies on top).
+				mode = os.fstat(f.fileno()).st_mode & 0o644
 				suffix = 0
 				while True:
 					try:
-						copy = open(backup, 'xb')  # never overwrite an earlier backup
+						# never overwrite an earlier backup
+						copy = os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), 'wb')
 						break
 					except FileExistsError:
 						suffix += 1
