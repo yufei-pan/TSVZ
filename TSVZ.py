@@ -2696,16 +2696,45 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				st = os.fstat(f.fileno())
 				if expect is not None and _specStamp(st) != expect:
 					return None
-				if st.st_size == len(raw) and f.read() == raw:
+				old = f.read()
+				if old == raw:
 					return False
-				f.seek(0)
-				f.write(raw)
-				f.truncate()
-				f.flush()
-				os.fsync(f.fileno())
+				fd = f.fileno()
+				_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
+				try:
+					_overwrite(fd, raw)
+				except BaseException:
+					try:
+						_overwrite(fd, old)  # put the old bytes back rather than leave a half-rewritten part
+					except OSError:
+						pass
+					raise
 				return True
 			finally:
 				_unlockFile(f)
+
+
+def _reserveSpace(fd, length):
+	"""Reserve ``length`` bytes from the start of the file before it is rewritten in place (spec
+	§19.8). Where the platform or the file system cannot reserve space, nothing is reserved."""
+	fallocate = getattr(os, 'posix_fallocate', None)
+	if fallocate is None or length <= 0:
+		return
+	try:
+		fallocate(fd, 0, length)
+	except OSError as e:
+		if e.errno not in (errno.EOPNOTSUPP, getattr(errno, 'ENOTSUP', errno.EOPNOTSUPP), errno.ENOSYS, errno.EINVAL):
+			raise
+
+
+def _overwrite(fd, data):
+	"""Write ``data`` over the file from offset 0, cut the file there, and sync it (unbuffered)."""
+	os.lseek(fd, 0, os.SEEK_SET)
+	view = memoryview(data)
+	while view:
+		view = view[os.write(fd, view):]
+	os.ftruncate(fd, len(data))
+	os.fsync(fd)
 
 
 def _specPreamble(state, delimiter, compensate=False, version=True):

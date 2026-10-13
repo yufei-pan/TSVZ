@@ -1693,6 +1693,28 @@ def test_a_backup_copy_is_never_more_open_than_its_part(tmp_path, part_mode):
 	assert mode & ~(part_mode & 0o644) == 0, '%o' % mode
 
 
+@pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs posix_fallocate and RLIMIT_FSIZE')
+def test_a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was(tmp_path):
+	# Spec §19.8: reserve the space first, so a full disk (here a file-size limit) refuses the rewrite
+	# before any byte of the part changes.
+	import resource
+	import signal
+	p = str(tmp_path / 's.tsvz')
+	original = ('#_defaults_#\tdefault-one\tdefault-two\n' + ''.join('k%d\tv\n' % i for i in range(2000))).encode()
+	_touch(p, original)  # scrubbing resolves the defaults into every row: the part grows
+	limit = len(original) + 100
+
+	def limited():
+		signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+		resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+	done = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'scrub', p], preexec_fn=limited,
+						  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	assert done.returncode == 1, done.stderr
+	with open(p, 'rb') as f:
+		assert f.read() == original, 'the part was changed by a rewrite that could not finish'
+
+
 def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')
