@@ -1911,13 +1911,52 @@ def test_classes_name_the_live_key_equal_to_a_requested_key(tmp_path, make):
 
 def test_client_does_not_resend_a_delete_that_could_name_another_key(tmp_path, monkeypatch):
 	# Spec §20.2.7: once k<space> is deleted, a resent `delete 'k '` would name, and delete, k.
-	c = TSVZ.TSVZClient(str(tmp_path / 's.tsvz'))
 	sent = []
-	monkeypatch.setattr(c, '_request', lambda fields, write=False, bulk=None, retry=True: sent.append((fields, retry)))
-	del c['k ']
-	del c['k']
-	assert sent == [(['delete', 'k '], False), (['delete', 'k'], True)]
-	c.close()
+	for name in ('s.tsvz', 's.tsv'):
+		c = TSVZ.TSVZClient(str(tmp_path / name))
+		monkeypatch.setattr(c, '_request', lambda fields, write=False, bulk=None, retry=True: sent.append((fields, retry)))
+		del c['k ']
+		del c['k\t']  # .tsvz writes k<sep>, never stripped
+		del c['k']
+		c.close()
+	assert [retry for fields, retry in sent] == [False, True, True, True, True, True]
+
+
+@pytest.mark.parametrize('name', ['s.tsvz', 's.tsv'])
+@pytest.mark.parametrize('make', [lambda p: TSVZ.TSVZed(p, rewrite_on_load=False), TSVZ.TSVZedLite],
+						 ids=['TSVZed', 'TSVZedLite'])
+def test_classes_name_keys_by_their_str(tmp_path, make, name):
+	# A key is its str(), as __setitem__ stores it: a (str, Enum) member is not looked up by its value.
+	import enum
+
+	class Color(str, enum.Enum):
+		RED = 'red'
+
+	p = str(tmp_path / name)
+	t = make(p)
+	try:
+		t['red'] = ['r']
+		t[Color.RED] = ['c']
+		assert t[Color.RED][:2] == [str(Color.RED), 'c'] and Color.RED in t and t.get(Color.RED)[1] == 'c'
+		del t[Color.RED]
+		assert Color.RED not in t and list(t.keys()) == ['red']
+		assert t.pop(['a'], None) is None and ['a'] not in t  # unhashable keys are named by their str() too
+	finally:
+		t.close()
+
+
+def test_tsvzed_pop_writes_one_tombstone(tmp_path):
+	# Before Python 3.11 OrderedDict.pop deletes through del self[key], which writes a tombstone of its own.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nx\tv2\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False)
+	try:
+		assert t.pop('x') == ['x', 'v2'] and t.pop('k ') == ['k ', 'v1']
+	finally:
+		t.close()
+	with open(p, 'rb') as f:
+		assert f.read().split(b'\n')[4:] == [b'x', b'#_strip_trailing_whites_#\tfalse', b'k ',
+											 b'#_strip_trailing_whites_#\ttrue', b'']
 
 
 def test_tsvzed_lookups_by_key_iterate_and_delete_every_key(tmp_path):

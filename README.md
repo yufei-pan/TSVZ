@@ -197,6 +197,7 @@ delimiter or encoding argument that conflicts with the extension.
 | L4 | New warnings on stderr (invalid encoding, lines dropped by `strict`); data unchanged. |
 | L5 | A damaged compressed file is read up to the damage instead of raising. |
 | L6 | `mapToFile` no longer glues a row it adds at the end of the file to the next one. |
+| L7 | `TSVZed`'s `in` and `get` find a key as `t[key]` does: the live key equal to it, else the key right-stripped. 3.39 matched them exactly, so `'x ' in t` was false while `t['x ']` read `x`, and `t.setdefault('x ', …)` overwrote `x`. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 
@@ -216,6 +217,7 @@ delimiter or encoding argument that conflicts with the extension.
 | S12 | `TSVZedLite.clear()` and `clear_file()` raise `OSError` when the clear is refused (a part could not be read, the path names one part of a store, or the store kept changing). Memory is reloaded from the unchanged store first. |
 | S13 | Compressed parts are written in members of at most 1 MiB of records (`#_member_size_#`), Zstandard frames with a checksum; an append never reads or repairs the part. |
 | S14 | A zero byte in a value is written `<NUL>`, and a raw zero byte in a record is read as zero-fill damage (spec §4.9): under the default `recover` only the bytes after it are read. **A value that 4.2 or 4.3 wrote with a raw zero byte therefore reads differently in 4.4.** Such values are rare; before upgrading, `grep -c -P '\x00' store.tsvz` (any `.tsvz`, `.csvz` or `.psvz` part) finds them. Stop 4.2 and 4.3 handlers before upgrading: they read `<NUL>` as text, as they read `<CR>`. |
+| S15 | A lookup (`t[key]`, `in`, `get`, `del`, `pop`, `setdefault`) takes the live key equal to the one given before the right-stripped one, so a key ending in whitespace (written while `#_strip_trailing_whites_#` was false) can be read and deleted by name (spec §20.2.7). Setting a key still right-strips it. |
 
 ### The `tsvz` command
 
@@ -235,6 +237,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
 | C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line. |
 | C11 | The table shows control characters, bidi controls and line separators as escapes (`\r`, `\n`, `\t`, `\xNN`, `\uNNNN`), so no value can move the cursor, reorder the line or restyle the terminal. It sizes columns in terminal columns, so CJK text (two columns a character) lines up. The table is for reading: a backslash in a value is shown as is, so use records for exact values. |
+| C12 | While stripping is on, `get`, `has`, `pop`, `delete` and `setdefault` take the live key equal to a KEY ending in a space or tab before the stripped one (spec §20.2.7), so `tsvz keys s \| tsvz delete s -` deletes every key. `delete` of such a KEY reads the store first, and exits 1 without writing when the store cannot be read whole. |
 
 ## Spec deviations and interpretations
 

@@ -1605,6 +1605,8 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 # ===========================================================================
 MAX_SPEC_VERSION = 1
 _MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
+#: What a lookup gets for a key that is not live (spec §20.2.7: then the stripped key is tried).
+_NO_ROW = object()
 _CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
 _ASCII_DIGITS_RE = re.compile(r'^[0-9]+$')
 _SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|CR|NUL|lt|#)>')
@@ -3682,26 +3684,25 @@ class TSVZed(OrderedDict):
 		The fallback strips every trailing whitespace whatever the stripping
 		marker says, as ``__setitem__`` strips every key it writes.
 		"""
-		if not isinstance(key, str):
-			key = str(key)
+		key = str(key)
 		return key if OrderedDict.__contains__(self, key) else key.rstrip()
 
-	# The lookups below inline _nameKey: they are the hot path.
 	def __getitem__(self, key):
-		if not OrderedDict.__contains__(self, key):
-			key = str(key).rstrip()
-		return OrderedDict.__getitem__(self, key)
+		key = str(key)
+		row = dict.get(self, key, _NO_ROW)  # one probe for the usual hit
+		return row if row is not _NO_ROW else OrderedDict.__getitem__(self, key.rstrip())
 
 	def __contains__(self, key):
 		# OrderedDict.setdefault asks this before it reads or writes, so it names keys as t[key] does.
-		return OrderedDict.__contains__(self, key) or OrderedDict.__contains__(self, str(key).rstrip())
+		key = str(key)
+		return dict.__contains__(self, key) or dict.__contains__(self, key.rstrip())
 
 	def get(self, key, default=None):
-		if not OrderedDict.__contains__(self, key):
-			key = str(key).rstrip()
-			if not OrderedDict.__contains__(self, key):
-				return default
-		return OrderedDict.__getitem__(self, key)
+		key = str(key)
+		row = dict.get(self, key, _NO_ROW)
+		if row is _NO_ROW:
+			row = dict.get(self, key.rstrip(), _NO_ROW)
+		return default if row is _NO_ROW else row
 
 
 	def __delitem__(self,key):
@@ -3987,11 +3988,13 @@ memoryOnly:{self.memoryOnly}
 
 		'''
 		key = self._nameKey(key)
-		if key not in self:
+		if not OrderedDict.__contains__(self, key):
 			if default is self.__marker:
 				raise KeyError(key)
 			return default
-		value = super().pop(key)
+		# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
+		value = OrderedDict.__getitem__(self, key)
+		OrderedDict.__delitem__(self, key)
 		if not self.memoryOnly:
 			self.__appendEmptyLine(key)
 		self.lastUpdateTime = get_time_ns()
@@ -4530,8 +4533,7 @@ class TSVZedLite(MutableMapping):
 		The fallback strips every trailing whitespace whatever the stripping
 		marker says, as ``__setitem__`` strips every key it writes.
 		"""
-		if not isinstance(key, str):
-			key = str(key)
+		key = str(key)
 		return key if key in self.indexes else key.rstrip()
 
 	def __contains__(self, key):
@@ -6586,7 +6588,8 @@ class TSVZClient(MutableMapping):
 		"""Delete ``key``; a missing key is not an error (as in ``TSVZed``)."""
 		key = str(key)
 		# Resending the delete of a key ending in whitespace could name, and delete, the stripped key (spec §20.2.7).
-		self._request(['delete', _serveEncode(key)], write=True, retry=not key.endswith((' ', '\t')))
+		retry = not (self._spec and _specStrippable(key, self.delimiter))
+		self._request(['delete', _serveEncode(key)], write=True, retry=retry)
 
 	_marker = object()
 

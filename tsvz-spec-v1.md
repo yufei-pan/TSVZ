@@ -376,10 +376,10 @@ tombstone with stripping disabled — for example between
 that it deletes the key itself and leaves stripping enabled after it.
 
 The guard and the tombstones inside it are one batch, appended in one write
-(§18.2). If a crash or a full disk cuts that write anywhere before its closing
-marker (§4.3, §16.6), stripping stays disabled for every later record. A reader cannot tell this from a
-store whose stripping was disabled on purpose; appending
-`#_strip_trailing_whites_#<d>true` repairs it.
+(§18.2). If a crash or a full disk cuts that write after the guard's first marker
+and before its closing one (§4.3, §16.6), stripping stays disabled for every
+later record. A reader cannot tell this from a store whose stripping was disabled
+on purpose; appending `#_strip_trailing_whites_#<d>true` repairs it.
 
 ---
 
@@ -1136,12 +1136,12 @@ handler MUST exit with status 1 and a diagnostic for them.
 
 20.2.7 **Naming a key.** The KEY arguments of `get`, `has`, `pop`, `delete` and
 `setdefault`, and the keys that `delete -` reads (§20.3), name keys of the store.
-While stripping is in force at the end of the store (§10), a KEY that ends in a
-space or tab MUST name the live key equal to it, if there is one; otherwise a tool
-SHOULD name the key a reader resolves it to (§7.7): the KEY without the trailing
-spaces and tabs of its encoded form (§13). While stripping is not in force, a KEY
-names itself. (While stripping is in force, a live key whose encoded form ends in
-a space or tab was written while stripping was disabled, §9.6.)
+While stripping is in force at the end of the store (§10), a KEY whose encoded
+form (§13) ends in a space or tab MUST name the live key equal to it, if there is
+one; otherwise a tool SHOULD name the key a reader resolves it to (§7.7): the KEY
+without the trailing spaces and tabs of its encoded form. Any other KEY names
+itself. (While stripping is in force, a live key whose encoded form ends in a
+space or tab was written while stripping was disabled, §9.6.)
 
    - `delete` writes the tombstone of the key named, per §9.6 when that key's
      encoded form ends in a space or tab. When it has to read the store to name
