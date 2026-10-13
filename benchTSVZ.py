@@ -35,6 +35,8 @@ def get_terminal_size():
 			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
 			rows, columns = struct.unpack('HHHH', packed)[:2]
+			if not (rows and columns):
+				raise OSError('the terminal has no size set')
 			return columns, rows
 		except Exception:
 			return shutil.get_terminal_size(fallback=(240, 50))

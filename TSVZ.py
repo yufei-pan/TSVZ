@@ -186,6 +186,8 @@ def get_terminal_size():
 			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
 			rows, columns = struct.unpack('HHHH', packed)[:2]
+			if not (rows and columns):
+				raise OSError('the terminal has no size set')
 			_tsize = (columns, rows)
 		except Exception:
 			import shutil
@@ -755,12 +757,32 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
 						tail = f.read(size - keep)
 						f.truncate(keep)
 						reporter.note('truncated-tail', None, 'removed uncommitted tail {!r} before appending'.format(tail[:80]))
-				f.write(payload)
-				f.flush()
+				_appendWhole(f, payload)
 				if fsync:
 					os.fsync(f.fileno())
 			finally:
 				_unlockFile(f)
+
+
+def _appendWhole(f, payload):
+	"""Append ``payload`` to ``f`` (open for appending, locked, nothing buffered) in unbuffered writes.
+
+	A write that fails part way is cut back off, so no prefix of a batch stays
+	committed: one that ended after a ``#_strip_trailing_whites_#`` false
+	marker (spec §9.6) would change every record after it.
+	"""
+	fd = f.fileno()
+	size = os.lseek(fd, 0, os.SEEK_END)
+	try:
+		view = memoryview(payload)
+		while view:
+			view = view[os.write(fd, view):]
+	except BaseException:
+		try:
+			os.ftruncate(fd, size)
+		except OSError:
+			pass  # the error below still reports the failed append
+		raise
 
 
 _CODEC_SUPPORT = {}
@@ -1655,16 +1677,18 @@ def _specFormatRecord(cells, delimiter, marker=False):
 	return delimiter.join([first] + [_specEncodeField(cell, delimiter) for cell in cells[1:]])
 
 
-def _specTombstones(keys, strip):
+def _specTombstones(keys, delimiter, strip):
 	"""``(cells, marker)`` records that delete ``keys`` (spec §9.2) from a store whose stripping is ``strip``.
 
 	While stripping is on a reader strips a tombstone's key too (spec §9.1): the
-	tombstone of a key ending in a space or tab, stored while stripping was off,
-	would delete the stripped key instead. A batch holding one is written with
-	stripping off, and stripping is turned back on after it (spec §9.6).
+	tombstone of a key whose encoded form ends in a space or tab, stored while
+	stripping was off, would delete the stripped key instead. A batch holding
+	one is written with stripping off, and stripping is turned back on after it
+	(spec §9.6).
 	"""
 	rows = [([key], False) for key in keys]
-	if strip and any(key.endswith((' ', '\t')) for key in keys):
+	if strip and any(key.endswith((' ', '\t')) and _specEncodeField(key, delimiter, isKey=True).endswith((' ', '\t'))
+					 for key in keys):
 		rows.insert(0, (['#_strip_trailing_whites_#', 'false'], True))
 		rows.append((['#_strip_trailing_whites_#', 'true'], True))
 	return rows
@@ -1673,6 +1697,12 @@ def _specTombstones(keys, strip):
 def _specFormatRecords(rows, delimiter):
 	"""``rows`` (``[(cells, marker), ...]``) as record lines, each with its '\\n'."""
 	return ''.join(_specFormatRecord(cells, delimiter, marker=marker) + '\n' for cells, marker in rows)
+
+
+def _specTombstoneLines(key, delimiter, strip):
+	"""The tombstone of ``key`` (spec §9.6) as lines joined by '\\n', without a last '\\n'."""
+	return '\n'.join(_specFormatRecord(cells, delimiter, marker=marker)
+					 for cells, marker in _specTombstones([key], delimiter, strip))
 
 
 class _SpecState(object):
@@ -2627,18 +2657,21 @@ def _specBackupPart(path, reporter):
 				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
 				# Readable by whoever could read the part, writable by its owner only, never setuid,
 				# setgid, sticky or executable (the umask still applies on top).
-				mode = os.fstat(f.fileno()).st_mode & 0o644
+				st = os.fstat(f.fileno())
+				mode = st.st_mode & 0o644
 				suffix = 0
 				while True:
 					try:
-						# never overwrite an earlier backup
-						copy = os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), 'wb')
+						# never overwrite an earlier backup; O_BINARY: no newline translation on Windows
+						flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+						copy = os.fdopen(os.open(backup, flags, mode), 'wb')
 						break
 					except FileExistsError:
 						suffix += 1
 						backup = '{}.{}'.format(first, suffix)
 				try:
 					with copy:
+						_matchOwner(copy.fileno(), st, mode)
 						shutil.copyfileobj(f, copy)
 						copy.flush()
 						os.fsync(copy.fileno())
@@ -2669,8 +2702,7 @@ def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
 		with open(path, 'ab') as f:
 			_lockFile(f)
 			try:
-				f.write(_compressBytes(codec, payload, memberSize=memberSize))
-				f.flush()
+				_appendWhole(f, _compressBytes(codec, payload, memberSize=memberSize))
 				if fsync:
 					os.fsync(f.fileno())
 			finally:
@@ -2697,6 +2729,21 @@ def _specSnapshot(fileName):
 		return parts, None
 
 
+def _matchOwner(fd, st, mode):
+	"""Give a new copy the owner and group of the file ``st`` describes. Where that is not allowed,
+	a copy left in another group loses its group bits, so no one reads it who could not read the file."""
+	if not hasattr(os, 'fchown'):
+		return
+	for uid in (st.st_uid, -1):
+		try:
+			os.fchown(fd, uid, st.st_gid)
+			return
+		except OSError:
+			pass
+	if os.fstat(fd).st_gid != st.st_gid:
+		os.fchmod(fd, mode & ~0o070)
+
+
 def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
 
@@ -2716,19 +2763,30 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				st = os.fstat(f.fileno())
 				if expect is not None and _specStamp(st) != expect:
 					return None
-				old = f.read()
-				if old == raw:
-					return False
 				fd = f.fileno()
-				_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
+				# The bytes the rewrite overwrites: all a failed one has to put back. Read unbuffered, as
+				# the file is written below: a read-ahead in f would leave it a stale position to close at.
+				old = _readFrom0(fd, len(raw))
+				if st.st_size == len(raw) and old == raw:
+					return False
+				written = 0
 				try:
-					_overwrite(fd, raw)
-				except BaseException:
+					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
+					os.lseek(fd, 0, os.SEEK_SET)
+					view = memoryview(raw)
+					while written < len(raw):
+						written += os.write(fd, view[written:])
+					os.ftruncate(fd, len(raw))
+				except BaseException as e:
+					# Put the old bytes and size back rather than leave a half-rewritten part (or one a
+					# failed reservation lengthened).
 					try:
-						_overwrite(fd, old)  # put the old bytes back rather than leave a half-rewritten part
-					except OSError:
-						pass
+						_putBack(fd, old[:written], st.st_size)
+					except OSError as undo:
+						raise OSError(getattr(e, 'errno', None), '{}: the rewrite failed ({}) and the old bytes could not be put back ({}): '
+									  'the part is damaged'.format(path, e, undo))
 					raise
+				os.fsync(fd)
 				return True
 			finally:
 				_unlockFile(f)
@@ -2747,13 +2805,27 @@ def _reserveSpace(fd, length):
 			raise
 
 
-def _overwrite(fd, data):
-	"""Write ``data`` over the file from offset 0, cut the file there, and sync it (unbuffered)."""
+def _readFrom0(fd, length):
+	"""Up to ``length`` bytes from the start of the file (unbuffered)."""
 	os.lseek(fd, 0, os.SEEK_SET)
-	view = memoryview(data)
+	chunks = []
+	while length > 0:
+		chunk = os.read(fd, length)
+		if not chunk:
+			break
+		chunks.append(chunk)
+		length -= len(chunk)
+	return b''.join(chunks)
+
+
+def _putBack(fd, old, size):
+	"""Undo a failed in-place rewrite: write ``old`` over the file from offset 0, set its size back to
+	``size`` and sync it (unbuffered)."""
+	os.lseek(fd, 0, os.SEEK_SET)
+	view = memoryview(old)
 	while view:
 		view = view[os.write(fd, view):]
-	os.ftruncate(fd, len(data))
+	os.ftruncate(fd, size)
 	os.fsync(fd)
 
 
@@ -2959,7 +3031,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
 				return False
 			if len(load.parts) > 1:
-				tombstones = _specFormatRecords(_specTombstones(load.data, load.state.strip), delimiter)
+				tombstones = _specFormatRecords(_specTombstones(load.data, delimiter, load.state.strip), delimiter)
 				if tombstones:
 					_specAppendPayload(load.active, tombstones.encode('utf-8'), attempt, memberSize=load.state.memberSize)
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
@@ -3613,7 +3685,7 @@ class TSVZed(OrderedDict):
 		self.dirty = True
 		if self._spec:
 			# Spec §9.2: a tombstone is the lone key, never padded. One queue item, so it is committed whole.
-			self.appendQueue.append(_specFormatRecords(_specTombstones([key], self._specState.strip), self.delimiter)[:-1])
+			self.appendQueue.append(_specTombstoneLines(key, self.delimiter, self._specState.strip))
 			return self
 		if self.correctColumnNum > 1:
 			emptyLine = [key]+['']*(self.correctColumnNum-1)
@@ -3835,7 +3907,12 @@ memoryOnly:{self.memoryOnly}
 		return self.close()
 
 	def popitem(self, last=True):
-		key, value = super().popitem(last)
+		# Not OrderedDict.popitem: before Python 3.9 it pops through self.pop, which strips the key.
+		if not OrderedDict.__len__(self):
+			raise KeyError('dictionary is empty')
+		key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+		value = OrderedDict.__getitem__(self, key)
+		OrderedDict.__delitem__(self, key)
 		if not self.memoryOnly:
 			self.__appendEmptyLine(key)
 		self.lastUpdateTime = get_time_ns()
@@ -4713,7 +4790,7 @@ class TSVZedLite(MutableMapping):
 
 	def __mapDeleteToFile(self,key):
 		if self._spec:
-			self._specWrite(_specFormatRecords(_specTombstones([key], self._specState.strip), self.delimiter)[:-1])
+			self._specWrite(_specTombstoneLines(key, self.delimiter, self._specState.strip))
 			return
 		# Persist a deletion by appending a tombstone (a lone key with no
 		# values); on read such a row deletes the key (see _processLine). The
@@ -4857,7 +4934,7 @@ class TSVZedLite(MutableMapping):
 					eprint(f"Key {key} not found")
 				return
 			self.indexes.pop(key, None)
-			self._specWrite(_specFormatRecord([key], self.delimiter))
+			self.__mapDeleteToFile(key)
 			return
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.__mapDeleteToFile(key)
@@ -5440,7 +5517,7 @@ class _ServeStore(object):
 
 	def _tombstone(self, key):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
-		return _specTombstones([key], self.state.strip) if self.spec else [([key], False)]
+		return _specTombstones([key], self.delimiter, self.state.strip) if self.spec else [([key], False)]
 
 	def _durable(self, sync):
 		return sync or (self.spec and self.state.writeAck == 'disk')
@@ -5678,25 +5755,32 @@ def _serveDispatch(store, line, bulk, log):
 	if operation in _SERVE_NEED_STORE and store.missing(log):
 		return 1, [], 'no such store'  # spec §20.2.2
 	unreadable = (1, _SERVE_UNREADABLE)
+	# Each read takes its status under the store lock it read under: another request's reload may
+	# change ``unreadable`` once the lock is free.
 	if operation == 'read':
-		rows = store.read(log)
-		status = unreadable if store.unreadable else (0, '')
+		with store.lock:
+			rows = store.read(log)
+			status = unreadable if store.unreadable else (0, '')
 		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
 	if operation == 'get':
-		rows, missing = store.get(args, log)
-		status = unreadable if store.unreadable else (3 if missing else 0, '')
+		with store.lock:
+			rows, missing = store.get(args, log)
+			status = unreadable if store.unreadable else (3 if missing else 0, '')
 		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
 	if operation == 'has':
-		found = store.has(args[0], log)
-		return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
+		with store.lock:
+			found = store.has(args[0], log)
+			return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
 	if operation == 'len':
-		count = store.length(log)
-		status = unreadable if store.unreadable else (0, '')  # spec §4.10, §20.6: a stopped read failed
+		with store.lock:
+			count = store.length(log)
+			status = unreadable if store.unreadable else (0, '')  # spec §4.10, §20.6: a stopped read failed
 		return status[0], [str(count)], status[1]
 	if operation == 'keys':
-		lines = [_specEncodeField(key, '\t', isKey=True) for key in store.keys(log)]
-		status = unreadable if store.unreadable else (0, '')
-		return status[0], lines, status[1]
+		with store.lock:
+			keys = store.keys(log)
+			status = unreadable if store.unreadable else (0, '')
+		return status[0], [_specEncodeField(key, '\t', isKey=True) for key in keys], status[1]
 	if operation in ('set', 'append', 'delete'):
 		keysOnly = operation == 'delete'
 		if isBulk:

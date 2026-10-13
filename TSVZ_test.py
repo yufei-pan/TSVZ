@@ -1443,31 +1443,18 @@ def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypat
 
 
 def _tear_first_append(monkeypatch, path):
-	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would."""
+	"""Make the next append to ``path`` write half its bytes and then fail, leaving them there: as a
+	full disk does when the half cannot be cut back off either, or a crash."""
 	torn = []
-	real_open = open
+	real = TSVZ._appendWhole
 
-	class Tearing(object):
-		def __init__(self, f):
-			self._f = f
-		def write(self, data):
-			if not torn:
-				torn.append(len(data))
-				self._f.write(data[:len(data) // 2])
-				self._f.flush()
-				raise OSError(28, 'No space left on device')
-			return self._f.write(data)
-		def __getattr__(self, name):
-			return getattr(self._f, name)
-		def __enter__(self):
-			return self
-		def __exit__(self, *exc):
-			self._f.close()
-
-	def opener(name, mode='r', *args, **kwargs):
-		f = real_open(name, mode, *args, **kwargs)
-		return Tearing(f) if name == path and 'a' in mode else f
-	monkeypatch.setattr(TSVZ, 'open', opener, raising=False)
+	def tearing(f, payload):
+		if not torn and f.name == path:
+			torn.append(len(payload))
+			os.write(f.fileno(), payload[:len(payload) // 2])
+			raise OSError(28, 'No space left on device')
+		return real(f, payload)
+	monkeypatch.setattr(TSVZ, '_appendWhole', tearing)
 	return torn
 
 
@@ -1693,6 +1680,39 @@ def test_a_backup_copy_is_never_more_open_than_its_part(tmp_path, part_mode):
 	assert mode & ~(part_mode & 0o644) == 0, '%o' % mode
 
 
+@pytest.mark.skipif(getattr(os, 'geteuid', lambda: -1)() != 0, reason='needs root to give the part another owner')
+def test_a_backup_copy_belongs_to_the_owner_and_group_of_its_part(tmp_path):
+	# A copy root makes of alice's part stays alice's, in the part's group, not root's.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n')
+	os.chown(p, 12345, 23456)
+	os.chmod(p, 0o640)
+	assert _run('scrub', p)[0] == 1
+	backup = [n for n in os.listdir(str(tmp_path)) if n.startswith('s.tsvz.damaged-')][0]
+	st = os.stat(str(tmp_path / backup))
+	assert (st.st_uid, st.st_gid) == (12345, 23456)
+
+
+@pytest.mark.skipif(not hasattr(os, 'fchown'), reason='POSIX owners')
+def test_a_backup_copy_left_in_another_group_loses_its_group_bits(tmp_path, monkeypatch):
+	# Where the copy cannot be given the part's group, that group's members must not read it.
+	p = str(tmp_path / 'copy')
+	_touch(p)
+	os.chmod(p, 0o640)
+	part = os.stat(p)
+	stranger = os.stat_result((part.st_mode, 0, 0, 0, part.st_uid, part.st_gid + 1) + tuple(part)[6:])
+
+	def refuse(*args):
+		raise PermissionError(errno.EPERM, 'not permitted')
+	monkeypatch.setattr(os, 'fchown', refuse)
+	fd = os.open(p, os.O_RDONLY)
+	try:
+		TSVZ._matchOwner(fd, stranger, 0o640)
+	finally:
+		os.close(fd)
+	assert os.stat(p).st_mode & 0o777 == 0o600
+
+
 @pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs posix_fallocate and RLIMIT_FSIZE')
 def test_a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was(tmp_path):
 	# Spec §19.8: reserve the space first, so a full disk (here a file-size limit) refuses the rewrite
@@ -1715,6 +1735,54 @@ def test_a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was(tmp_path)
 		assert f.read() == original, 'the part was changed by a rewrite that could not finish'
 
 
+@pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs RLIMIT_FSIZE')
+def test_a_rewrite_that_fails_part_way_puts_the_old_bytes_back(tmp_path):
+	# Where no space can be reserved, the write itself fails part way: the bytes it overwrote and
+	# the part's size are put back.
+	p = str(tmp_path / 's.tsvz')
+	original = ''.join('k%d\tv\n' % i for i in range(2000)).encode()
+	_touch(p, original)
+	limit = len(original) + 100
+	code = '\n'.join([
+		'import resource, signal, sys',
+		'sys.path.insert(0, sys.argv[1])',
+		'import TSVZ',
+		'TSVZ._reserveSpace = lambda fd, length: None  # a file system that cannot reserve space',
+		'signal.signal(signal.SIGXFSZ, signal.SIG_IGN)',
+		'resource.setrlimit(resource.RLIMIT_FSIZE, (int(sys.argv[3]),) * 2)',
+		'try:',
+		'    TSVZ._specRewriteInPlace(sys.argv[2], b"x\\n" * int(sys.argv[3]))',
+		'except OSError as e:',
+		'    print(e.errno)'])
+	done = subprocess.run([sys.executable, '-c', code, HERE, p, str(limit)], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True)
+	assert done.stdout.strip() == str(errno.EFBIG), done.stderr
+	with open(p, 'rb') as f:
+		assert f.read() == original, 'the part was left half-rewritten'
+
+
+@pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs RLIMIT_FSIZE')
+def test_an_append_that_fails_part_way_leaves_none_of_its_batch(tmp_path):
+	# A popitem of `k ` writes stripping off, the tombstone, stripping on (spec §9.6); one that fails
+	# after the first line must not leave stripping off for every later record.
+	import resource
+	import signal
+	p = str(tmp_path / 's.tsvz')
+	original = b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n'
+	_touch(p, original)
+	limit = len(original) + len(b'#_strip_trailing_whites_#\tfalse\n') + 1
+
+	def limited():
+		signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+		resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+	done = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'popitem', p, 'first'], preexec_fn=limited,
+						  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	assert done.returncode != 0, done.stdout
+	with open(p, 'rb') as f:
+		assert f.read() == original
+
+
 def test_cli_tombstones_of_keys_ending_in_space_delete_that_key(tmp_path):
 	# While stripping is on, a reader strips a tombstone's key (§9.1): a stored key `k ` (written while
 	# stripping was off) must be deleted without deleting `k`.
@@ -1727,6 +1795,16 @@ def test_cli_tombstones_of_keys_ending_in_space_delete_that_key(tmp_path):
 	_touch(m + '.1', b'k\tv2\n')
 	assert _run('clear', m)[0] == 0
 	assert _run('read', m)[:2] == (0, '')
+
+
+def test_only_a_tombstone_stripping_would_change_is_guarded():
+	# Spec §9.6, §10.2: in .tsvz a key's trailing tab is written <sep>, which stripping leaves alone.
+	guard = [(['#_strip_trailing_whites_#', 'false'], True), (['k '], False), (['#_strip_trailing_whites_#', 'true'], True)]
+	assert TSVZ._specTombstones(['k '], '\t', True) == guard
+	assert TSVZ._specTombstones(['k '], '\t', False) == [(['k '], False)]
+	assert TSVZ._specTombstones(['k\t'], '\t', True) == [(['k\t'], False)]
+	assert TSVZ._specTombstones(['k\t'], ',', True)[0] == guard[0]
+	assert TSVZ._specTombstoneLines('k ', '\t', True) == '#_strip_trailing_whites_#\tfalse\nk \n#_strip_trailing_whites_#\ttrue'
 
 
 @pytest.mark.parametrize('make', [lambda p: TSVZ.TSVZed(p, rewrite_on_load=False), TSVZ.TSVZedLite],
