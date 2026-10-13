@@ -1715,6 +1715,32 @@ def test_a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was(tmp_path)
 		assert f.read() == original, 'the part was changed by a rewrite that could not finish'
 
 
+def test_cli_tombstones_of_keys_ending_in_space_delete_that_key(tmp_path):
+	# While stripping is on, a reader strips a tombstone's key (§9.1): a stored key `k ` (written while
+	# stripping was off) must be deleted without deleting `k`.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n')
+	assert _run('popitem', p, 'first')[:2] == (0, 'k \tv1\n')
+	assert _run('read', p)[:2] == (0, 'k\tv2\n')
+	m = str(tmp_path / 'm.tsvz')
+	_touch(m, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\n')
+	_touch(m + '.1', b'k\tv2\n')
+	assert _run('clear', m)[0] == 0
+	assert _run('read', m)[:2] == (0, '')
+
+
+@pytest.mark.parametrize('make', [lambda p: TSVZ.TSVZed(p, rewrite_on_load=False), TSVZ.TSVZedLite],
+						 ids=['TSVZed', 'TSVZedLite'])
+def test_classes_pop_a_key_ending_in_space_by_its_own_tombstone(tmp_path, make):
+	# Spec §9.6, through the library classes.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n')
+	t = make(p)
+	assert t.popitem(last=False) == ('k ', ['k ', 'v1'])
+	t.close()
+	assert dict(TSVZ.readTabularFile(p)) == {'k': ['k', 'v2']}
+
+
 def test_engine_stops_following_at_a_zero_filled_line_under_stop(tmp_path):
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#_on_corruption_#\tstop\na\t1\n')

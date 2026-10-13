@@ -1655,6 +1655,26 @@ def _specFormatRecord(cells, delimiter, marker=False):
 	return delimiter.join([first] + [_specEncodeField(cell, delimiter) for cell in cells[1:]])
 
 
+def _specTombstones(keys, strip):
+	"""``(cells, marker)`` records that delete ``keys`` (spec §9.2) from a store whose stripping is ``strip``.
+
+	While stripping is on a reader strips a tombstone's key too (spec §9.1): the
+	tombstone of a key ending in a space or tab, stored while stripping was off,
+	would delete the stripped key instead. A batch holding one is written with
+	stripping off, and stripping is turned back on after it (spec §9.6).
+	"""
+	rows = [([key], False) for key in keys]
+	if strip and any(key.endswith((' ', '\t')) for key in keys):
+		rows.insert(0, (['#_strip_trailing_whites_#', 'false'], True))
+		rows.append((['#_strip_trailing_whites_#', 'true'], True))
+	return rows
+
+
+def _specFormatRecords(rows, delimiter):
+	"""``rows`` (``[(cells, marker), ...]``) as record lines, each with its '\\n'."""
+	return ''.join(_specFormatRecord(cells, delimiter, marker=marker) + '\n' for cells, marker in rows)
+
+
 class _SpecState(object):
 	"""Reader state of spec §12, carried across records and parts."""
 
@@ -2939,7 +2959,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
 				return False
 			if len(load.parts) > 1:
-				tombstones = ''.join(_specFormatRecord([key], delimiter) + '\n' for key in load.data)
+				tombstones = _specFormatRecords(_specTombstones(load.data, load.state.strip), delimiter)
 				if tombstones:
 					_specAppendPayload(load.active, tombstones.encode('utf-8'), attempt, memberSize=load.state.memberSize)
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
@@ -3592,8 +3612,8 @@ class TSVZed(OrderedDict):
 		# the mapping by the caller, so self[key] must not be accessed.
 		self.dirty = True
 		if self._spec:
-			# Spec §9.2: a tombstone is the lone key, never padded.
-			self.appendQueue.append(_specFormatRecord([key], self.delimiter))
+			# Spec §9.2: a tombstone is the lone key, never padded. One queue item, so it is committed whole.
+			self.appendQueue.append(_specFormatRecords(_specTombstones([key], self._specState.strip), self.delimiter)[:-1])
 			return self
 		if self.correctColumnNum > 1:
 			emptyLine = [key]+['']*(self.correctColumnNum-1)
@@ -4520,7 +4540,7 @@ class TSVZedLite(MutableMapping):
 		self._specWrite(_specFormatRecord(value, self.delimiter, marker=True))
 
 	def _specWrite(self, line):
-		"""Append one record to the active part; return its offset, or None for a compressed part."""
+		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
 		data = (line + '\n').encode('utf-8', errors='replace')
 		if self.fileObj is None:
 			reporter = _Reporter(self._activePath)
@@ -4693,7 +4713,7 @@ class TSVZedLite(MutableMapping):
 
 	def __mapDeleteToFile(self,key):
 		if self._spec:
-			self._specWrite(_specFormatRecord([key], self.delimiter))
+			self._specWrite(_specFormatRecords(_specTombstones([key], self._specState.strip), self.delimiter)[:-1])
 			return
 		# Persist a deletion by appending a tombstone (a lone key with no
 		# values); on read such a row deletes the key (see _processLine). The
@@ -5414,10 +5434,13 @@ class _ServeStore(object):
 	def _payload(self, rows, log):
 		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
 		if self.spec:
-			return ''.join(_specFormatRecord(cells, self.delimiter, marker=marker) + '\n'
-						   for cells, marker in rows).encode('utf-8')
+			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
 		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, [''], True, self.verbose,
 									'utf8', self.strict, self.delimiter)[0]
+
+	def _tombstone(self, key):
+		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
+		return _specTombstones([key], self.state.strip) if self.spec else [([key], False)]
 
 	def _durable(self, sync):
 		return sync or (self.spec and self.state.writeAck == 'disk')
@@ -5456,7 +5479,7 @@ class _ServeStore(object):
 			if row is None:
 				return None
 			row = list(row)
-			queued = self._submit([([key], False)], sync, log)
+			queued = self._submit(self._tombstone(key), sync, log)
 		self._ack(queued, written=True)  # the row is only popped once its tombstone is written
 		return row
 
@@ -5470,7 +5493,7 @@ class _ServeStore(object):
 				return None
 			key = next(reversed(self.data)) if last else next(iter(self.data))
 			row = list(self.data[key])
-			queued = self._submit([([key], False)], sync, log)
+			queued = self._submit(self._tombstone(key), sync, log)
 		self._ack(queued, written=True)
 		return row
 

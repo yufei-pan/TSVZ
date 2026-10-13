@@ -367,6 +367,14 @@ every row is of the form `key\n` and is therefore a tombstone; such a store can
 represent only deletions. To represent presence-with-empty-value, a row MUST
 include at least one delimiter (`key\t\n`).
 
+9.6 **Keys ending in whitespace.** A key stored while stripping was disabled
+(§10) can end in a raw space or tab. While stripping is enabled, a tombstone for
+such a key would resolve to the stripped key (§9.1) and delete that one instead.
+A writer that deletes such a key while stripping is enabled MUST write its
+tombstone with stripping disabled — for example between
+`#_strip_trailing_whites_#<d>false` and `#_strip_trailing_whites_#<d>true` — so
+that it deletes the key itself and leaves stripping enabled after it.
+
 ---
 
 ## 10. Whitespace

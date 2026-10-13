@@ -18,5 +18,10 @@
  "note": "Clearing a multi-part store appends tombstones to its active part, the last one, and changes no earlier byte.",
  "files": {"s.tsvz": "#_defaults_#\td\na\t1\n", "s.tsvz.1": "b\t2\nc\t3\n"},
  "steps": [{"op": ["clear"]}],
+ "after": {"rows": [], "fidelity": "markers", "bytes": ["last-part-only", "encoded"]}},
+{"id": "9.6-clear-tombstones-a-key-ending-in-a-space", "spec": ["9.6", "18.8", "20.2"], "level": "MUST",
+ "note": "Clearing a multi-part store deletes a key k<space> written while stripping was off, though stripping is on at the end, and leaves the final marker state as it was.",
+ "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\n", "s.tsvz.1": "k\tv2\n"},
+ "steps": [{"op": ["clear"]}],
  "after": {"rows": [], "fidelity": "markers", "bytes": ["last-part-only", "encoded"]}}
 ]}

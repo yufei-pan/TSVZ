@@ -158,5 +158,10 @@
 {"id": "20.4.1-verify-lines-are-tab-joined-for-csvz", "spec": ["20.4.1", "20.2"], "level": "MUST", "requires": ["crc32"],
  "note": "verify joins its fields with TAB whatever the store's delimiter; the marker's value is split off with the store's comma.",
  "store": "s.csvz", "files": {"s.csvz": "#_checksum_crc32_#\na,x\n#_checksum_crc32_#,00000000\n"},
- "steps": [{"op": ["verify"], "exit": 4, "stdout": {"lines": [["{store}", "3", "crc32", "00000000", "94baea1e"]]}}]}
+ "steps": [{"op": ["verify"], "exit": 4, "stdout": {"lines": [["{store}", "3", "crc32", "00000000", "94baea1e"]]}}]},
+{"id": "9.6-popitem-of-a-key-ending-in-a-space", "spec": ["9.6", "9.1", "20.2"], "level": "MUST",
+ "note": "A key k<space> written while stripping was off is popped by its own tombstone, not one a reader strips to k while stripping is on.",
+ "files": {"s.tsvz": "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n"},
+ "steps": [{"op": ["popitem", "first"], "stdout": {"rows": [["k ", "v1"]]}}, {"op": ["read"], "stdout": {"rows": [["k", "v2"]]}}],
+ "after": {"rows": [["k", "v2"]]}}
 ]}
