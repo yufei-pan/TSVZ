@@ -27,7 +27,10 @@ def almost_urandom(n):
 
 def get_terminal_size():
 	try:
-		return os.get_terminal_size()
+		size = os.get_terminal_size()
+		if not (size[0] and size[1]):
+			raise OSError('the terminal has no size set')
+		return size
 	except Exception:
 		try:
 			import fcntl

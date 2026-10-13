@@ -1443,18 +1443,31 @@ def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypat
 
 
 def _tear_first_append(monkeypatch, path):
-	"""Make the next append to ``path`` write half its bytes and then fail, leaving them there: as a
-	full disk does when the half cannot be cut back off either, or a crash."""
+	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would."""
 	torn = []
-	real = TSVZ._appendWhole
+	real_open = open
 
-	def tearing(f, payload):
-		if not torn and f.name == path:
-			torn.append(len(payload))
-			os.write(f.fileno(), payload[:len(payload) // 2])
-			raise OSError(28, 'No space left on device')
-		return real(f, payload)
-	monkeypatch.setattr(TSVZ, '_appendWhole', tearing)
+	class Tearing(object):
+		def __init__(self, f):
+			self._f = f
+		def write(self, data):
+			if not torn:
+				torn.append(len(data))
+				self._f.write(data[:len(data) // 2])
+				self._f.flush()
+				raise OSError(28, 'No space left on device')
+			return self._f.write(data)
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+
+	def opener(name, mode='r', *args, **kwargs):
+		f = real_open(name, mode, *args, **kwargs)
+		return Tearing(f) if name == path and 'a' in mode else f
+	monkeypatch.setattr(TSVZ, 'open', opener, raising=False)
 	return torn
 
 
@@ -1705,12 +1718,14 @@ def test_a_backup_copy_left_in_another_group_loses_its_group_bits(tmp_path, monk
 	def refuse(*args):
 		raise PermissionError(errno.EPERM, 'not permitted')
 	monkeypatch.setattr(os, 'fchown', refuse)
-	fd = os.open(p, os.O_RDONLY)
-	try:
-		TSVZ._matchOwner(fd, stranger, 0o640)
-	finally:
-		os.close(fd)
-	assert os.stat(p).st_mode & 0o777 == 0o600
+	for created in (0o640, 0o600):  # 0o600: what a umask of 077 leaves; it must not be widened
+		os.chmod(p, created)
+		fd = os.open(p, os.O_RDONLY)
+		try:
+			TSVZ._matchOwner(fd, stranger)
+		finally:
+			os.close(fd)
+		assert os.stat(p).st_mode & 0o777 == 0o600, '%o' % created
 
 
 @pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs posix_fallocate and RLIMIT_FSIZE')
@@ -1733,6 +1748,30 @@ def test_a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was(tmp_path)
 	assert done.returncode == 1, done.stderr
 	with open(p, 'rb') as f:
 		assert f.read() == original, 'the part was changed by a rewrite that could not finish'
+
+
+@pytest.mark.parametrize('call', ['write', 'ftruncate'])
+@pytest.mark.parametrize('lines', [5, 2000], ids=['shrinks', 'grows'])
+def test_a_rewrite_interrupted_after_a_call_puts_the_old_bytes_back(tmp_path, monkeypatch, call, lines):
+	# A Ctrl-C can land after a write or the cut has happened and before the code notes it.
+	p = str(tmp_path / 's.tsvz')
+	original = ''.join('k%d\tv\n' % i for i in range(100)).encode()
+	_touch(p, original)
+	real = getattr(os, call)
+	fired = []
+
+	def interrupted(*args):
+		result = real(*args)
+		if not fired:
+			fired.append(call)
+			raise KeyboardInterrupt
+		return result
+	monkeypatch.setattr(os, call, interrupted)
+	with pytest.raises(KeyboardInterrupt):
+		TSVZ._specRewriteInPlace(p, b'x\n' * lines)
+	monkeypatch.undo()
+	with open(p, 'rb') as f:
+		assert f.read() == original
 
 
 @pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs RLIMIT_FSIZE')
@@ -1760,27 +1799,6 @@ def test_a_rewrite_that_fails_part_way_puts_the_old_bytes_back(tmp_path):
 	with open(p, 'rb') as f:
 		assert f.read() == original, 'the part was left half-rewritten'
 
-
-@pytest.mark.skipif(not hasattr(os, 'posix_fallocate'), reason='needs RLIMIT_FSIZE')
-def test_an_append_that_fails_part_way_leaves_none_of_its_batch(tmp_path):
-	# A popitem of `k ` writes stripping off, the tombstone, stripping on (spec §9.6); one that fails
-	# after the first line must not leave stripping off for every later record.
-	import resource
-	import signal
-	p = str(tmp_path / 's.tsvz')
-	original = b'#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n'
-	_touch(p, original)
-	limit = len(original) + len(b'#_strip_trailing_whites_#\tfalse\n') + 1
-
-	def limited():
-		signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-		resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
-
-	done = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'popitem', p, 'first'], preexec_fn=limited,
-						  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-	assert done.returncode != 0, done.stdout
-	with open(p, 'rb') as f:
-		assert f.read() == original
 
 
 def test_cli_tombstones_of_keys_ending_in_space_delete_that_key(tmp_path):

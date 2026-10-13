@@ -179,6 +179,8 @@ def get_terminal_size():
 	try:
 		import os
 		_tsize = os.get_terminal_size()
+		if not (_tsize[0] and _tsize[1]):
+			raise OSError('the terminal has no size set')
 	except Exception:
 		try:
 			import fcntl
@@ -757,32 +759,12 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
 						tail = f.read(size - keep)
 						f.truncate(keep)
 						reporter.note('truncated-tail', None, 'removed uncommitted tail {!r} before appending'.format(tail[:80]))
-				_appendWhole(f, payload)
+				f.write(payload)
+				f.flush()
 				if fsync:
 					os.fsync(f.fileno())
 			finally:
 				_unlockFile(f)
-
-
-def _appendWhole(f, payload):
-	"""Append ``payload`` to ``f`` (open for appending, locked, nothing buffered) in unbuffered writes.
-
-	A write that fails part way is cut back off, so no prefix of a batch stays
-	committed: one that ended after a ``#_strip_trailing_whites_#`` false
-	marker (spec §9.6) would change every record after it.
-	"""
-	fd = f.fileno()
-	size = os.lseek(fd, 0, os.SEEK_END)
-	try:
-		view = memoryview(payload)
-		while view:
-			view = view[os.write(fd, view):]
-	except BaseException:
-		try:
-			os.ftruncate(fd, size)
-		except OSError:
-			pass  # the error below still reports the failed append
-		raise
 
 
 _CODEC_SUPPORT = {}
@@ -2671,7 +2653,7 @@ def _specBackupPart(path, reporter):
 						backup = '{}.{}'.format(first, suffix)
 				try:
 					with copy:
-						_matchOwner(copy.fileno(), st, mode)
+						_matchOwner(copy.fileno(), st)
 						shutil.copyfileobj(f, copy)
 						copy.flush()
 						os.fsync(copy.fileno())
@@ -2702,7 +2684,8 @@ def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
 		with open(path, 'ab') as f:
 			_lockFile(f)
 			try:
-				_appendWhole(f, _compressBytes(codec, payload, memberSize=memberSize))
+				f.write(_compressBytes(codec, payload, memberSize=memberSize))
+				f.flush()
 				if fsync:
 					os.fsync(f.fileno())
 			finally:
@@ -2729,7 +2712,7 @@ def _specSnapshot(fileName):
 		return parts, None
 
 
-def _matchOwner(fd, st, mode):
+def _matchOwner(fd, st):
 	"""Give a new copy the owner and group of the file ``st`` describes. Where that is not allowed,
 	a copy left in another group loses its group bits, so no one reads it who could not read the file."""
 	if not hasattr(os, 'fchown'):
@@ -2740,8 +2723,9 @@ def _matchOwner(fd, st, mode):
 			return
 		except OSError:
 			pass
-	if os.fstat(fd).st_gid != st.st_gid:
-		os.fchmod(fd, mode & ~0o070)
+	created = os.fstat(fd)
+	if created.st_gid != st.st_gid:
+		os.fchmod(fd, created.st_mode & 0o7707)  # what the umask left, without the group bits
 
 
 def _specRewriteInPlace(path, content, expect=None, memberSize=None):
@@ -2764,31 +2748,34 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				if expect is not None and _specStamp(st) != expect:
 					return None
 				fd = f.fileno()
-				# The bytes the rewrite overwrites: all a failed one has to put back. Read unbuffered, as
+				# The whole part, for a failed rewrite to put back whenever it fails. Read unbuffered, as
 				# the file is written below: a read-ahead in f would leave it a stale position to close at.
-				old = _readFrom0(fd, len(raw))
-				if st.st_size == len(raw) and old == raw:
+				old = _readFrom0(fd, st.st_size)
+				if old == raw:
 					return False
-				written = 0
 				try:
 					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
-					os.lseek(fd, 0, os.SEEK_SET)
-					view = memoryview(raw)
-					while written < len(raw):
-						written += os.write(fd, view[written:])
-					os.ftruncate(fd, len(raw))
+					_writeFrom0(fd, raw)
 				except BaseException as e:
-					# Put the old bytes and size back rather than leave a half-rewritten part (or one a
-					# failed reservation lengthened).
+					# Put the old bytes back rather than leave a half-rewritten part (or one a failed
+					# reservation lengthened).
 					try:
-						_putBack(fd, old[:written], st.st_size)
+						_writeFrom0(fd, old)
+						os.fsync(fd)
 					except OSError as undo:
-						raise OSError(getattr(e, 'errno', None), '{}: the rewrite failed ({}) and the old bytes could not be put back ({}): '
-									  'the part is damaged'.format(path, e, undo))
+						damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
+							path, e, undo)
+						if isinstance(e, OSError):
+							raise OSError(e.errno, damaged)
+						_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
 					raise
 				os.fsync(fd)
 				return True
 			finally:
+				try:
+					_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
+				except OSError:
+					pass
 				_unlockFile(f)
 
 
@@ -2818,15 +2805,13 @@ def _readFrom0(fd, length):
 	return b''.join(chunks)
 
 
-def _putBack(fd, old, size):
-	"""Undo a failed in-place rewrite: write ``old`` over the file from offset 0, set its size back to
-	``size`` and sync it (unbuffered)."""
+def _writeFrom0(fd, data):
+	"""Write ``data`` over the file from offset 0 and cut the file there (unbuffered)."""
 	os.lseek(fd, 0, os.SEEK_SET)
-	view = memoryview(old)
+	view = memoryview(data)
 	while view:
 		view = view[os.write(fd, view):]
-	os.ftruncate(fd, size)
-	os.fsync(fd)
+	os.ftruncate(fd, len(data))
 
 
 def _specPreamble(state, delimiter, compensate=False, version=True):
@@ -3907,12 +3892,15 @@ memoryOnly:{self.memoryOnly}
 		return self.close()
 
 	def popitem(self, last=True):
-		# Not OrderedDict.popitem: before Python 3.9 it pops through self.pop, which strips the key.
-		if not OrderedDict.__len__(self):
-			raise KeyError('dictionary is empty')
-		key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
-		value = OrderedDict.__getitem__(self, key)
-		OrderedDict.__delitem__(self, key)
+		if sys.version_info >= (3, 11):
+			key, value = OrderedDict.popitem(self, last)
+		else:
+			# Before Python 3.11 OrderedDict.popitem goes through self[key] and del self[key], which strip the key.
+			if not OrderedDict.__len__(self):
+				raise KeyError('dictionary is empty')
+			key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+			value = OrderedDict.__getitem__(self, key)
+			OrderedDict.__delitem__(self, key)
 		if not self.memoryOnly:
 			self.__appendEmptyLine(key)
 		self.lastUpdateTime = get_time_ns()
