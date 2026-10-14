@@ -240,6 +240,10 @@ remove or redefine existing constructs.
   its own highest implemented version. (A version-2 reader encountering a
   version-3 line uses version 2, not version 1.)
 
+A producer that rewrites parts must not make that lower reading permanent: it
+refuses to compact or clear in place a part that declares a version it does not
+implement (§19.4, §19.8).
+
 6.4 Constructs newer than the effective version **degrade gracefully**:
 unrecognized markers are ignored (§12.3); unrecognized escape tokens are passed
 through literally (§13.4). Absence of any `#_version_#` line means version 1.
@@ -1010,6 +1014,13 @@ strategy is to emit `#_strip_trailing_whites_#` `false` and
 `#_defaults_#` only as a fallback for absent trailing columns, and then emit the
 final markers after the rows (§19.2.3d).
 
+A producer cannot know how a version it does not implement reads a line (§6.3),
+so it cannot meet this fidelity for a reader that does. It **MUST NOT** snapshot
+or compact parts in which any `#_version_#` line declares a version higher than
+the highest it implements, even when a later line declares a lower one: it
+refuses and writes nothing. A rewrite would make its lower-version reading of
+those lines permanent for every reader.
+
 19.5 **`#_rotate_#` action** for the now-superseded prefix:
 
    - `keep` (built-in default) — leave prior parts as they are.
@@ -1042,6 +1053,10 @@ part (§18.6), and the file itself is kept (§18.7). Unlike §19.2, an in-place
 rewrite is not crash-atomic: a crash during it can damage the part. A producer
 SHOULD therefore build the complete new content before modifying the file,
 reserve space for it first, write it from offset 0, then truncate and `fsync`.
+A part in which any `#_version_#` line declares a version higher than the
+producer implements **MUST NOT** be compacted (§19.4) or cleared in place: the
+producer cannot keep the active markers of a version it does not know. It refuses
+and writes nothing.
 
 19.9 **Promotion.** Snapshotting a single unnumbered file (§17.1) by the §19.2
 procedure promotes the store to multi-part: with exclusive access to the file held
@@ -1105,8 +1120,8 @@ effect and exit status (§20.6).
 | `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key. `-` reads records from standard input (§20.3). |
 | `append` | as `set` | Alias of `set`, with identical behaviour. |
 | `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`, for the key it names (§20.2.7). It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
-| `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). |
-| `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store; it then writes nothing and exits with status 1. |
+| `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8); a part that declares a version the tool does not implement is refused (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). A refused `clear` writes nothing and exits with status 1. |
+| `scrub` | `STORE` | Compact a single-part store in place (§19.8, with §19.4 fidelity). A tool MAY refuse to scrub a multi-part store, and MUST refuse parts that declare a version it does not implement (§19.4); it then writes nothing and exits with status 1. |
 | `verify` | `STORE` | Replay the store with integrity checking (§15) and print one line per segment whose digest does not match: the part path; the line number, which is the 1-based line, within that part, of the `#_checksum_<algo>_#` marker that closes the segment; the algorithm name in lowercase; the expected digest; and the computed digest. Both digests are printed in lowercase hexadecimal. |
 | `parts` | `STORE` | Print the parts of the store in replay order (§17.3), one per line: index (from 0), ordinal in hexadecimal (empty for the unnumbered part 0), path, and flags: `active` for the part appends go to (§17.7), then the codec name `gzip`, `bzip2`, `xz` or `zstd` (§16.2) if the part is compressed, separated by commas. Parts carrying `.rotated` are not listed. |
 | `has` | `STORE KEY` | Print nothing. Exit with status 0 when KEY is live and 3 when it is not. |

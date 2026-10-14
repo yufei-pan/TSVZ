@@ -2439,6 +2439,25 @@ def test_spec_clear_multipart_appends_tombstones(tmp_path, capsys):
 	assert any('older parts are not compacted' in w for w in _tsvz_warnings(capsys))
 
 
+def test_spec_clear_refuses_a_part_declaring_a_newer_spec_version(tmp_path, capsys):
+	# Clearing in place keeps the active markers, which TSVZ cannot know for version 2 (spec §19.8).
+	p = str(tmp_path / 'v.tsvz')
+	for content in (b'#id\tv\n#_version_#\t2\na\t1\n',
+					b'#_version_#\t2\na\t1\n#_version_#\t1\nb\t2\n'):  # declared, even when set back to 1
+		_touch(p, content)
+		TSVZ.clearTabularFile(p)
+		assert open(p, 'rb').read() == content
+		assert any('clear skipped' in w and 'newer' in w for w in _tsvz_warnings(capsys))
+	status, _, err = _run('clear', p)
+	assert status == 1 and 'clear refused' in err
+	assert open(p, 'rb').read() == content
+	base = str(tmp_path / 'm.tsvz')  # a multi-part store is cleared by appending tombstones (§18.8)
+	_touch(base, b'#_version_#\t2\na\t1\n')
+	_touch(base + '.1', b'b\t2\n')
+	assert _run('clear', base)[0] == 0
+	assert open(base, 'rb').read() == b'#_version_#\t2\na\t1\n' and open(base + '.1', 'rb').read() == b'b\t2\na\nb\n'
+
+
 def test_spec_clear_creates_missing_and_empty_files(tmp_path):
 	p = str(tmp_path / 'n.tsvz')
 	TSVZ.clearTabularFile(p, header='id\tv')

@@ -8,5 +8,15 @@
  "note": "Clearing a part without a header keeps its markers.",
  "files": {"s.tsvz": "#_defaults_#\td\n#_return_defaults_when_missing_#\tfalse\na\tx\n"},
  "steps": [{"op": ["clear"]}],
- "after": {"rows": [], "fidelity": "markers", "bytes": ["same-file"]}}
+ "after": {"rows": [], "fidelity": "markers", "bytes": ["same-file"]}},
+{"id": "19.8-clear-refuses-a-newer-version", "spec": ["19.8", "6.3", "20.2", "20.6"], "level": "MUST",
+ "note": "A part declaring a spec version the tool does not implement is not cleared in place (its markers cannot be kept): clear exits 1 and writes nothing.",
+ "files": {"s.tsvz": "#hdr\n#_version_#\t2\na\tx\n"},
+ "steps": [{"op": ["clear"], "exit": 1}],
+ "after": {"bytes": ["unchanged"]}},
+{"id": "19.8-clear-refuses-a-newer-version-set-back", "spec": ["19.8", "6.4", "20.6"], "level": "MUST",
+ "note": "A newer version declared anywhere in the part refuses the clear, even when a later line sets it back to 1.",
+ "files": {"s.tsvz": "#_version_#\t2\na\tx\n#_version_#\t1\nb\ty\n"},
+ "steps": [{"op": ["clear"], "exit": 1}],
+ "after": {"bytes": ["unchanged"]}}
 ]}

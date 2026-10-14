@@ -3040,7 +3040,8 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 	A single file is read without a lock and rewritten in place only if no
 	other writer changed it since the read (else it is read again, up to
 	``_SPEC_REWRITE_ATTEMPTS`` times). A path naming one part of a multi-part
-	store is refused.
+	store is refused, and so is a single file declaring a spec version newer
+	than ``MAX_SPEC_VERSION``.
 	"""
 	reporter = _Reporter(fileName, teeLogger)
 	attempt = None
@@ -3074,6 +3075,10 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				break
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
+			if attempt.has('newer-version'):
+				attempt.note('refused', None, 'clear skipped: the part declares a spec version newer than {} (#_version_#), whose '
+							 'markers this TSVZ cannot keep (spec §19.8); nothing was written'.format(MAX_SPEC_VERSION))
+				return False
 			if any(header) and verifyHeader and load.headerLine is not None and not headerChecked:
 				headerChecked = True
 				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
