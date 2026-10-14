@@ -1742,6 +1742,7 @@ class _SpecState(object):
 
 	def __init__(self, defaults=None):
 		self.version = 1
+		self.newestVersion = 1  # the highest version a #_version_# line declared (spec §19.4, §19.8)
 		self.defaults = list(defaults) if defaults and len(defaults) > 1 else [DEFAULTS_INDICATOR_KEY]
 		self.strip = True
 		self.fillEmpty = False
@@ -1786,16 +1787,16 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 		else:
 			number = 0
 			if _ASCII_DIGITS_RE.match(value):
-				try:
-					number = int(value)
-				except ValueError:  # more digits than int() converts (Python 3.11+ limit)
-					pass
+				digits = value.lstrip('0') or '0'
+				# int() refuses very long values (Python 3.11+); any such value is above every implemented version.
+				number = int(digits) if len(digits) <= 64 else MAX_SPEC_VERSION + 1
 			if number < 1:
 				reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
 				return False
 			if number > MAX_SPEC_VERSION:
 				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(value, MAX_SPEC_VERSION))
 			state.version = number
+			state.newestVersion = max(state.newestVersion, number)
 	elif keyLower in _BOOL_MARKERS:
 		attr, default = _BOOL_MARKERS[keyLower]
 		if not value:
@@ -3075,7 +3076,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				break
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
-			if attempt.has('newer-version'):
+			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'clear skipped: the part declares a spec version newer than {} (#_version_#), whose '
 							 'markers this TSVZ cannot keep (spec §19.8); nothing was written'.format(MAX_SPEC_VERSION))
 				return False
@@ -3198,7 +3199,7 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 				return taskDic, False
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
-			if attempt.has('newer-version'):
+			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'scrub skipped: the store declares a spec version newer than {0} (#_version_#), which '
 							 'this TSVZ reads as version {0} only (spec §6.3); a rewrite would make that reading permanent; '
 							 'nothing was written'.format(MAX_SPEC_VERSION))

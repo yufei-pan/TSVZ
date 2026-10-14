@@ -2532,6 +2532,10 @@ def test_spec_scrub_refuses_a_store_declaring_a_newer_spec_version(tmp_path, cap
 	status, _, err = _run('scrub', p)
 	assert status == 1 and 'scrub refused' in err
 	assert open(p, 'rb').read() == content
+	_touch(p, b'#_version_#\t' + b'9' * 5000 + b'\na\t1\n')  # too long for int() on Python 3.11+, still a version
+	assert TSVZ.scrubTabularFile(p) == {'a': ['a', '1']}
+	assert open(p, 'rb').read() == b'#_version_#\t' + b'9' * 5000 + b'\na\t1\n'
+	assert any('scrub skipped' in w and 'newer' in w for w in _tsvz_warnings(capsys))
 	_touch(p, b'#_version_#\t1\na\t1\na\t2\n')  # version 1, declared: compacted
 	TSVZ.scrubTabularFile(p)
 	assert open(p, 'rb').read() == b'#_version_#\t1\na\t2\n'
@@ -3292,12 +3296,9 @@ def test_spec_version_marker_with_too_many_digits_does_not_crash(tmp_path, capsy
 	_, state, reporter = _process(['#_version_#\t' + '1' * 5000])
 	reporter.flush()
 	warnings = [w for w in _tsvz_warnings(capsys) if w.startswith(('TSVZ warning: t:', 'TSVZ warning: ' + p))]
-	limit = getattr(sys, 'get_int_max_str_digits', lambda: 0)()
-	if limit and limit < 5000:  # int() refuses it: the marker is ignored and the state kept
-		assert state.version == 1
-		assert len(warnings) == 2 and all('ignored #_version_# with invalid value' in w for w in warnings)
-	else:
-		assert len(warnings) == 2 and all('declares spec version' in w for w in warnings)
+	# On every Python, int()'s digit limit (3.11+) included: a version above every implemented one.
+	assert state.version > TSVZ.MAX_SPEC_VERSION and state.newestVersion > TSVZ.MAX_SPEC_VERSION
+	assert len(warnings) == 2 and all('declares spec version' in w for w in warnings)
 
 
 def test_spec_backup_never_overwrites_a_backup(tmp_path, monkeypatch, capsys):

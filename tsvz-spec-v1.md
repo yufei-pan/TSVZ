@@ -240,9 +240,9 @@ remove or redefine existing constructs.
   its own highest implemented version. (A version-2 reader encountering a
   version-3 line uses version 2, not version 1.)
 
-A producer that rewrites parts must not make that lower reading permanent: it
-refuses to compact or clear in place a part that declares a version it does not
-implement (§19.4, §19.8).
+A producer that rewrites parts does not make that lower reading permanent: it
+refuses to snapshot, compact or clear in place a part that declares a version it
+does not implement (§19.4, §19.8).
 
 6.4 Constructs newer than the effective version **degrade gracefully**:
 unrecognized markers are ignored (§12.3); unrecognized escape tokens are passed
