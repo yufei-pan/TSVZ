@@ -40,10 +40,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '4.7'
+version = '4.8'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-10-13'
+COMMIT_DATE = '2026-10-14'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'

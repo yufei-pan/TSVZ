@@ -266,8 +266,8 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	assert TSVZ.version == '4.7'
-	assert TSVZ.__version__ == '4.7'
+	assert TSVZ.version == '4.8'
+	assert TSVZ.__version__ == '4.8'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -3040,7 +3040,7 @@ def test_cli_legacy_matches_339(tmp_path):
 
 def test_cli_version():
 	out = _cli('-V')
-	assert out.returncode == 0 and '4.7' in out.stdout
+	assert out.returncode == 0 and '4.8' in out.stdout
 
 
 # ==========================================================================
@@ -3542,7 +3542,7 @@ def test_cli_usage_errors_help_and_version(tmp_path):
 	r = _cli('-h')
 	assert (r.returncode, r.stderr) == (0, '') and r.stdout.startswith('usage: tsvz')
 	r = _cli('read', p, '--version')
-	assert r.returncode == 0 and '4.7' in r.stdout
+	assert r.returncode == 0 and '4.8' in r.stdout
 
 
 def test_cli_streams_and_verbosity(tmp_path):
