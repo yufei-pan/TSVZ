@@ -1,4 +1,4 @@
 {"impl": "python3 TSVZ.py",
- "features": ["bzip2", "xz", "crc32", "sha256", "file-first", "handler"],
+ "features": ["bzip2", "xz", "crc32", "sha256", "file-first", "handler", "snapshot-skip"],
  "note": "The reference also claims zstd on Python 3.14 and later. Every case it does not pass, and why; remove an entry when the reference is fixed.",
  "not_passing": []}

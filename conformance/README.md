@@ -54,6 +54,7 @@ implement:
 | `file-first` | Accepts `tsvz STORE [OPERATION]` (§20.1.5) |
 | `handler` | Provides `serve` and the socket (§21) |
 | `scrub-multipart` | Scrubs a multi-part store instead of refusing (§20.2) |
+| `snapshot-skip` | Starts a read at the last snapshot part, skipping the parts before it (§19.10.3) |
 
 A case marked `requires: ["x"]` runs only when you claim `x`; one marked
 `["!x"]` runs only when you do not, and checks what the spec asks of an

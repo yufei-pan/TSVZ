@@ -40,7 +40,8 @@ __version__ = version
 CASES_FORMAT = 1
 CLASSES = ('reader', 'writer', 'cli', 'handler')
 MODES = ('files', 'socket', 'forwarded')
-FEATURES = ('bzip2', 'xz', 'zstd', 'crc32', 'crc32c', 'sha256', 'blake3', 'file-first', 'handler', 'scrub-multipart')
+FEATURES = ('bzip2', 'xz', 'zstd', 'crc32', 'crc32c', 'sha256', 'blake3', 'file-first', 'handler', 'scrub-multipart',
+	'snapshot-skip')
 LEVELS = ('MUST', 'SHOULD')
 OPERATIONS = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'parts', 'has', 'len', 'keys',
 	'pop', 'popitem', 'setdefault', 'serve', 'stop')

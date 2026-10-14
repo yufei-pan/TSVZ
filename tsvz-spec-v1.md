@@ -485,6 +485,7 @@ those markers are inert.
 | `#_rotate_#` | advisory | recommended action for superseded parts after a snapshot (§19) | `keep` / `rename` / `delete` | `keep` |
 | `#_write_ack_#` | advisory | when a writer/handler acknowledges a record (§18) | `memory` / `disk` | `memory` |
 | `#_member_size_#` | advisory | the most uncompressed data a writer puts in one compressed member (§16.7) | a single integer ≥ 1 | `1048576` |
+| `#_snapshot_#` | positional | the part it begins holds the store's whole state: a reader MAY skip the parts before it (§19.10) | none: a line with a value is not this marker | — |
 | `#_checksum_<algo>_#` | integrity | verify a segment digest (§15) | hex digest, or empty | off |
 
 12.4.1 A boolean value is `true` or `false`; `yes`, `on` and `1` are also accepted
@@ -986,7 +987,9 @@ append-only (§3.1).
          markers of (a);
       d. when the rows of (b) are written under marker state other than the final
          state (§19.4), the final markers again, after the rows, so that the
-         store's final marker state is preserved.
+         store's final marker state is preserved;
+      e. a `#_snapshot_#` line (§19.10) MAY come first, after the header comment
+         of (c) when there is one.
    4. Once _S_ is durable, apply the `#_rotate_#` action (§19.5) to the subsumed
       prefix.
    5. The worker exits. No coordination with the live process is required: the live
@@ -1058,12 +1061,67 @@ producer implements **MUST NOT** be compacted (§19.4) or cleared in place: the
 producer cannot keep the active markers of a version it does not know. It refuses
 and writes nothing.
 
+When other parts precede the part compacted in place, and stay — `#_rotate_#`
+`keep`, or until the rotation of §19.5 completes, or after a crash before it —
+readers still replay them first. The new content **MUST** then also read, after
+those parts, exactly as the parts up to and including it did (§19.4). The
+snapshot content of §19.2.3 alone does not: a key that the compacted part had
+deleted, and that a part before it leaves live, would read again; so would a
+marker state the compacted part had reset. A simple always-correct form is:
+the header comment, if any; `#_version_#` `1`; `#_strip_trailing_whites_#`
+`false`; a tombstone for every key live after the parts before it; every stateful
+marker stated explicitly with its final value, `#_defaults_#` included (an empty
+`#_defaults_#` resets the defaults); the rows, fully resolved (§19.4); then the
+final `#_strip_trailing_whites_#` and `#_fill_empty_with_default_#`. That form
+also reads correctly alone, so it may begin with `#_snapshot_#` (§19.10).
+
 19.9 **Promotion.** Snapshotting a single unnumbered file (§17.1) by the §19.2
 procedure promotes the store to multi-part: with exclusive access to the file held
 for the duration (quiescing, §19.3), write the snapshot as a new numbered part,
 then apply the `#_rotate_#` action (§19.5) to the file, which is now part 0.
 Writers MUST thereafter append only to numbered parts: a record appended to part 0
 would be ordered before the snapshot and lost to it.
+
+19.10 **Snapshot parts (`#_snapshot_#`).** A snapshot written by §19.2, or a part
+compacted in place by §19.8, holds the store's whole state, yet with `#_rotate_#`
+`keep` every reader still replays the parts before it. The `#_snapshot_#` marker
+lets a reader skip them.
+
+19.10.1 **The marker.** `#_snapshot_#` marks the part it begins as a *snapshot
+part*. It counts only as the first committed line of a part, or as the second when
+the first is a comment (the header comment, §11), and only without a value.
+Anywhere else, or with a value, it is an unrecognized marker (§12.3). It sets no
+state (it is not stateful in the sense of §12.1). A reader that does not implement
+this section ignores it and reads the same result (§19.10.2).
+
+19.10.2 **Producers.** A producer **MUST** begin a part with `#_snapshot_#` only
+when:
+
+   a. the part, replayed alone from the built-in default state, yields exactly the
+      read result and the final marker state that replaying every part up to and
+      including it yields (§19.4) — as a snapshot written by §19.2.3 does, and as
+      the content §19.8 gives a part that other parts precede does;
+   b. the part begins with the store's header comment when the store has one
+      (§11), so that a reader that starts at the part finds the same header; and
+   c. no part up to and including it declares a version higher than the producer
+      implements (§19.4).
+
+A writer appending records (§18) never writes `#_snapshot_#`.
+
+19.10.3 **Readers.** A reader **MAY** begin its replay at the last snapshot part in
+replay order, from the built-in default state, without reading the parts before
+it: by §19.10.2 the result is the same. A part whose first lines cannot be read
+(§16.5, §4.10) is not a snapshot part. The parts before a snapshot part still
+belong to the store: they keep their place in the ordinal order, `parts` lists
+them (§20.2), and a change to one of them (against §17.7) is a change to the store.
+
+19.10.4 **Integrity.** `verify` (§20.2) replays every part, snapshot parts or not:
+a checksum segment opened in a part before a snapshot part is verified across the
+boundary only by a full replay (§15.4).
+
+19.10.5 **History.** With `#_rotate_#` `keep`, the parts before a snapshot part
+keep the store's history for audit and recovery, while readers that implement
+§19.10 no longer pay to replay it.
 
 ---
 
@@ -1486,6 +1544,8 @@ digests                  = {}        # armed per-algorithm accumulators (optiona
 # Parts are read in ordinal order as ONE concatenation; marker state and digest
 # accumulators persist across part boundaries (§17.4, §15.4). A compressed part
 # contributes its members' output by §16.6; damaged data follows §4.9-§4.10.
+# Optionally (§19.10.3), the concatenation starts at the last part whose first
+# committed line, or second after a comment, is a value-less #_snapshot_#.
 for raw in split_records(concatenated_parts):   # split on '\n'; tolerate trailing
                                                  # '\r'; discard bytes after last '\n'
     fields = split(raw, DELIM)        # raw split; count = (#DELIM) + 1

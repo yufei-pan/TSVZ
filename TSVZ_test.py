@@ -3208,24 +3208,35 @@ def test_tsvzed_spec_clear_reloads_when_the_clear_was_skipped(tmp_path, monkeypa
 def _during_reads(monkeypatch, trigger, action, afterLines=0):
 	"""Run ``action()`` whenever a read of a spec store reaches the part ``trigger``, or once it has read
 	``afterLines`` lines of it. Parts are then read unbuffered, 8 bytes at a time, so what a read takes
-	after ``action`` comes from the bytes it left. Returns a list with one entry per read of ``trigger``."""
+	after ``action`` comes from the bytes it left. Returns a list with one entry per read of ``trigger``.
+	The look at a part's first lines for a snapshot marker (spec §19.10) is no read of it here."""
 	real = TSVZ._iterPartLines
+	realStart = TSVZ._specSnapshotStart
 	realOpen = open
 	reads = []
+	probing = []
+
+	def start(*args):
+		probing.append(1)
+		try:
+			return realStart(*args)
+		finally:
+			probing.pop()
 
 	def lines(info, reporter, label=''):
-		if info.path == trigger:
+		if info.path == trigger and not probing:
 			reads.append(1)
 			if not afterLines:
 				action()
 		for n, item in enumerate(real(info, reporter, label), 1):
 			yield item
-			if info.path == trigger and n == afterLines:
+			if info.path == trigger and n == afterLines and not probing:
 				action()
 
 	def unbuffered(path, mode='r', *args, **kwargs):
 		return realOpen(path, mode, 0) if mode == 'rb' else realOpen(path, mode, *args, **kwargs)
 	monkeypatch.setattr(TSVZ, '_iterPartLines', lines)
+	monkeypatch.setattr(TSVZ, '_specSnapshotStart', start)
 	monkeypatch.setattr(TSVZ, 'open', unbuffered, raising=False)
 	monkeypatch.setattr(TSVZ, '_CHUNK', 8)
 	return reads
@@ -5234,3 +5245,39 @@ def test_legacy_upper_case_compressed_name_is_rewritten_as_compressed(tmp_path, 
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
+
+
+def test_spec_a_read_starts_at_the_last_snapshot_part(tmp_path):
+	# Spec §19.10.3: a reader may skip the parts before a part that begins with #_snapshot_#.
+	# The parts here are crafted so that a skip shows: the snapshot part does not restate a,
+	# which a producer may not do (§19.10.2a), but which tells a skip from a full replay.
+	import gzip
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#h\tv\na\t1\n')
+	_touch(p + '.1', b'#h\tv\n#_snapshot_#\nb\t2\n')
+	_touch(p + '.2', b'c\t3\n')
+	assert _run('read', p) == (0, 'b\t2\nc\t3\n', '')
+	load = TSVZ._specLoad(p, '\t')
+	assert load.headerLine == '#h\tv' and len(load.infos) == 3 and load.parts == [p, p + '.1', p + '.2']
+	# The last snapshot part, compressed too.
+	_touch(p + '.2', b'')
+	os.remove(p + '.2')
+	_touch(p + '.3.gz', gzip.compress(b'#h\tv\n#_SNAPSHOT_#\nd\t4\n'))
+	assert _run('read', p) == (0, 'd\t4\n', '')
+	os.remove(p + '.3.gz')
+	# Not first (after a header comment), or with a value: not a snapshot part.
+	for text in (b'b\t2\n#_snapshot_#\n', b'#_snapshot_#\tx\nb\t2\n', b'#h\tv\n#x\n#_snapshot_#\nb\t2\n'):
+		_touch(p + '.1', text)
+		assert _run('read', p) == (0, 'a\t1\nb\t2\n', ''), text
+
+
+def test_spec_verify_and_parts_see_the_parts_a_snapshot_part_lets_a_read_skip(tmp_path):
+	# Spec §19.10.3-4: the skipped parts still belong to the store.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t00000000\n')
+	_touch(p + '.1', b'#_snapshot_#\nb\t2\n')
+	assert _run('read', p) == (0, 'b\t2\n', '')
+	status, out, err = _run('verify', p)
+	assert status == 4, (out, err)
+	status, out, err = _run('parts', p)
+	assert status == 0 and len(out.splitlines()) == 2, out

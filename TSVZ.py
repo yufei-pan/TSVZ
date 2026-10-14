@@ -1961,6 +1961,7 @@ class _PartInfo(object):
 		# The last bytes (_SERVE_CHECK_BYTES at most) of a plain part's committed lines as read, ending at
 		# ``committed`` unless a stop policy ended the read.
 		self.check = b''
+		self.skipped = False  # not read: a later snapshot part holds the store's state (spec §19.10.3)
 
 
 def _newDecompressor(codec):
@@ -2341,20 +2342,24 @@ def _specZeroFill(raw, delimiter, state, reporter, where):
 	return raw[cut:]
 
 
-def _specReplay(parts, delimiter, state, reporter, infos):
+def _specReplay(parts, delimiter, state, reporter, infos, start=0):
 	"""Replay ``parts`` as one stream (spec §7, §17.4).
 
 	Yields ``(partIndex, offset, text, record)`` for every committed line except
 	checksum markers of supported algorithms, where ``record`` is what
 	``_specProcessRecord`` returned. Marker state and checksum accumulators in
 	``state`` carry across parts. One ``_PartInfo`` per part is appended to
-	``infos``.
+	``infos``. The parts before ``start`` (a snapshot part, spec §19.10.3) are not
+	read: their infos are marked ``skipped``.
 	"""
 	multi = len(parts) > 1
 	for partIndex, path in enumerate(parts):
 		info = _PartInfo(path)
 		info.state = state
 		infos.append(info)
+		if partIndex < start:
+			info.skipped = True
+			continue
 		label = os.path.basename(path) + ' ' if multi else ''
 		lineNo = 0
 		for raw, offset in _iterPartLines(info, reporter, label):
@@ -2389,6 +2394,38 @@ def _specReplay(parts, delimiter, state, reporter, infos):
 		info.lines = lineNo
 		if info.stopped:  # a stop policy ends the read of the whole store (spec §4.10)
 			return
+
+
+SNAPSHOT_KEY = '#_snapshot_#'
+
+
+def _specIsSnapshotPart(path, delimiter):
+	"""True when the part ``path`` begins with a value-less ``#_snapshot_#`` (spec §19.10.1).
+
+	It counts as the first committed line, or the second after a comment. A part
+	whose first lines cannot be read is not a snapshot part (spec §19.10.3).
+	"""
+	quiet = _Reporter(path)  # never flushed: nothing found here is reported
+	info = _PartInfo(path)
+	lines = _iterPartLines(info, quiet)
+	try:
+		for lineNo, (raw, _) in enumerate(lines, 1):
+			fields = _decodeLine(raw, quiet, None).split(delimiter)
+			if fields[0].lower() == SNAPSHOT_KEY:
+				return not info.lost and all(f == '' for f in fields[1:])
+			if lineNo == 2 or not fields[0].startswith('#') or _MARKER_RE.match(fields[0]):
+				return False  # a first line that is not a comment, or a second line
+	finally:
+		lines.close()
+	return False
+
+
+def _specSnapshotStart(parts, delimiter):
+	"""The index of the last snapshot part of ``parts``, where a read may begin (spec §19.10.3); else 0."""
+	for index in range(len(parts) - 1, 0, -1):
+		if _specIsSnapshotPart(parts[index], delimiter):
+			return index
+	return 0
 
 
 def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter, atStart=False):
@@ -2606,12 +2643,13 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 	parts, active = _storeParts(fileName, reporter)
 	result.parts, result.active = parts, active
 	activeIndex = len(parts) - 1
+	start = _specSnapshotStart(parts, delimiter)  # the parts before a snapshot part are not read (spec §19.10.3)
 	width = correctColumnNum
 	headerPending = bool(header and any(header) and verifyHeader)
 	firstPartPending = True
 	lastRowState = None
-	for partIndex, offset, text, record in _specReplay(parts, delimiter, state, reporter, result.infos):
-		if partIndex == 0 and firstPartPending and text.strip() and not _MARKER_RE.match(text.split(delimiter, 1)[0]):
+	for partIndex, offset, text, record in _specReplay(parts, delimiter, state, reporter, result.infos, start):
+		if partIndex == start and firstPartPending and text.strip() and not _MARKER_RE.match(text.split(delimiter, 1)[0]):
 			firstPartPending = False
 			isComment = text.startswith('#')
 			if isComment:
@@ -2627,7 +2665,7 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 		if record is None:
 			if verbose and text.startswith('#_'):
 				f0 = text.split(delimiter, 1)[0]
-				if _MARKER_RE.match(f0) and f0.lower() not in _SPEC_MARKER_KEYS:
+				if _MARKER_RE.match(f0) and f0.lower() not in _SPEC_MARKER_KEYS and f0.lower() != SNAPSHOT_KEY:
 					__teePrintOrNot('Ignored unrecognised marker line {!r}'.format(text[:80]), teeLogger=teeLogger)
 			continue
 		key, row = record
@@ -2643,7 +2681,7 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 			data[key] = offset
 		else:
 			data[key] = row
-	if headerPending and not (result.infos and (result.infos[0].unreadable or result.infos[0].lost)):
+	if headerPending and not (len(result.infos) > start and (result.infos[start].unreadable or result.infos[start].lost)):
 		# part 0 could not be read, or was damaged before any line: there is no header to compare
 		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
 	result.correctColumnNum = width

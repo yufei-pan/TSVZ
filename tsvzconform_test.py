@@ -983,6 +983,8 @@ def test_the_oracle_passes_every_reader_case(case, tmp_path):
 	read = case.expect.get('read')
 	if isinstance(read, dict) and read.get('exit', 0) != 0:
 		pytest.skip('an unreadable store: a refusal the oracle does not model')
+	if 'snapshot-skip' in case.requires:
+		pytest.skip('the oracle replays every part: it does not skip history (spec §19.10.3 is a MAY)')
 	tc.materialize(case, str(tmp_path))
 	try:
 		r = tc.replay_store(str(tmp_path / case.store))
