@@ -2501,6 +2501,23 @@ def test_spec_scrub_refuses_multipart_and_fragments(tmp_path, capsys):
 	assert sum('scrub skipped' in w for w in _tsvz_warnings(capsys)) == 2
 
 
+def test_spec_scrub_refuses_a_store_declaring_a_newer_spec_version(tmp_path, capsys):
+	# TSVZ reads version-2 lines as version 1 (spec §6.3): a rewrite would make that reading permanent.
+	p = str(tmp_path / 'v.tsvz')
+	for content in (b'#_version_#\t2\na\t1\na\t2\n',
+					b'#_version_#\t2\na\t1\n#_version_#\t1\na\t2\n'):  # declared, even when set back to 1
+		_touch(p, content)
+		assert TSVZ.scrubTabularFile(p) == {'a': ['a', '2']}
+		assert open(p, 'rb').read() == content
+		assert any('scrub skipped' in w and 'newer' in w for w in _tsvz_warnings(capsys))
+	status, _, err = _run('scrub', p)
+	assert status == 1 and 'scrub refused' in err
+	assert open(p, 'rb').read() == content
+	_touch(p, b'#_version_#\t1\na\t1\na\t2\n')  # version 1, declared: compacted
+	TSVZ.scrubTabularFile(p)
+	assert open(p, 'rb').read() == b'#_version_#\t1\na\t2\n'
+
+
 def test_spec_scrub_compressed_in_place(tmp_path):
 	p = str(tmp_path / 's.tsvz.gz')
 	_touch(p, gzip.compress(b'a\t1\n') + gzip.compress(b'a\t2\nb\t3\nb\n'))

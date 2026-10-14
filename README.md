@@ -231,7 +231,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C3 | `read` and `scrub` of a missing store exit 1 with a message (3.39: exit 0, and `read` printed "File not found" on stdout). |
 | C4 | `delete` deletes every KEY it is given (3.39: only the first). |
 | C5 | `append` or `delete` without a KEY, or with an empty KEY, is a usage error with exit 2 (3.39 wrote an empty line). |
-| C6 | A `clear` or `scrub` that writes nothing (one part of a multi-part store, a store that kept changing) exits 1. |
+| C6 | A `clear` or `scrub` that writes nothing (one part of a multi-part store, a store that kept changing, a `scrub` of a store declaring a spec version newer than 1) exits 1. |
 | C7 | `-c/--header`, `--defaults`, `-s/--strict` and `-f/--force` are undocumented aliases of the `--x-` options. `--x-header` and `--x-defaults` keep non-ASCII text. |
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
@@ -249,6 +249,7 @@ Conformance testing).
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
 - §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere it is `lockf`.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
+- §6.3, §19.4: a scrub of a store in which a `#_version_#` line declares a version newer than 1, even one set back to 1 later, is refused with exit 1, nothing written: TSVZ reads such lines as version 1, and a rewrite would make that reading permanent.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.

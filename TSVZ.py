@@ -3156,8 +3156,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 	writer changed it since the read (else it is read again, up to
 	``_SPEC_REWRITE_ATTEMPTS`` times), so a record committed meanwhile is
 	never compacted away. ``done`` is False when nothing was written because
-	the store is missing, has several parts (or the path names one part), or
-	kept changing. It is None when the read stopped at damaged data (spec
+	the store is missing, has several parts (or the path names one part),
+	declares a spec version newer than ``MAX_SPEC_VERSION``, or kept changing. It is None when the read stopped at damaged data (spec
 	§4.10): the part was rewritten from what was read, the original kept.
 	"""
 	if taskDic is None:
@@ -3193,6 +3193,11 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 				return taskDic, False
 			if stamp is None or load.parts != parts:
 				continue  # the set of parts changed under the read
+			if attempt.has('newer-version'):
+				attempt.note('refused', None, 'scrub skipped: the store declares a spec version newer than {0} (#_version_#), which '
+							 'this TSVZ reads as version {0} only (spec §6.3); a rewrite would make that reading permanent; '
+							 'nothing was written'.format(MAX_SPEC_VERSION))
+				return taskDic, False
 			info = load.infos[0]
 			if (info.lost or info.damaged) and backedUp != stamp:
 				# Damaged data is not in what is written, or only unverified (spec §4.10, §16.6): keep the original
