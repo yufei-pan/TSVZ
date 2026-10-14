@@ -2443,6 +2443,7 @@ def test_spec_clear_refuses_a_part_declaring_a_newer_spec_version(tmp_path, caps
 	# Clearing in place keeps the active markers, which TSVZ cannot know for version 2 (spec §19.8).
 	p = str(tmp_path / 'v.tsvz')
 	for content in (b'#id\tv\n#_version_#\t2\na\t1\n',
+					b'#_version_#\t' + b'9' * 5000 + b'\na\t1\n',  # too long for int() on Python 3.11+
 					b'#_version_#\t2\na\t1\n#_version_#\t1\nb\t2\n'):  # declared, even when set back to 1
 		_touch(p, content)
 		TSVZ.clearTabularFile(p)
@@ -3299,6 +3300,21 @@ def test_spec_version_marker_with_too_many_digits_does_not_crash(tmp_path, capsy
 	# On every Python, int()'s digit limit (3.11+) included: a version above every implemented one.
 	assert state.version > TSVZ.MAX_SPEC_VERSION and state.newestVersion > TSVZ.MAX_SPEC_VERSION
 	assert len(warnings) == 2 and all('declares spec version' in w for w in warnings)
+	assert all(len(w) < 300 for w in warnings)  # the value is shortened, not printed whole
+
+
+def test_spec_integer_marker_values_are_digits_only_with_no_trailing_newline(tmp_path, capsys):
+	# '<LF>' decodes to a newline, which is not a digit (spec §12.4.1): the marker is ignored, never a crash.
+	for value in ('0<LF>', '2<LF>'):
+		_, state, reporter = _process(['#_version_#\t' + value])
+		assert (state.version, state.newestVersion) == (1, 1), value
+		assert reporter.has('bad-marker'), value
+	_, state, reporter = _process(['#_member_size_#\t5<LF>'])
+	assert state.memberSize == TSVZ._DEFAULT_MEMBER_SIZE and reporter.has('bad-marker')
+	p = str(tmp_path / 'z.tsvz')
+	_touch(p, b'#_version_#\t0<LF>\na\t1\na\t2\n')
+	assert TSVZ.readTabularFile(p) == {'a': ['a', '2']}
+	assert _run('scrub', p)[0] == 0 and open(p, 'rb').read() == b'#_version_#\t1\na\t2\n'
 
 
 def test_spec_backup_never_overwrites_a_backup(tmp_path, monkeypatch, capsys):

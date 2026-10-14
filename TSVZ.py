@@ -1608,7 +1608,7 @@ _MARKER_RE = re.compile(r'^#_[A-Za-z0-9_-]+_#$')
 #: What a lookup gets for a key that is not live (spec §20.2.7: then the stripped key is tried).
 _NO_ROW = object()
 _CHECKSUM_RE = re.compile(r'^#_checksum_([A-Za-z0-9_-]+)_#$', re.IGNORECASE)
-_ASCII_DIGITS_RE = re.compile(r'^[0-9]+$')
+_ASCII_DIGITS_RE = re.compile(r'^[0-9]+\Z')  # \Z: '$' would also match before a final newline
 _SPEC_DECODE_RE = re.compile(r'<(?:sep|LF|CR|NUL|lt|#)>')
 _SPEC_TOKENS = {'<LF>': '\n', '<CR>': '\r', '<NUL>': '\0', '<lt>': '<', '<#>': '#'}
 _RowState = namedtuple('_RowState', 'defaults strip fillEmpty')
@@ -1794,7 +1794,8 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 				reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
 				return False
 			if number > MAX_SPEC_VERSION:
-				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(value, MAX_SPEC_VERSION))
+				shown = value if len(value) <= 20 else '{}… ({} digits)'.format(value[:20], len(value))
+				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(shown, MAX_SPEC_VERSION))
 			state.version = number
 			state.newestVersion = max(state.newestVersion, number)
 	elif keyLower in _BOOL_MARKERS:
