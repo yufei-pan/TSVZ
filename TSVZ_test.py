@@ -3352,6 +3352,24 @@ def test_engine_reads_a_torn_store_again_rather_than_follow_it(tmp_path, monkeyp
 	store.close()
 
 
+def test_engine_follows_only_after_the_bytes_its_read_saw(tmp_path, monkeypatch):
+	# A rewrite that lands just after the reload's read: the follower compares the bytes that read saw, not
+	# the rewritten ones, so it reads the store again instead of adding the new bytes' tail to the old view.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	real = TSVZ._specLoad
+
+	def loadThenRewrite(*args, **kwargs):
+		result = real(*args, **kwargs)
+		TSVZ._specRewriteInPlace(p, b'c\t3\nd\t4\ne\t5\nf\t6\n')
+		return result
+	monkeypatch.setattr(TSVZ, '_specLoad', loadThenRewrite)
+	store = TSVZ._ServeStore(p)
+	monkeypatch.undo()
+	assert store.read(None) == [['c', '3'], ['d', '4'], ['e', '5'], ['f', '6']]
+	store.close()
+
+
 def test_lite_spec_and_another_process_append_without_losing_records(tmp_path):
 	p = str(tmp_path / 'race.tsvz')
 	_touch(p, b'seed\tx\n')

@@ -5504,7 +5504,7 @@ class _ServeStore(object):
 		self.lineNo = info.lines if info is not None else 0
 		self.tailSeen = info.tail if info is not None else b''
 		self.label = os.path.basename(self.parts[-1]) + ' ' if len(self.parts) > 1 else ''
-		self.check = self._readCheck()
+		self.check = info.check if info is not None else b''  # as read: the part may be rewritten since
 
 	def _loadLegacy(self, reporter):
 		self.parts = [self.path] if os.path.isfile(self.path) else []
