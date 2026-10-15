@@ -580,9 +580,18 @@ class _Reporter(object):
 		"""True when an event of ``kind`` was noted and not yet flushed."""
 		return kind in self._events
 
+	def mark(self):
+		"""The events noted so far, for ``rewind``."""
+		return [(kind, list(event)) for kind, event in self._events.items()]
+
+	def rewind(self, mark):
+		"""Forget the events noted since ``mark`` (for a read that is done again)."""
+		self._events = OrderedDict((kind, list(event)) for kind, event in mark)
+
 	def incomplete(self):
-		"""True when the read did not see the whole store: a part was unreadable, or a stop policy ended it."""
-		return 'unreadable' in self._events or 'stopped' in self._events
+		"""True when the read did not see the whole store: a part was unreadable, a stop policy ended it, or
+		parts kept changing under it (it may be torn)."""
+		return 'unreadable' in self._events or 'stopped' in self._events or 'torn' in self._events
 
 	def flush(self):
 		for count, where, detail in self._events.values():
@@ -1948,6 +1957,10 @@ class _PartInfo(object):
 		self.unreadable = False  # the part could not be opened, or this Python lacks its codec
 		self.committed = 0  # bytes of committed lines read (decompressed bytes for a compressed part)
 		self.lines = 0  # committed lines replayed (set by _specReplay)
+		self.stamp = None  # the part's _specStamp just before it was opened
+		# The last bytes (_SERVE_CHECK_BYTES at most) of a plain part's committed lines as read, ending at
+		# ``committed`` unless a stop policy ended the read.
+		self.check = b''
 
 
 def _newDecompressor(codec):
@@ -2209,6 +2222,7 @@ def _iterPartLines(info, reporter, label=''):
 	is reported and skipped. ``label`` prefixes locations in reports.
 	"""
 	try:
+		info.stamp = _specStamp(os.stat(info.path))  # just before the open: a change while it is read shows
 		f = open(info.path, 'rb')
 	except OSError as e:
 		info.unreadable = True
@@ -2254,6 +2268,8 @@ def _iterPartLines(info, reporter, label=''):
 					offset += nl + 1 - start
 					start = nl + 1
 				rest = data[start:]
+				if start and not info.codec:
+					info.check = (info.check + data[max(0, start - _SERVE_CHECK_BYTES):start])[-_SERVE_CHECK_BYTES:]
 		except OSError as e:
 			info.unreadable = True
 			reporter.note('unreadable', None, 'stopped reading part {} ({})'.format(info.path, e))
@@ -2453,6 +2469,66 @@ def _storeParts(path, reporter=None):
 	return parts, (parts[-1] if numbered else path)
 
 
+#: Reads of a store that changes under them (spec §19.8) before the last one is kept as possibly torn.
+_SPEC_READS = 3
+
+
+def _specUnsteady(parts, infos):
+	"""What changed in the parts ``infos`` describe while they were read, for a warning; None when nothing did.
+
+	A part before the last must be as it was just before it was opened. The
+	last part may also have grown by appends, as the handler's follower accepts
+	them: the same file, longer, and for a plain part still holding the bytes
+	read just before its committed offset. A part that was not there to open is
+	not checked.
+	"""
+	last = len(parts) - 1
+	for i, info in enumerate(infos):
+		if info.stamp is None:
+			continue
+		try:
+			stamp = _specStamp(os.stat(info.path))
+		except OSError:
+			stamp = None
+		if stamp == info.stamp:
+			continue
+		if i != last:
+			return 'the parts before the last kept changing while they were read'
+		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
+		if appended and not info.codec:  # committed counts raw bytes only in a plain part
+			try:
+				with open(info.path, 'rb') as f:
+					f.seek(info.committed - len(info.check))
+					appended = stamp[1] >= info.committed and f.read(len(info.check)) == info.check
+			except OSError:
+				appended = False
+		if not appended:
+			return 'the last part kept changing other than by appends while it was read'
+	return None
+
+
+def _specSteadyRead(read, reporter):
+	"""Return what ``read(again)`` returns, done again while the store changed under it (spec §19.8).
+
+	Readers take no lock, so a part rewritten in place while it is read (a
+	scrub) gives a torn view. ``read`` replays the store and returns ``(result,
+	parts, infos)``; ``again`` is True from its second call. When
+	``_specUnsteady`` finds a part changed, the events the read noted on
+	``reporter`` are forgotten and it is done again, up to ``_SPEC_READS``
+	times in all. The last read is then kept, noted 'torn': an incomplete read,
+	which nothing is written on the strength of.
+	"""
+	mark = reporter.mark()
+	for attempt in range(_SPEC_READS):
+		if attempt:
+			reporter.rewind(mark)  # only the read kept reports its tolerance events
+		result, parts, infos = read(bool(attempt))
+		changed = _specUnsteady(parts, infos)
+		if changed is None:
+			return result
+	reporter.note('torn', None, '{} ({} reads); the read may be torn'.format(changed, _SPEC_READS))
+	return result
+
 
 def _specVerify(fileName, delimiter, reporter):
 	"""Replay the store ``fileName`` names and return its checksum mismatches (spec §15).
@@ -2460,16 +2536,21 @@ def _specVerify(fileName, delimiter, reporter):
 	Each mismatch is ``(partPath, lineNo, algo, expected, computed)``, where
 	``lineNo`` is the 1-based line of the checksum marker in its part. The
 	mismatches are returned rather than reported. A checksum marker whose
-	algorithm this Python lacks is reported, since it cannot be verified.
+	algorithm this Python lacks is reported, since it cannot be verified. A
+	read the store changed under is done again (``_specSteadyRead``).
 	"""
-	state = _SpecState()
-	parts, _ = _storeParts(fileName, reporter)
-	for _, _, text, _ in _specReplay(parts, delimiter, state, reporter, []):
-		check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
-		if check:
-			reporter.note('checksum-unsupported', None, '#_checksum_{}_# not verified: this Python does not provide that algorithm'.format(check.group(1).lower()))
+	def read(again):
+		state = _SpecState()
+		parts, _ = _storeParts(fileName, reporter)
+		infos = []
+		for _, _, text, _ in _specReplay(parts, delimiter, state, reporter, infos):
+			check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+			if check:
+				reporter.note('checksum-unsupported', None, '#_checksum_{}_# not verified: this Python does not provide that algorithm'.format(check.group(1).lower()))
+		return state.mismatches, parts, infos
+	mismatches = _specSteadyRead(read, reporter)
 	reporter.discard('checksum')
-	return state.mismatches
+	return mismatches
 
 
 class _SpecLoad(object):
@@ -2496,10 +2577,27 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 	padded to ``max(W, len(row-bound defaults))`` with the row-bound defaults;
 	nothing is trimmed or dropped for its width. Header verification follows
 	3.39 (``strict`` raises ``ValueError`` on a mismatch) against the first
-	line of part 0 that is neither a marker nor blank.
+	line of part 0 that is neither a marker nor blank. A read the store changed
+	under is done again into ``taskDic`` as the caller passed it
+	(``_specSteadyRead``).
 	"""
 	if reporter is None:
 		reporter = _Reporter(fileName, teeLogger)
+	given = list(taskDic.items()) if taskDic else []
+
+	def read(again):
+		if again and taskDic is not None:
+			taskDic.clear()
+			taskDic.update(given)
+		load = _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum,
+							 storeOffset, taskDic, reporter, teeLogger, verbose)
+		return load, load.parts, load.infos
+	return _specSteadyRead(read, reporter)
+
+
+def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum, storeOffset,
+				  taskDic, reporter, teeLogger, verbose):
+	"""One replay of the store for ``_specLoad``."""
 	result = _SpecLoad()
 	result.data = taskDic if taskDic is not None else {}
 	data = result.data
@@ -3041,9 +3139,10 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 
 	A single file is read without a lock and rewritten in place only if no
 	other writer changed it since the read (else it is read again, up to
-	``_SPEC_REWRITE_ATTEMPTS`` times). A path naming one part of a multi-part
-	store is refused, and so is a single file declaring a spec version newer
-	than ``MAX_SPEC_VERSION``.
+	``_SPEC_REWRITE_ATTEMPTS`` times), as is a store whose read may be torn,
+	so a multi-part store never gets tombstones for the keys of a torn view.
+	A path naming one part of a multi-part store is refused, and so is a
+	single file declaring a spec version newer than ``MAX_SPEC_VERSION``.
 	"""
 	reporter = _Reporter(fileName, teeLogger)
 	attempt = None
@@ -3063,6 +3162,8 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			parts, stamp = _specSnapshot(fileName)
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
+			if attempt.has('torn'):
+				continue  # the store kept changing under its reads: never clear the keys of a torn view
 			if attempt.incomplete():
 				if _storeParts(fileName)[0] != parts:
 					continue  # a part went away during the read (a rotation): read again
@@ -3198,8 +3299,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
 				attempt.note('multipart', None, 'scrub skipped: TSVZ does not compact multi-part stores or single parts of them; nothing was written')
 				return taskDic, False
-			if stamp is None or load.parts != parts:
-				continue  # the set of parts changed under the read
+			if stamp is None or load.parts != parts or attempt.has('torn'):
+				continue  # the set of parts changed under the read, or the part kept changing while it was read
 			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'scrub skipped: the store declares a spec version newer than {0} (#_version_#), which '
 							 'this TSVZ reads as version {0} only (spec §6.3); a rewrite would make that reading permanent; '
@@ -5394,7 +5495,8 @@ class _ServeStore(object):
 						 strict=self.strict, taskDic=OrderedDict(), reporter=reporter, teeLogger=log,
 						 verbose=self.verbose)
 		self.data, self.state, self.width = load.data, load.state, load.correctColumnNum
-		if load.parts != self.parts:  # the part list changed while it was read
+		if load.parts != self.parts or reporter.has('torn'):
+			# The part list changed while it was read, or the read may be torn: the next sync reads it again.
 			self.parts = load.parts
 			self.stamps = {}
 		info = load.infos[-1] if load.infos else None

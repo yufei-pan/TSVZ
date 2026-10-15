@@ -3202,6 +3202,156 @@ def test_tsvzed_spec_clear_reloads_when_the_clear_was_skipped(tmp_path, monkeypa
 	assert TSVZ.readTabularFile(p) == {'a': ['a', '1'], 'c': ['c', 'x']}
 
 
+# --------------------------------------------------------------------------
+# Readers take no lock: a part rewritten in place under a read (spec §19.8)
+# --------------------------------------------------------------------------
+def _during_reads(monkeypatch, trigger, action, afterLines=0):
+	"""Run ``action()`` whenever a read of a spec store reaches the part ``trigger``, or once it has read
+	``afterLines`` lines of it. Parts are then read unbuffered, 8 bytes at a time, so what a read takes
+	after ``action`` comes from the bytes it left. Returns a list with one entry per read of ``trigger``."""
+	real = TSVZ._iterPartLines
+	realOpen = open
+	reads = []
+
+	def lines(info, reporter, label=''):
+		if info.path == trigger:
+			reads.append(1)
+			if not afterLines:
+				action()
+		for n, item in enumerate(real(info, reporter, label), 1):
+			yield item
+			if info.path == trigger and n == afterLines:
+				action()
+
+	def unbuffered(path, mode='r', *args, **kwargs):
+		return realOpen(path, mode, 0) if mode == 'rb' else realOpen(path, mode, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_iterPartLines', lines)
+	monkeypatch.setattr(TSVZ, 'open', unbuffered, raising=False)
+	monkeypatch.setattr(TSVZ, '_CHUNK', 8)
+	return reads
+
+
+def _rewrites(path, contents):
+	"""An action that rewrites the part ``path`` in place, as a scrub does, with the next of ``contents``
+	while any are left (the list can be emptied to stop it). Give each another size than the bytes it replaces:
+	the (inode, size, mtime) stamp cannot tell a same-size rewrite within one timestamp tick."""
+	return lambda: contents and TSVZ._specRewriteInPlace(path, contents.pop(0))
+
+
+_TORN_EARLIER = 'the parts before the last kept changing while they were read (3 reads); the read may be torn'
+_TORN_LAST = 'the last part kept changing other than by appends while it was read (3 reads); the read may be torn'
+
+
+def test_spec_a_part_rewritten_while_the_store_is_read_is_read_again(tmp_path, monkeypatch, capsys):
+	# A multi-part scrub may rewrite an earlier part in place: the first read saw part 0 as it was, then
+	# part 1, a view the store never had. It is read again.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	_touch(p + '.1', b'z\t9\nunfinished')
+	reads = _during_reads(monkeypatch, p + '.1', _rewrites(p, [b'c\t3\n']))
+	assert TSVZ.readTabularFile(p) == {'c': ['c', '3'], 'z': ['z', '9']}
+	assert len(reads) == 2
+	warnings = _tsvz_warnings(capsys)  # only the read kept reports what it found
+	assert len(warnings) == 1 and 'uncommitted bytes' in warnings[0] and 'occurrences' not in warnings[0]
+	monkeypatch.undo()
+	_during_reads(monkeypatch, p + '.1', _rewrites(p, [b'a\t10\n']))
+	store = TSVZ._ServeStore(p)  # the handler's reload reads again too
+	assert not store.unreadable and store.data == {'a': ['a', '10'], 'z': ['z', '9']}
+	store.close()
+
+
+def test_spec_verify_reads_a_part_rewritten_under_it_again(tmp_path, monkeypatch):
+	p = str(tmp_path / 'v.tsvz')
+	_touch(p, b'#_checksum_crc32_#\na\t1\n')
+	_touch(p + '.1', ('#_checksum_crc32_#\t' + _crc32(b'b\t22\n') + '\n').encode())
+	_during_reads(monkeypatch, p + '.1', _rewrites(p, [b'#_checksum_crc32_#\nb\t22\n']))
+	assert _run('verify', p) == (0, '', '')  # not the mismatch the first read computed
+
+
+def test_spec_a_store_that_keeps_changing_under_its_reads_is_torn_and_nothing_acts_on_it(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	_touch(p + '.1', b'z\t9\n')
+	flips = [b'c\t3\n', b'a\t1\nb\t2\n'] * 50
+	reads = _during_reads(monkeypatch, p + '.1', _rewrites(p, flips))
+	TSVZ.readTabularFile(p)
+	assert len(reads) == 3
+	assert any(_TORN_EARLIER in w for w in _tsvz_warnings(capsys))
+	assert _run('read', p)[0] == 1  # a torn read is an incomplete one
+	TSVZ.clearTabularFile(p)  # would append tombstones for the keys one read saw, leaving the others live
+	assert any('clear skipped: the store kept changing while it was being cleared; nothing was written' in w
+			   for w in _tsvz_warnings(capsys))
+	store = TSVZ._ServeStore(p)
+	assert store.unreadable
+	assert store.pop('z', False, None) is TSVZ._SERVE_PARTIAL
+	assert store.popitem(True, False, None) is TSVZ._SERVE_PARTIAL
+	assert store.setdefault(['q', '1'], False, None) is TSVZ._SERVE_PARTIAL
+	del flips[:]  # the store holds still again
+	assert store.read(None) in ([['a', '1'], ['b', '2'], ['z', '9']], [['c', '3'], ['z', '9']])
+	assert not store.unreadable
+	store.close()
+	assert open(p + '.1', 'rb').read() == b'z\t9\n'  # nothing was written
+
+
+@pytest.mark.parametrize('name, new', [
+	('s.tsvz', b'x\t9\n'),  # shorter: the read ends early, with a and b but not c
+	('s.tsvz', b'c\t3\nd\t4\ne\t5\nf\t6\n'),  # longer: the read takes a and b, then e and f
+	('s.tsvz.gz', b'x\t9\n'),
+])
+def test_spec_a_single_part_rewritten_while_it_is_read_is_read_again(tmp_path, monkeypatch, capsys, name, new):
+	# TSVZ's own scrub rewrites a one-part store in place: the part is also the last one.
+	p = str(tmp_path / name)
+	old = b'a\t1\nb\t2\nc\t3\n'
+	_touch(p, gzip.compress(old) if name.endswith('.gz') else old)
+	reads = _during_reads(monkeypatch, p, _rewrites(p, [new]), afterLines=1)
+	assert list(TSVZ.readTabularFile(p)) == [line.split(b'\t')[0].decode() for line in new.splitlines()]
+	assert len(reads) == 2
+	assert not _tsvz_warnings(capsys)
+
+
+@pytest.mark.parametrize('name', ['s.tsvz', 's.tsvz.gz'])
+def test_spec_records_appended_while_the_store_is_read_do_not_make_it_read_again(tmp_path, monkeypatch, capsys, name):
+	p = str(tmp_path / name)
+	old = b'a\t1\nb\t2\n'
+	_touch(p, gzip.compress(old) if name.endswith('.gz') else old)
+	appends = [[['n', 'new']]]
+	reads = _during_reads(monkeypatch, p, lambda: appends and TSVZ.appendLinesTabularFile(p, appends.pop()),
+						  afterLines=1)
+	assert TSVZ.readTabularFile(p) == {'a': ['a', '1'], 'b': ['b', '2'], 'n': ['n', 'new']}
+	assert len(reads) == 1
+	assert not _tsvz_warnings(capsys)
+
+
+def test_spec_a_single_part_rewritten_under_every_read_is_torn_and_scrub_and_clear_refuse(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\nc\t3\n')
+	flips = [b'x\t9\n', b'a\t1\nb\t2\nc\t3\n'] * 50
+	reads = _during_reads(monkeypatch, p, _rewrites(p, flips), afterLines=1)
+	TSVZ.readTabularFile(p)
+	assert len(reads) == 3
+	assert any(_TORN_LAST in w for w in _tsvz_warnings(capsys))
+	TSVZ.scrubTabularFile(p)
+	assert any('scrub skipped: the store kept changing while it was being compacted; nothing was written' in w
+			   for w in _tsvz_warnings(capsys))
+	TSVZ.clearTabularFile(p)
+	assert any('clear skipped: the store kept changing while it was being cleared; nothing was written' in w
+			   for w in _tsvz_warnings(capsys))
+
+
+def test_engine_reads_a_torn_store_again_rather_than_follow_it(tmp_path, monkeypatch):
+	# Each rewrite lengthens the part, so the last one looks like appends after the torn read's offset:
+	# following them would keep the torn view. The next sync reads the store again instead.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t0\nb\t0\n')
+	grown = [b''.join(b'%c\t%d\n' % (97 + j, i) for j in range(2 + 2 * i)) for i in (1, 2, 3)]
+	_during_reads(monkeypatch, p, _rewrites(p, grown), afterLines=1)
+	store = TSVZ._ServeStore(p)
+	assert store.unreadable and not grown
+	assert store.read(None) == [[chr(97 + j), '3'] for j in range(8)]
+	assert not store.unreadable
+	store.close()
+
+
 def test_lite_spec_and_another_process_append_without_losing_records(tmp_path):
 	p = str(tmp_path / 'race.tsvz')
 	_touch(p, b'seed\tx\n')
