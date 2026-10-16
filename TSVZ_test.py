@@ -1693,6 +1693,31 @@ def test_reads_while_a_write_waits_for_another_process_keep_no_files_open(tmp_pa
 		assert f.read() == b'a\t1\nb\t2\n'
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_a_close_re_entered_while_a_lock_is_counted_does_not_drop_it(tmp_path, monkeypatch):
+	# A finalizer (cyclic GC) can close a read's file on the locking thread at any allocation; the
+	# lock must look held or tried throughout.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+	pending = [lambda: TSVZ._closeAfterLocks(open(p, 'rb'))]
+
+	class Reentered(dict):
+		def setdefault(self, key, default=None):
+			while pending:
+				pending.pop()()
+			return dict.setdefault(self, key, default)
+	monkeypatch.setattr(TSVZ, '_CLASSIC_HELD', Reentered())
+	with open(p, 'r+b') as held:
+		TSVZ._lockFile(held)
+		try:
+			assert not pending
+			code = subprocess.call([sys.executable, '-c', _LOCK_PROBE, p])
+		finally:
+			TSVZ._unlockFile(held)
+	assert code == 3, 'the re-entered close dropped the lock'
+
+
 def _counting_reads(monkeypatch):
 	read = []
 	real_open = open
@@ -3685,14 +3710,40 @@ def test_spec_a_torn_tsvzed_load_whose_reload_fails_is_not_read_again_at_every_c
 	def fail(*args, **kwargs):
 		raise OSError(errno.EIO, 'Input/output error')
 	monkeypatch.setattr(TSVZ, '_specLoad', fail)
+	clock = [time.monotonic()]
+	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])
 	try:
 		t.checkExternalChanges()
 		assert t.deSynced
-		t.rewrite()  # reloads, which fails: reported once
+		t.rewrite()  # reloads, which fails: reported, then tried again only after a while
 		t.checkExternalChanges()
 		assert not t.deSynced
+		monkeypatch.undo()  # the store reads again, and the time has come
+		clock[0] += 120
+		monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])
+		t.checkExternalChanges()
+		assert t.deSynced
+		t.rewrite()
+		assert dict(t) == dict(TSVZ.readTabularFile(p, verbose=False))
 	finally:
 		t.close()
+
+
+def test_spec_a_strict_header_mismatch_is_raised_though_the_next_read_cannot_read_the_header(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#x\ty\na\t1\n')
+	real = open
+	opened = []
+
+	def opening(path, mode='r', *args, **kwargs):
+		if path == p and mode == 'rb':
+			opened.append(1)
+			if len(opened) == 2:
+				raise OSError(errno.EMFILE, 'Too many open files')
+		return real(path, mode, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, 'open', opening, raising=False)
+	with pytest.raises(ValueError):
+		TSVZ.readTabularFile(p, header='k\tv', strict=True, verbose=False)
 
 
 def test_spec_a_store_with_no_header_line_under_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch):

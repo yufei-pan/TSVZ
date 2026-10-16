@@ -732,8 +732,8 @@ def _closeCounted(key, files, quiet=False):
 def _lockClassic(f, key):
 	"""Take a lockf lock on ``f`` (the file ``key``) and count it; returns the thread's ident.
 
-	It is tried without waiting, while no close of the file is in flight (and a read's close meanwhile
-	is put off), and counted as soon as it is taken. When another process holds it, it is waited for in
+	It is tried without waiting, once no close of the file is in flight (a read's close meanwhile is
+	put off), and counted as soon as it is taken. When another process holds it, it is waited for in
 	the kernel, as other lockf users wait for it, uncounted (reads close meanwhile, which may drop it
 	once taken), then tried again: still held (a no-op) or free, it is counted; taken by another process
 	meanwhile, it is waited for again.
@@ -741,9 +741,11 @@ def _lockClassic(f, key):
 	me = threading.get_ident()
 	while True:
 		with _CLASSIC:
+			# Counted first: reads closing from now on are put off (after a grant from the kernel, the
+			# lock may be ours already); then the closes in flight end.
+			_count(_CLASSIC_TAKING, key, 1)
 			while _CLASSIC_CLOSING.get(key):
 				_CLASSIC.wait()
-			_count(_CLASSIC_TAKING, key, 1)
 		taken = False
 		try:
 			try:
@@ -754,10 +756,10 @@ def _lockClassic(f, key):
 					raise
 		finally:
 			with _CLASSIC:
-				_count(_CLASSIC_TAKING, key, -1)
-				if taken:
+				if taken:  # counted before the try's count goes: the file never looks idle in between
 					held = _CLASSIC_HELD.setdefault(key, {})
 					held[me] = held.get(me, 0) + 1
+				_count(_CLASSIC_TAKING, key, -1)
 				parked = _unparkIfIdle(key)
 				_CLASSIC.notify_all()
 			if parked:
@@ -2791,6 +2793,10 @@ def _specUnsteady(parts, infos):
 	return None
 
 
+#: The clock a torn TSVZed load's next read again is timed by.
+_specClock = time.monotonic
+
+
 class _HeaderMismatch(Exception):
 	"""A strict read found a header line other than the one asked for (``line``): it stops there."""
 
@@ -2902,6 +2908,9 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 			if taskDic is not None:
 				taskDic.clear()
 				taskDic.update(given)
+	if seen and load.headerChecked is None:  # the line seen, and none read since (the part unreadable)
+		_lineContainHeader(header, seen[-1], verbose=verbose, teeLogger=teeLogger, strict=True,
+						   delimiter=delimiter)
 	if load.headerChecked is not None:  # judged silently in each read; said, or raised on, once
 		_lineContainHeader(header, load.headerChecked, verbose=verbose, teeLogger=teeLogger, strict=strict,
 						   delimiter=delimiter)
@@ -3971,6 +3980,9 @@ class TSVZed(OrderedDict):
 		# The store kept changing under every read: no part watched need change again for the next
 		# check to read it again (spec §19.8).
 		self._specTorn = torn
+		self._specTornAt = 0.0
+		if not torn:
+			self._specTornWait = 0.0
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
 				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
@@ -4010,8 +4022,10 @@ class TSVZed(OrderedDict):
 				self.reload()
 			except Exception as e:
 				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
-				# Mark the change as seen so the failure is reported once, not every tick.
-				self._specTorn = False
+				# Mark the change as seen so the failure is reported once, not every tick. A torn view is
+				# read again after a while (1 s, doubling to a minute), not at every tick.
+				self._specTornWait = min(max(1.0, getattr(self, '_specTornWait', 0.0) * 2), 60.0)
+				self._specTornAt = _specClock() + self._specTornWait
 				try:
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 					self._dirMtimeNs = _dirMtimeNs(self._fileName)
@@ -4025,7 +4039,7 @@ class TSVZed(OrderedDict):
 
 	def _specExternalChanged(self):
 		"""True when another writer changed the active part or the set of parts, or the last load was torn."""
-		if getattr(self, '_specTorn', False):
+		if getattr(self, '_specTorn', False) and _specClock() >= getattr(self, '_specTornAt', 0.0):
 			return True
 		if getFileUpdateTimeNs(self._activePath) > self.externalFileUpdateTime:
 			return True
