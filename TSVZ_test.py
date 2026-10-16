@@ -1619,7 +1619,7 @@ def test_a_write_waiting_for_another_process_s_lock_gets_it_between_its_holds(tm
 	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nprint("go", flush=True)\n'
 			'end = time.monotonic() + 30\n'
 			'while time.monotonic() < end:\n'
-			'    fcntl.lockf(f, fcntl.LOCK_EX)\n    time.sleep(0.0099)\n    fcntl.lockf(f, fcntl.LOCK_UN)\n    time.sleep(0.0001)\n')
+			'    fcntl.lockf(f, fcntl.LOCK_EX)\n    time.sleep(0.009)\n    fcntl.lockf(f, fcntl.LOCK_UN)\n    time.sleep(0.001)\n')
 	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdout=subprocess.PIPE)
 	try:
 		assert holder.stdout.readline().strip() == b'go'
@@ -1665,6 +1665,32 @@ def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, 
 		holder.wait(10)
 		holder.stdout.close()
 	assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_reads_while_a_write_waits_for_another_process_keep_no_files_open(tmp_path, monkeypatch):
+	# A lock still waited for is not held: a read's close is not put off for it.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nfcntl.lockf(f, fcntl.LOCK_EX)\n'
+			'print("held", flush=True)\nsys.stdin.readline()\n')
+	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+	try:
+		assert holder.stdout.readline().strip() == b'held'
+		writer = threading.Thread(target=TSVZ._lockedAppend, args=(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p)))
+		writer.start()
+		time.sleep(0.2)
+		for _ in range(20):
+			TSVZ.readTabularFile(p, verbose=False)
+		assert not TSVZ._CLASSIC_PARKED
+	finally:
+		holder.stdin.close()
+		holder.wait(10)
+		holder.stdout.close()
+	writer.join(10)
+	with open(p, 'rb') as f:
+		assert f.read() == b'a\t1\nb\t2\n'
 
 
 def _counting_reads(monkeypatch):
@@ -3634,6 +3660,39 @@ def test_spec_a_compressed_snapshot_part_whose_first_member_is_corrupt_is_no_sna
 	_touch(p + '.1.gz', bytes(member))
 	assert not TSVZ._specIsSnapshotPart(p + '.1.gz', '\t')
 	assert 'a' in TSVZ.readTabularFile(p, verbose=False)
+
+
+def test_spec_a_compressed_snapshot_part_whose_first_member_is_cut_short_is_no_snapshot_part(tmp_path):
+	# A part cut short holds no whole state (a crash, or a snapshot still being written).
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\n')
+	member = gzip.compress(b'#_snapshot_#\n' + b''.join(b'k%d\t%d\n' % (i, i) for i in range(5000)))
+	_touch(p + '.1.gz', member[:len(member) // 3])
+	assert not TSVZ._specIsSnapshotPart(p + '.1.gz', '\t')
+	assert 'a' in TSVZ.readTabularFile(p, verbose=False)
+
+
+def test_spec_a_torn_tsvzed_load_whose_reload_fails_is_not_read_again_at_every_check(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	_touch(p + '.1', b'z\t9\n')
+	flips = [b'c\t3\n', b'a\t1\nb\t2\n'] * 50
+	_during_reads(monkeypatch, p + '.1', _rewrites(p, flips))
+	t = TSVZ.TSVZed(p)
+	t.stopAppendThread()
+	del flips[:]
+
+	def fail(*args, **kwargs):
+		raise OSError(errno.EIO, 'Input/output error')
+	monkeypatch.setattr(TSVZ, '_specLoad', fail)
+	try:
+		t.checkExternalChanges()
+		assert t.deSynced
+		t.rewrite()  # reloads, which fails: reported once
+		t.checkExternalChanges()
+		assert not t.deSynced
+	finally:
+		t.close()
 
 
 def test_spec_a_store_with_no_header_line_under_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch):
