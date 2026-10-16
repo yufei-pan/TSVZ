@@ -485,7 +485,7 @@ those markers are inert.
 | `#_rotate_#` | advisory | recommended action for superseded parts after a snapshot (§19) | `keep` / `rename` / `delete` | `keep` |
 | `#_write_ack_#` | advisory | when a writer/handler acknowledges a record (§18) | `memory` / `disk` | `memory` |
 | `#_member_size_#` | advisory | the most uncompressed data a writer puts in one compressed member (§16.7) | a single integer ≥ 1 | `1048576` |
-| `#_snapshot_#` | positional | the part it begins holds the store's whole state: a reader MAY skip the parts before it (§19.10) | none: a line with a value is not this marker | — |
+| `#_snapshot_#` | advisory | the part it begins holds the store's whole state: a reader MAY skip the parts before it (§19.10) | none: a line with a value is not this marker | — |
 | `#_checksum_<algo>_#` | integrity | verify a segment digest (§15) | hex digest, or empty | off |
 
 12.4.1 A boolean value is `true` or `false`; `yes`, `on` and `1` are also accepted
@@ -499,10 +499,11 @@ without verification (§15.3).
 12.4.2 **`#_version_#`** — see §6. **`#_defaults_#`, `#_fill_empty_with_default_#`,
 `#_return_defaults_when_missing_#`** — see §14. **`#_strip_trailing_whites_#`** —
 see §10. **`#_on_corruption_#`** — see §4.10. **`#_rotate_#`** — see §19. **`#_write_ack_#`** — see §18.
-**`#_member_size_#`** — see §16.7. **`#_checksum_<algo>_#`** — see §15.
+**`#_member_size_#`** — see §16.7. **`#_snapshot_#`** — see §19.10. **`#_checksum_<algo>_#`** — see §15.
 
-12.4.3 **Advisory** markers (`#_rotate_#`, `#_write_ack_#`, `#_member_size_#`) are
-hints to writers and processors and have **no effect on reconstructed data**. **Integrity** markers
+12.4.3 **Advisory** markers (`#_rotate_#`, `#_write_ack_#`, `#_member_size_#`,
+`#_snapshot_#`) are hints to writers, readers and processors and have **no effect on
+reconstructed data**. **Integrity** markers
 (`#_checksum_<algo>_#`) affect only verification and have no effect on
 reconstructed data (§15).
 
@@ -1073,7 +1074,8 @@ the header comment, if any; `#_version_#` `1`; `#_strip_trailing_whites_#`
 marker stated explicitly with its final value, `#_defaults_#` included (an empty
 `#_defaults_#` resets the defaults); the rows, fully resolved (§19.4); then the
 final `#_strip_trailing_whites_#` and `#_fill_empty_with_default_#`. That form
-also reads correctly alone, so it may begin with `#_snapshot_#` (§19.10).
+also reads correctly alone, so it may carry `#_snapshot_#` after its header comment
+(§19.10).
 
 19.9 **Promotion.** Snapshotting a single unnumbered file (§17.1) by the §19.2
 procedure promotes the store to multi-part: with exclusive access to the file held

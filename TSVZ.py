@@ -659,12 +659,27 @@ _LOCKF_FDS = {}
 
 #: A lockf lock belongs to the process, and closing any descriptor of the file in the process drops it
 #: (spec §18.6). So that a read in another thread cannot drop a write's lock, this process's lockf locks
-#: are counted per file (``_fileKey``) and per thread, held or being taken, in ``_CLASSIC_HELD``; and the
-#: closes in flight per file in ``_CLASSIC_CLOSING``. A close (``_closeAfterLocks``) waits until no
-#: other thread holds or is taking a lockf lock on the file; a lockf lock waits for the closes in flight.
+#: held are counted per file (``_fileKey``) and per thread in ``_CLASSIC_HELD``; and the closes in flight
+#: per file in ``_CLASSIC_CLOSING``. A close (``_closeAfterLocks``) waits until no other thread holds a
+#: lockf lock on the file; a lockf lock is taken (without waiting, retried) only while no close of the
+#: file is in flight, and counted at once, both under ``_CLASSIC``.
 _CLASSIC = threading.Condition()
 _CLASSIC_HELD = {}
 _CLASSIC_CLOSING = {}
+
+
+def _classicAfterFork():
+	"""In a forked child: the parent's lockf locks are not inherited, and a thread that held
+	``_CLASSIC`` at the fork is not there to release it."""
+	global _CLASSIC
+	_CLASSIC = threading.Condition()
+	_CLASSIC_HELD.clear()
+	_CLASSIC_CLOSING.clear()
+	_LOCKF_FDS.clear()
+
+
+if hasattr(os, 'register_at_fork'):  # Python 3.7+
+	os.register_at_fork(after_in_child=_classicAfterFork)
 
 
 def _fileKey(f):
@@ -673,19 +688,35 @@ def _fileKey(f):
 	return st.st_dev, st.st_ino
 
 
-def _enterClassic(key):
-	"""Count a lockf lock this thread is about to take on the file ``key``; returns the thread's ident."""
+def _lockClassic(f, key):
+	"""Take a lockf lock on ``f`` (the file ``key``) and count it; returns the thread's ident.
+
+	The lock is tried without waiting, while no close of the file is in flight,
+	and counted at once, both under ``_CLASSIC``; while another process holds it,
+	it is tried again (1 ms, doubling to 50 ms). A lock still being waited for is
+	not counted: closes in other threads (reads, which take no lock) go on.
+	"""
 	me = threading.get_ident()
-	with _CLASSIC:
-		while _CLASSIC_CLOSING.get(key):
-			_CLASSIC.wait()
-		held = _CLASSIC_HELD.setdefault(key, {})
-		held[me] = held.get(me, 0) + 1
-	return me
+	delay = 0.001
+	while True:
+		with _CLASSIC:
+			while _CLASSIC_CLOSING.get(key):
+				_CLASSIC.wait()
+			try:
+				fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+			except OSError as e:
+				if e.errno not in (errno.EACCES, errno.EAGAIN):
+					raise
+			else:
+				held = _CLASSIC_HELD.setdefault(key, {})
+				held[me] = held.get(me, 0) + 1
+				return me
+		time.sleep(delay)
+		delay = min(delay * 2, 0.05)
 
 
 def _leaveClassic(key, me):
-	"""Uncount a lockf lock ``_enterClassic`` counted: released, or never taken."""
+	"""Uncount a lockf lock ``_lockClassic`` counted, once released."""
 	with _CLASSIC:
 		held = _CLASSIC_HELD[key]
 		held[me] -= 1
@@ -698,7 +729,7 @@ def _leaveClassic(key, me):
 
 def _closeAfterLocks(f):
 	"""Close ``f``, a file this process may also lock through another descriptor, once no other thread
-	holds or is taking a lockf lock on it: the close would drop that lock (spec §18.6). Open file
+	holds a lockf lock on it: the close would drop that lock (spec §18.6). Open file
 	description locks (Linux) are not counted, so nothing waits for them."""
 	key = None
 	if os.name == 'posix':
@@ -753,13 +784,7 @@ def _lockFile(f):
 			_LOCKF_FDS.pop(f.fileno(), None)
 		else:
 			key = _fileKey(f)
-			me = _enterClassic(key)
-			try:
-				fcntl.lockf(f, fcntl.LOCK_EX)
-			except BaseException:
-				_leaveClassic(key, me)
-				raise
-			_LOCKF_FDS[f.fileno()] = (key, me)
+			_LOCKF_FDS[f.fileno()] = (key, _lockClassic(f, key))
 	elif os.name == 'nt':
 		msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
 
@@ -1208,6 +1233,12 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = ...):
 				__teePrintOrNot('Invalid header, setting header to empty.','error',teeLogger=teeLogger)
 			header = []
 	return [s.rstrip() for s in header]
+
+def _headerMatches(header, line, delimiter):
+	"""Whether ``line`` holds ``header``, as ``_lineContainHeader`` judges it, saying nothing."""
+	line = _formatHeader(line, delimiter=get_delimiter(delimiter))
+	return len(header) == len(line) and all(header[i] in line[i] for i in range(len(header)))
+
 
 def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = ...):
 	"""
@@ -1755,7 +1786,14 @@ def _specEncodeField(value, delimiter, isKey=False):
 
 
 def _specFormatRecord(cells, delimiter, marker=False):
-	"""Format one record without its '\\n'. ``marker`` writes ``cells[0]`` raw as a marker key."""
+	"""Format one record without its '\\n'. ``marker`` writes ``cells[0]`` raw as a marker key.
+
+	Raises ValueError for ``#_snapshot_#``: only a snapshot writes it, as a part's first line
+	(spec §19.10.2), and TSVZ writes none; as a record it could make readers skip the parts
+	before it."""
+	if marker and cells[0].lower() == SNAPSHOT_KEY:
+		raise ValueError('{} is not written by a writer appending records: it marks a part that holds the '
+						 "store's whole state, written by a snapshot (spec §19.10.2)".format(cells[0]))
 	first = cells[0] if marker else _specEncodeField(cells[0], delimiter, isKey=True)
 	if len(cells) == 1:
 		return first
@@ -2495,18 +2533,22 @@ def _specIsSnapshotPart(path, delimiter):
 	"""True when the part ``path`` begins with a value-less ``#_snapshot_#`` (spec §19.10.1).
 
 	It counts as the first committed line, or the second after a comment. A part
-	whose first lines cannot be read is not a snapshot part (spec §19.10.3).
+	whose first lines cannot be read is not a snapshot part (spec §19.10.3). Only
+	the start of the part is read and decoded (``_specFirstLines``).
 	"""
 	quiet = _Reporter(path)  # never flushed: nothing found here is reported
-	info = _PartInfo(path)
-	lines = _iterPartLines(info, quiet)
+	lines = _specFirstLines(path)
 	try:
-		for lineNo, (raw, _) in enumerate(lines, 1):
+		for lineNo, raw in enumerate(lines, 1):
+			if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
+				raw = raw[3:]  # spec §4.7
 			fields = _decodeLine(raw, quiet, None).split(delimiter)
 			if fields[0].lower() == SNAPSHOT_KEY:
-				return not info.lost and all(f == '' for f in fields[1:])
+				return all(f == '' for f in fields[1:])
 			if lineNo == 2 or not fields[0].startswith('#') or _MARKER_RE.match(fields[0]):
 				return False  # a first line that is not a comment, or a second line
+	except _StartUnreadable:
+		return False
 	finally:
 		lines.close()
 	return False
@@ -2608,8 +2650,9 @@ def _specUnsteady(parts, infos):
 	A part before the last must be as it was just before it was opened. The
 	last part may also have grown by appends, as the handler's follower accepts
 	them: the same file, longer, and for a plain part still holding the bytes
-	read just before its committed offset. A part that was not there to open is
-	not checked.
+	read just before its committed offset; for a compressed part, read without
+	damage (a rewrite in place shows as damage where the old bytes give way to the
+	new). A part that was not there to open is not checked.
 	"""
 	last = len(parts) - 1
 	for i, info in enumerate(infos):
@@ -2624,7 +2667,9 @@ def _specUnsteady(parts, infos):
 		if i != last:
 			return 'the parts before the last kept changing while they were read'
 		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
-		if appended and not info.codec:  # committed counts raw bytes only in a plain part
+		if appended and info.codec:
+			appended = not info.lost and not info.damaged
+		elif appended:  # committed counts raw bytes only in a plain part
 			try:
 				with _ClosedAfterLocks(open(info.path, 'rb')) as f:
 					f.seek(info.committed - len(info.check))
@@ -2695,6 +2740,7 @@ class _SpecLoad(object):
 		self.correctColumnNum = -1
 		self.lastLine = None
 		self.headerLine = None
+		self.headerChecked = None  # the line the header was checked against, judged out loud once kept
 
 
 def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, defaults=None,
@@ -2721,7 +2767,11 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 		load = _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum,
 							 storeOffset, taskDic, reporter, teeLogger, verbose)
 		return load, load.parts, load.infos
-	return _specSteadyRead(read, reporter)
+	load = _specSteadyRead(read, reporter)
+	if load.headerChecked is not None:  # judged silently in each read; said, or raised on, once
+		_lineContainHeader(header, load.headerChecked, verbose=verbose, teeLogger=teeLogger, strict=strict,
+						   delimiter=delimiter)
+	return load
 
 
 def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum, storeOffset,
@@ -2736,6 +2786,9 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 	result.parts, result.active = parts, active
 	activeIndex = len(parts) - 1
 	start = _specSnapshotStart(parts, delimiter)  # the parts before a snapshot part are not read (spec §19.10.3)
+	if start:
+		# The skipped history may have declared defaults: TSVZed and TSVZedLite write none of their own.
+		state.sawDefaults = True
 	width = correctColumnNum
 	headerPending = bool(header and any(header) and verifyHeader)
 	firstPartPending = True
@@ -2749,7 +2802,8 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 			if headerPending:
 				headerPending = False
 				candidate = text[1:] if isComment else text
-				if _lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
+				result.headerChecked = candidate  # said, or raised on, for the read kept only (_specLoad)
+				if _headerMatches(header, candidate, delimiter):
 					if not isComment:
 						reporter.note('header-as-data', 'line 1', 'first line matches the header but is not a # comment; read as data key {!r} (prefix it with #)'.format(record[0] if record else text))
 					if width == -1:
@@ -2846,7 +2900,7 @@ def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLo
 			raise
 		return False
 	try:
-		with open(fileName, 'xb') as f:
+		with _ClosedAfterLocks(open(fileName, 'xb')) as f:
 			f.write(_compressBytes(codec, content) if codec and content else content)
 		__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 	except FileExistsError:
@@ -2977,8 +3031,10 @@ _SPEC_REWRITE_ATTEMPTS = 3
 
 
 def _specStamp(st):
-	"""What identifies a part's bytes between a read and a rewrite: (inode, size, mtime)."""
-	return (st.st_ino, st.st_size, st.st_mtime_ns)
+	"""What identifies a part's bytes between a read and a rewrite: (inode, size, mtime, ctime). The change
+	time catches a rewrite to the same size whose modification time was set back (cp -p, rsync -a): no
+	program sets it back."""
+	return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _specSnapshot(fileName):
@@ -3755,6 +3811,7 @@ class TSVZed(OrderedDict):
 								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
 								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
 			unreadable = reporter.incomplete()
+			torn = reporter.has('torn')
 		finally:
 			reporter.flush()
 		OrderedDict.clear(self)
@@ -3774,6 +3831,10 @@ class TSVZed(OrderedDict):
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 		self.lastUpdateTime = self.externalFileUpdateTime
+		if torn:
+			# The store kept changing under every read: no part watched need change again for the
+			# next check to read it again (spec §19.8).
+			self.externalFileUpdateTime = -1
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
 				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
@@ -4582,20 +4643,26 @@ memoryOnly:{self.memoryOnly}
 		if file is None:
 			return
 		try:
-			file.flush()  # Ensure the file is flushed before unlocking
-			os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
-			if not file.closed:
-				if os.name == 'posix':
-					_unlockFile(file)
-				elif os.name == 'nt':
-					# Unlocking the entire file; for Windows, ensure not unlocking an empty file
-					#unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
-					unlock_length = 2147483647
+			try:
+				file.flush()  # Ensure the file is flushed before unlocking
+				os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
+			finally:
+				# Unlocked and closed even when the flush or the sync failed: a lockf lock left
+				# held (and counted) would hold every other thread's close of the file.
+				if not file.closed:
 					try:
-						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
-					except Exception:
-						pass
-				_closeAfterLocks(file)  # closed after unlocking, and after any other thread's lockf lock on it
+						if os.name == 'posix':
+							_unlockFile(file)
+						elif os.name == 'nt':
+							# Unlocking the entire file; for Windows, ensure not unlocking an empty file
+							#unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
+							unlock_length = 2147483647
+							try:
+								msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
+							except Exception:
+								pass
+					finally:
+						_closeAfterLocks(file)  # closed after unlocking, and after any other thread's lockf lock on it
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
@@ -5620,7 +5687,7 @@ class _ServeStore(object):
 
 	def _loadSpec(self, reporter, log):
 		self.parts = _storeParts(self.path)[0]
-		self.stamps = self._stamps(self.parts)
+		before = self._stamps(self.parts)
 		load = _specLoad(self.path, self.delimiter, defaults=_normalizeDefaults(self.defaults, self.delimiter),
 						 strict=self.strict, taskDic=OrderedDict(), reporter=reporter, teeLogger=log,
 						 verbose=self.verbose)
@@ -5629,6 +5696,11 @@ class _ServeStore(object):
 			# The part list changed while it was read, or the read may be torn: the next sync reads it again.
 			self.parts = load.parts
 			self.stamps = {}
+		else:
+			# As the read kept saw each part when it opened it (a read done again saw them as they are
+			# now); a part it skipped (spec §19.10.3) keeps the stamp taken before the read.
+			self.stamps = {info.path: info.stamp if info.stamp is not None else before.get(info.path)
+						   for info in load.infos}
 		info = load.infos[-1] if load.infos else None
 		self.offset = info.committed if info is not None else 0
 		self.lineNo = info.lines if info is not None else 0
@@ -5714,7 +5786,7 @@ class _ServeStore(object):
 			reporter.flush()
 		self.offset += end
 		self.check = (self.check + data[:end])[-_SERVE_CHECK_BYTES:]
-		self.stamps[path] = (stamp[0], self.offset + len(data) - end, stamp[2])
+		self.stamps[path] = stamp[:1] + (self.offset + len(data) - end,) + stamp[2:]
 		return True
 
 	def _apply(self, raw, reporter, atStart=False):

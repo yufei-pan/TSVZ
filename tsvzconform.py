@@ -967,6 +967,10 @@ def snapshot_layout(store, before):
 		if lines[0] != first_line(before):
 			return ['line 1 is a comment but not the store\'s header comment: %s' % show(lines[0])]
 		i = 1
+	if i < len(lines):
+		fields = lines[i].split(d)
+		if fields[0].lower() == '#_snapshot_#' and all(f == '' for f in fields[1:]):
+			i += 1  # §19.2.3e: a snapshot may begin with #_snapshot_#, after the header comment
 	block = []
 	while i < len(lines) and _is_marker_line(lines[i], d):
 		block.append(lines[i].split(d)[0].lower())
