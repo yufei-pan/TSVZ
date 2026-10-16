@@ -8,6 +8,8 @@ you have the current state.
 
 `pip install tsvz` — Python, the reference implementation
 
+`cargo install tsvz` — Rust, a fast single-binary tool and library
+
 ```csvz people.csvz
 #id,name,score  ← header (a comment)
 alice,Alice,30
@@ -79,10 +81,20 @@ t.close()
 | Language | Package | Read | Write | CLI §20 | Handler §21 | Version | Links |
 |---|---|---|---|---|---|---|---|
 | Python (reference) | `tsvz` on PyPI | ✓ | ✓ | ✓ | ✓ | 4.4+ | [GitHub](https://github.com/yufei-pan/TSVZ) · [PyPI](https://pypi.org/project/TSVZ/) · [Notes](https://github.com/yufei-pan/TSVZ#spec-deviations-and-interpretations) |
+| Rust | `tsvz` on crates.io | ✓ | ✓ | ✓ | ✓ | 0.1+ | [GitHub](https://github.com/yufei-pan/tsvz-rs) · [crates.io](https://crates.io/crates/tsvz) · [Notes](https://github.com/yufei-pan/tsvz-rs/blob/main/docs/silent-choices.md) |
 
 TSVZ 4.2 is the first Python release that follows spec v1, and 4.4 the first
 that passes the whole conformance suite. Earlier releases (3.x) read `.tsvz`
 files under older rules.
+
+tsvz-rs is the same `tsvz` command and a library crate in Rust: `cargo install
+tsvz`, or a static binary for Linux or macOS from its
+[releases](https://github.com/yufei-pan/tsvz-rs/releases). It passes the whole
+conformance suite, and its handler speaks the same protocol as the Python one,
+so either tool's commands go through either tool's handler. On the
+[benchmark workloads](https://github.com/yufei-pan/tsvz-rs/blob/main/bench/RESULTS.md)
+it runs about 4 to 10 times as fast as the Python reference, and holds a
+loaded store in less than half the memory.
 
 Writing one in another language? The spec is one document with worked
 examples and pseudocode, and the
