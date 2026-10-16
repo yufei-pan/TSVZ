@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 4.8**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 4.9**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -72,7 +72,12 @@ tsvz -V
   `#_return_defaults_when_missing_#`, ...), escapes (`<sep>`, `<LF>`, `<lt>`,
   `<#>`), tombstones, `#_checksum_<algo>_#` segments (crc32 and every
   fixed-length hashlib algorithm), compressed parts, and **multi-part stores**
-  (`store.tsvz.<hex>`, part 0 first, `.rotated` parts skipped).
+  (`store.tsvz.<hex>`, part 0 first, `.rotated` parts skipped). A read starts
+  at the last *snapshot part* (one that begins with `#_snapshot_#`, spec
+  §19.10, and holds the store's whole state) and skips the history before it;
+  `verify` and `parts` still read every part. A store whose parts change while
+  they are read (another tool's in-place scrub) is read again, up to three
+  times; a read still changing then is incomplete, as an unreadable part is.
 - **Writes** one file: the named file, or the highest-numbered part of a
   multi-part store. Rows are written as given (no padding); a lone key is a
   tombstone; a row of empty cells (`k\t\t`) is a live row.
@@ -247,13 +252,13 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere it is `lockf`.
+- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere it is `lockf`, and since closing any descriptor of the file drops a `lockf` lock, another thread of the process that closes one waits until the lock is released.
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
 - §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
-- §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, exit 1 with an error that `-q` keeps.
+- §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, or whose parts kept changing through three reads, exit 1 with an error that `-q` keeps.
 - §21: a served `.tsv` file with a header line shows that line as a row, as `tsvz read` does (`TSVZed` hides it when given the header).
 - §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, and reloads a part whose size stayed the same but whose inode or modification time changed. A rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
 - §21.9: `tsvz` commands and `TSVZClient` ask the server to answer writes once they are written (`--x-written`), so a write the server cannot make fails as it would on the files. While writes fail, every answer carries a warning.
