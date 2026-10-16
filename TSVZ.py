@@ -653,8 +653,89 @@ def _ofdLock(f, kind):
 	return True
 
 
-#: Descriptors locked with lockf because their open file description lock was refused: unlocked the same way.
-_LOCKF_FDS = set()
+#: Descriptors locked with lockf because their open file description lock was refused, unlocked the same
+#: way: each maps to its file's ``_fileKey`` and the thread that took the lock.
+_LOCKF_FDS = {}
+
+#: A lockf lock belongs to the process, and closing any descriptor of the file in the process drops it
+#: (spec §18.6). So that a read in another thread cannot drop a write's lock, this process's lockf locks
+#: are counted per file (``_fileKey``) and per thread, held or being taken, in ``_CLASSIC_HELD``; and the
+#: closes in flight per file in ``_CLASSIC_CLOSING``. A close (``_closeAfterLocks``) waits until no
+#: other thread holds or is taking a lockf lock on the file; a lockf lock waits for the closes in flight.
+_CLASSIC = threading.Condition()
+_CLASSIC_HELD = {}
+_CLASSIC_CLOSING = {}
+
+
+def _fileKey(f):
+	"""The device and inode of the open file ``f``."""
+	st = os.fstat(f.fileno())
+	return st.st_dev, st.st_ino
+
+
+def _enterClassic(key):
+	"""Count a lockf lock this thread is about to take on the file ``key``; returns the thread's ident."""
+	me = threading.get_ident()
+	with _CLASSIC:
+		while _CLASSIC_CLOSING.get(key):
+			_CLASSIC.wait()
+		held = _CLASSIC_HELD.setdefault(key, {})
+		held[me] = held.get(me, 0) + 1
+	return me
+
+
+def _leaveClassic(key, me):
+	"""Uncount a lockf lock ``_enterClassic`` counted: released, or never taken."""
+	with _CLASSIC:
+		held = _CLASSIC_HELD[key]
+		held[me] -= 1
+		if not held[me]:
+			del held[me]
+			if not held:
+				del _CLASSIC_HELD[key]
+		_CLASSIC.notify_all()
+
+
+def _closeAfterLocks(f):
+	"""Close ``f``, a file this process may also lock through another descriptor, once no other thread
+	holds or is taking a lockf lock on it: the close would drop that lock (spec §18.6). Open file
+	description locks (Linux) are not counted, so nothing waits for them."""
+	key = None
+	if os.name == 'posix':
+		try:
+			key = _fileKey(f)
+		except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
+			pass  # closed already, or no descriptor of its own
+	if key is None:
+		f.close()
+		return
+	me = threading.get_ident()
+	with _CLASSIC:
+		while any(thread != me for thread in _CLASSIC_HELD.get(key, ())):
+			_CLASSIC.wait()
+		_CLASSIC_CLOSING[key] = _CLASSIC_CLOSING.get(key, 0) + 1
+	try:
+		f.close()
+	finally:
+		with _CLASSIC:
+			_CLASSIC_CLOSING[key] -= 1
+			if not _CLASSIC_CLOSING[key]:
+				del _CLASSIC_CLOSING[key]
+			_CLASSIC.notify_all()
+
+
+class _ClosedAfterLocks(object):
+	"""``with _ClosedAfterLocks(open(...)) as f:``: ``f`` is closed by ``_closeAfterLocks``."""
+	__slots__ = ('f',)
+
+	def __init__(self, f):
+		self.f = f
+
+	def __enter__(self):
+		return self.f
+
+	def __exit__(self, *exc):
+		_closeAfterLocks(self.f)
 
 
 def _lockFile(f):
@@ -663,14 +744,22 @@ def _lockFile(f):
 	On Linux it belongs to the open file description (spec §18.6), so closing
 	another descriptor of the file in this process does not drop it; it still
 	excludes the process-owned lockf of other writers. Elsewhere, or when the
-	kernel refuses it, it is lockf.
+	kernel refuses it, it is lockf, counted so that no other thread of this
+	process closes a descriptor of the file while it is held
+	(``_closeAfterLocks``).
 	"""
 	if os.name == 'posix':
 		if _ofdLock(f, fcntl.F_WRLCK):
-			_LOCKF_FDS.discard(f.fileno())
+			_LOCKF_FDS.pop(f.fileno(), None)
 		else:
-			fcntl.lockf(f, fcntl.LOCK_EX)
-			_LOCKF_FDS.add(f.fileno())
+			key = _fileKey(f)
+			me = _enterClassic(key)
+			try:
+				fcntl.lockf(f, fcntl.LOCK_EX)
+			except BaseException:
+				_leaveClassic(key, me)
+				raise
+			_LOCKF_FDS[f.fileno()] = (key, me)
 	elif os.name == 'nt':
 		msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
 
@@ -701,8 +790,11 @@ def _unlockFile(f):
 		if os.name == 'posix':
 			fd = f.fileno()
 			if fd in _LOCKF_FDS:
-				_LOCKF_FDS.discard(fd)
-				fcntl.lockf(f, fcntl.LOCK_UN)
+				key, me = _LOCKF_FDS.pop(fd)
+				try:
+					fcntl.lockf(f, fcntl.LOCK_UN)
+				finally:
+					_leaveClassic(key, me)
 			elif not _ofdLock(f, fcntl.F_UNLCK):
 				fcntl.lockf(f, fcntl.LOCK_UN)
 		elif os.name == 'nt':
@@ -754,7 +846,7 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False):
 	repair is noted on ``reporter``. A missing file is created.
 	"""
 	with _pathLock(path):
-		with open(path, 'a+b') as f:
+		with _ClosedAfterLocks(open(path, 'a+b')) as f:
 			_lockFile(f)
 			try:
 				if _endsWithoutNewline(f):
@@ -930,7 +1022,7 @@ def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=F
 	delimiter = get_delimiter(delimiter, file_name=fileName)
 	last_valid = -1 if storeOffset else []
 	scratch = {}
-	with openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
+	with _ClosedAfterLocks(openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger)) as file:
 		while True:
 			offset = file.tell()
 			line = file.readline()
@@ -989,7 +1081,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 			fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger,
 			strict=strict, encoding=encoding, delimiter=delimiter, defaults=defaults,
 			storeOffset=storeOffset)
-	with openFileAsCompressed(fileName, 'rb',encoding=encoding, teeLogger=teeLogger) as file:
+	with _ClosedAfterLocks(openFileAsCompressed(fileName, 'rb',encoding=encoding, teeLogger=teeLogger)) as file:
 		file.seek(0, os.SEEK_END)
 		file_size = file.tell()
 		buffer = b''
@@ -1173,7 +1265,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 	if not os.path.isfile(fileName):
 		if createIfNotExist:
 			try:
-				with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)as file:
+				with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)) as file:
 					header = delimiter.join(_sanitize(_formatHeader(header,
 													 teeLogger=teeLogger,
 													 delimiter=delimiter,
@@ -1271,7 +1363,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 		return taskDic
 	reporter = _Reporter(fileName, teeLogger)
 	try:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
+		with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)) as file:
 			lineNo = 0
 			if any(header) and verifyHeader:
 				try:
@@ -1411,7 +1503,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
 		return
 	if _isCompressedFile(fileName):
-		with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)as file:
+		with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger)) as file:
 			file.write(payload)
 	else:
 		# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
@@ -1457,7 +1549,7 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
 	if any(header) and verifyHeader:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
+		with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)) as file:
 			line = file.readline().decode(encoding=encoding,errors='replace')
 			if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 				correctColumnNum = len(header)
@@ -1508,13 +1600,13 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
 		raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 	else:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)as file:
+		with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger)) as file:
 			if any(header) and verifyHeader:
 				line = file.readline().decode(encoding=encoding,errors='replace')
 				if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 				header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
-		with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)as file:
+		with _ClosedAfterLocks(openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger)) as file:
 			if header:
 				header = delimiter.join(_sanitize(header,delimiter=delimiter))
 				file.write(header.encode(encoding=encoding,errors='replace')+b'\n')
@@ -2232,12 +2324,12 @@ def _iterPartLines(info, reporter, label=''):
 	if info.codec and not _codecSupported(info.codec):
 		# Spec §16.5: a codec this Python lacks makes the part unreadable; it is not damage to repair.
 		info.unreadable = True
-		f.close()
+		_closeAfterLocks(f)
 		reporter.note('unreadable', None, 'cannot read part {}: no {} support in this Python'.format(info.path, _CODEC_NAMES.get(info.codec, info.codec)))
 		return
 	rest = b''
 	atStart = True
-	with f:
+	with _ClosedAfterLocks(f):
 		chunks = _decompressChunks(f, info) if info.codec else iter(lambda: f.read(_CHUNK), b'')
 		offset = 0
 		try:
@@ -2534,7 +2626,7 @@ def _specUnsteady(parts, infos):
 		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
 		if appended and not info.codec:  # committed counts raw bytes only in a plain part
 			try:
-				with open(info.path, 'rb') as f:
+				with _ClosedAfterLocks(open(info.path, 'rb')) as f:
 					f.seek(info.committed - len(info.check))
 					appended = stamp[1] >= info.committed and f.read(len(info.check)) == info.check
 			except OSError:
@@ -2821,7 +2913,7 @@ def _specBackupPart(path, reporter):
 	the copy cannot be made; a partial copy is removed.
 	"""
 	with _pathLock(path):
-		with open(path, 'r+b') as f:
+		with _ClosedAfterLocks(open(path, 'r+b')) as f:
 			_lockFile(f)
 			try:
 				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
@@ -2869,7 +2961,7 @@ def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
 		return
 	_requireCodec(codec)
 	with _pathLock(path):
-		with open(path, 'ab') as f:
+		with _ClosedAfterLocks(open(path, 'ab')) as f:
 			_lockFile(f)
 			try:
 				f.write(_compressBytes(codec, payload, memberSize=memberSize))
@@ -2929,7 +3021,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	_requireCodec(codec)
 	raw = _compressBytes(codec, content, memberSize=memberSize) if codec and content else content
 	with _pathLock(path):
-		with open(path, 'r+b') as f:
+		with _ClosedAfterLocks(open(path, 'r+b')) as f:
 			_lockFile(f)
 			try:
 				st = os.fstat(f.fileno())
@@ -3052,7 +3144,7 @@ def _specFirstLines(path):
 		f = open(path, 'rb')
 	except OSError:
 		raise _StartUnreadable()
-	with f:
+	with _ClosedAfterLocks(f):
 		try:
 			if not codec:
 				for raw in f:
@@ -4503,7 +4595,7 @@ memoryOnly:{self.memoryOnly}
 						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
 					except Exception:
 						pass
-				file.close()  # Ensure file is closed after unlocking
+				_closeAfterLocks(file)  # closed after unlocking, and after any other thread's lockf lock on it
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
@@ -4933,7 +5025,7 @@ class TSVZedLite(MutableMapping):
 		if self._spec:
 			cleared = _specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter)
 			if self.fileObj is not None:
-				self.fileObj.close()
+				_closeAfterLocks(self.fileObj)
 			self.indexes.clear()
 			self._specLiteLoad(self.indexes)
 			self.fileObj = None if self._inMemoryRows else open(self._activePath, 'r+b')
@@ -4964,7 +5056,7 @@ class TSVZedLite(MutableMapping):
 		if verifyHeader is ...:
 			verifyHeader = self.verifyHeader
 		if self.fileObj is not None:
-			self.fileObj.close()
+			_closeAfterLocks(self.fileObj)
 		self._fileName = newFileName
 		self._spec = _isSpecPath(newFileName)
 		if self._spec:
@@ -4989,7 +5081,7 @@ class TSVZedLite(MutableMapping):
 	def __writeValues(self,data):
 		if self.fileObj is None:
 			line = self.delimiter.join(_sanitize(data,delimiter=self.delimiter))
-			with openFileAsCompressed(self._fileName, mode='ab', encoding=self.encoding) as f:
+			with _ClosedAfterLocks(openFileAsCompressed(self._fileName, mode='ab', encoding=self.encoding)) as f:
 				f.write(line.encode(encoding=self.encoding,errors='replace') + b'\n')
 			return list(data)
 		write_at = self.fileObj.seek(0, os.SEEK_END)
@@ -5312,7 +5404,7 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 	
 	def close(self):
 		if self.fileObj is not None:
-			self.fileObj.close()
+			_closeAfterLocks(self.fileObj)
 		return self
 
 	def __exit__(self,exc_type,exc_value,traceback):
@@ -5552,7 +5644,7 @@ class _ServeStore(object):
 		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
 		if self.parts:
 			try:
-				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
+				with _ClosedAfterLocks(openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger)) as f:
 					self.width, self.offset, self.lineNo = _legacyReadLoop(
 						f, self.path, self.data, -1, 0, self.strict, self.delimiter, self.legacyDefaults, False,
 						'utf8', reporter)
@@ -5566,7 +5658,7 @@ class _ServeStore(object):
 		if not self.parts or _parsePartName(self.parts[-1]).codec or not self.offset:
 			return b''
 		try:
-			with open(self.parts[-1], 'rb') as f:
+			with _ClosedAfterLocks(open(self.parts[-1], 'rb')) as f:
 				start = max(0, self.offset - _SERVE_CHECK_BYTES)
 				f.seek(start)
 				return f.read(self.offset - start)
@@ -5599,7 +5691,7 @@ class _ServeStore(object):
 				or stamp[1] < self.offset or stamp[1] <= old[1]):
 			return False  # an append always grows the part; anything else is a rewrite (and a stopped read is read again)
 		try:
-			with open(path, 'rb') as f:
+			with _ClosedAfterLocks(open(path, 'rb')) as f:
 				f.seek(self.offset - len(self.check))
 				if f.read(len(self.check)) != self.check:
 					return False
@@ -5880,7 +5972,7 @@ class _ServeStore(object):
 				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
 								   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None))
 			elif _isCompressedFile(self.path):
-				with openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger) as f:
+				with _ClosedAfterLocks(openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger)) as f:
 					f.write(payload)
 			else:
 				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync)
@@ -5890,7 +5982,7 @@ class _ServeStore(object):
 	def _fsync(self):
 		path = _storeParts(self.path)[1] if self.spec else self.path
 		if os.path.exists(path):
-			with open(path, 'ab') as f:
+			with _ClosedAfterLocks(open(path, 'ab')) as f:
 				os.fsync(f.fileno())
 
 

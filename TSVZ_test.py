@@ -1412,6 +1412,80 @@ def test_lock_survives_another_descriptor_of_the_part_closing(tmp_path):
 	assert code == 3
 
 
+_LOCK_PROBE = ('import fcntl, sys\nf = open(sys.argv[1], "r+b")\n'
+			   'try:\n    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError:\n    sys.exit(3)\nsys.exit(0)\n')
+
+
+def _held_while(monkeypatch, p, write, act):
+	"""Hold the lock ``write()`` takes on ``p``, at the end of its locked section, while ``act()`` runs in
+	another thread (given half a second to finish). Returns the exit code of another process that tries
+	the lock meanwhile (3: held) and whether ``act`` had to wait for the write."""
+	locked, release = threading.Event(), threading.Event()
+	real = TSVZ._unlockFile
+
+	def unlock(f):
+		locked.set()
+		release.wait(10)
+		real(f)
+	monkeypatch.setattr(TSVZ, '_unlockFile', unlock)
+	writer = threading.Thread(target=write)
+	writer.start()
+	other = threading.Thread(target=act)
+	try:
+		assert locked.wait(10)
+		other.start()
+		other.join(0.5)  # done at once, unless it waits for the write
+		waited = other.is_alive()
+		code = subprocess.call([sys.executable, '-c', _LOCK_PROBE, p])
+	finally:
+		release.set()
+		writer.join(10)
+	other.join(10)
+	return code, waited
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+@pytest.mark.parametrize('reader', ['spec', 'legacy', 'handler'])
+def test_a_classic_lock_survives_a_read_of_the_file_in_another_thread(tmp_path, monkeypatch, reader):
+	# Where only lockf is available (macOS; Linux without open file description locks), closing any
+	# descriptor of a file in this process drops the process's lock on it (spec §18.6): a read in another
+	# thread must not close its descriptor of the file while a write holds the lock.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / ('l.tsv' if reader == 'legacy' else 'l.tsvz'))
+	_touch(p, b'a\t1\n')
+	if reader == 'handler':
+		store = TSVZ._ServeStore(p)
+		act = lambda: store.sync(None)
+	else:
+		act = lambda: TSVZ.readTabularFile(p, verbose=False)
+	code, waited = _held_while(monkeypatch, p, lambda: TSVZ._lockedAppend(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p)), act)
+	assert code == 3, 'the read dropped the write lock'
+	assert waited
+	with open(p, 'rb') as f:
+		assert f.read() == b'a\t1\nb\t2\n'
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_a_close_in_the_thread_that_holds_the_classic_lock_does_not_wait_for_itself(tmp_path, monkeypatch):
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+
+	def lock_and_read():
+		with open(p, 'r+b') as held:
+			TSVZ._lockFile(held)
+			try:
+				TSVZ.readTabularFile(p, verbose=False)
+			finally:
+				TSVZ._unlockFile(held)
+	thread = threading.Thread(target=lock_and_read)
+	thread.daemon = True
+	thread.start()
+	thread.join(10)
+	assert not thread.is_alive()
+	assert not TSVZ._CLASSIC_HELD and not TSVZ._CLASSIC_CLOSING
+
+
 def _counting_reads(monkeypatch):
 	read = []
 	real_open = open
