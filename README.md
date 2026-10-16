@@ -260,7 +260,7 @@ Conformance testing).
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
 - §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, or whose parts kept changing through three reads, exit 1 with an error that `-q` keeps.
 - §21: a served `.tsv` file with a header line shows that line as a row, as `tsvz read` does (`TSVZed` hides it when given the header).
-- §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, and reloads a part whose size stayed the same but whose inode or modification time changed. A rewrite in place that keeps a part's size and modification time is not seen until the part changes again.
+- §21.8: the server notices changes with `stat()`. It re-reads the part list while the store's directory changed less than 2 s ago, and reloads a part whose size stayed the same but whose inode, modification time or change time changed. The change time catches a rewrite whose modification time was set back (`cp -p`, `rsync --inplace -a`); a rewrite in place that keeps a part's size within one clock tick is not seen until the part changes again.
 - §21.9: `tsvz` commands and `TSVZClient` ask the server to answer writes once they are written (`--x-written`), so a write the server cannot make fails as it would on the files. While writes fail, every answer carries a warning.
 - §21.3: `tsvz serve` needs Unix-domain sockets. Where Python has none (Windows), it exits 1, and `tsvz` commands and `TSVZClient` work on the files.
 - §20.7: on `.tsv`-family files a `-d` longer than one character is used, as in 3.39, with a warning; a `-d` that does not decode is a usage error.
