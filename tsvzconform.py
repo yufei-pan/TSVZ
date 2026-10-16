@@ -970,7 +970,12 @@ def snapshot_layout(store, before):
 	if i < len(lines):
 		fields = lines[i].split(d)
 		if fields[0].lower() == '#_snapshot_#' and all(f == '' for f in fields[1:]):
-			i += 1  # §19.2.3e: a snapshot may begin with #_snapshot_#, after the header comment
+			# §19.2.3e: a snapshot may begin with #_snapshot_#, after the header comment, which it then
+			# MUST repeat when the store has one (§19.10.2b).
+			had = first_line(before) or ''
+			if i == 0 and had.startswith('#') and not _is_marker_line(had, d):
+				return ['line 1 is #_snapshot_#, but a snapshot part must begin with the store\'s header comment (§19.10.2b)']
+			i += 1
 	block = []
 	while i < len(lines) and _is_marker_line(lines[i], d):
 		block.append(lines[i].split(d)[0].lower())

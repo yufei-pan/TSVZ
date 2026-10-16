@@ -1460,7 +1460,8 @@ def test_a_classic_lock_survives_a_read_of_the_file_in_another_thread(tmp_path, 
 		act = lambda: TSVZ.readTabularFile(p, verbose=False)
 	code, waited = _held_while(monkeypatch, p, lambda: TSVZ._lockedAppend(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p)), act)
 	assert code == 3, 'the read dropped the write lock'
-	assert waited
+	assert not waited, 'a read waits for no write: its close is put off until the lock is released'
+	assert not TSVZ._CLASSIC_PARKED, 'closed at the release'
 	with open(p, 'rb') as f:
 		assert f.read() == b'a\t1\nb\t2\n'
 
@@ -1583,7 +1584,7 @@ def test_a_store_created_while_another_thread_locks_it_keeps_that_lock(tmp_path,
 	assert held and code == 3, 'the creation dropped the lock'
 
 
-@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork')
+@pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
 @pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
 def test_a_forked_child_does_not_wait_for_its_parent_s_classic_locks(tmp_path, monkeypatch):
 	# lockf locks are not inherited: the child's closes have nothing to wait for.
@@ -1605,6 +1606,64 @@ def test_a_forked_child_does_not_wait_for_its_parent_s_classic_locks(tmp_path, m
 	finally:
 		release.set()
 		holder.join(10)
+	assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_a_write_waiting_for_another_process_s_lock_gets_it_between_its_holds(tmp_path, monkeypatch):
+	# The lock is waited for in the kernel, which wakes the waiter at the release: polling for it
+	# would seldom find the lock free between another process's holds.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nprint("go", flush=True)\n'
+			'end = time.monotonic() + 30\n'
+			'while time.monotonic() < end:\n'
+			'    fcntl.lockf(f, fcntl.LOCK_EX)\n    time.sleep(0.0099)\n    fcntl.lockf(f, fcntl.LOCK_UN)\n    time.sleep(0.0001)\n')
+	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdout=subprocess.PIPE)
+	try:
+		assert holder.stdout.readline().strip() == b'go'
+		time.sleep(0.1)
+		start = time.monotonic()
+		for _ in range(10):
+			TSVZ._lockedAppend(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p))
+		assert time.monotonic() - start < 2
+	finally:
+		holder.kill()
+		holder.wait(10)
+		holder.stdout.close()
+
+
+@pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
+@pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
+def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, monkeypatch):
+	# A parent thread waits for another process's lock, holding the in-process lock of the path:
+	# that thread is not in the child.
+	import signal
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nfcntl.lockf(f, fcntl.LOCK_EX)\n'
+			'print("held", flush=True)\ntime.sleep(1.5)\n')
+	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdout=subprocess.PIPE)
+	try:
+		assert holder.stdout.readline().strip() == b'held'
+		writer = threading.Thread(target=TSVZ._lockedAppend, args=(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p)))
+		writer.start()
+		time.sleep(0.2)  # waiting for the lock, holding the path's in-process lock
+		pid = os.fork()
+		if pid == 0:
+			try:
+				signal.alarm(8)
+				TSVZ._lockedAppend(p, b'c\t3\n', 'truncate', TSVZ._Reporter(p))
+				os._exit(0)
+			except BaseException:
+				os._exit(1)
+		_, status = os.waitpid(pid, 0)
+		writer.join(10)
+	finally:
+		holder.wait(10)
+		holder.stdout.close()
 	assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 
 
@@ -3519,14 +3578,22 @@ def test_spec_a_part_rewritten_to_its_size_with_its_mtime_put_back_is_read_again
 
 
 def test_spec_a_header_garbled_by_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch, capsys):
-	# The first read sees part 0 before a rewrite that fixes its header: only the read kept counts,
-	# and its header matches.
+	# Part 0 is rewritten while its first line is read: the line seen is not the store's, and the
+	# change shows, so the mismatch is no reason to raise; only the read kept counts.
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#x\ty\na\t1\n')
-	_touch(p + '.1', b'b\t2\n')
-	reads = _during_reads(monkeypatch, p + '.1', _rewrites(p, [b'#k\tv\na\t1\n']))
+	real = TSVZ._iterPartLines
+	done = []
+
+	def lines(info, reporter, label=''):
+		for item in real(info, reporter, label):
+			if info.path == p and not done:
+				done.append(1)
+				TSVZ._specRewriteInPlace(p, b'#k\tv\na\t11\n')
+			yield item
+	monkeypatch.setattr(TSVZ, '_iterPartLines', lines)
 	data = TSVZ.readTabularFile(p, header='k\tv', strict=True, verbose=False)
-	assert list(data) == ['a', 'b'] and len(reads) == 2
+	assert data['a'] == ['a', '11']
 	assert 'mismatch' not in capsys.readouterr().err
 
 
@@ -3551,6 +3618,96 @@ def test_spec_the_handler_does_not_read_again_what_a_read_done_again_saw(tmp_pat
 		assert not loads
 	finally:
 		store.close()
+
+
+def test_spec_a_compressed_snapshot_part_whose_first_member_is_corrupt_is_no_snapshot_part(tmp_path):
+	# Spec §19.10.3: a part whose first lines cannot be read is not a snapshot part. The member is
+	# larger than a first read, so its lines decode before its check fails.
+	import random as _random
+	rng = _random.Random(7)
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\n')
+	rows = b''.join(b'k%d\t%d\n' % (i, rng.getrandbits(64)) for i in range(20000))
+	member = bytearray(gzip.compress(b'#_snapshot_#\n' + rows))
+	assert len(member) > 1 << 17
+	member[-8] ^= 0xFF  # its CRC
+	_touch(p + '.1.gz', bytes(member))
+	assert not TSVZ._specIsSnapshotPart(p + '.1.gz', '\t')
+	assert 'a' in TSVZ.readTabularFile(p, verbose=False)
+
+
+def test_spec_a_store_with_no_header_line_under_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch):
+	# The first read sees part 0 empty, cut short by a rewrite that then completes.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'')
+	_touch(p + '.1', b'b\t2\n')
+	_during_reads(monkeypatch, p + '.1', _rewrites(p, [b'#k\tv\na\t1\n']))
+	assert sorted(TSVZ.readTabularFile(p, header='k\tv', strict=True, verbose=False)) == ['a', 'b']
+
+
+def test_spec_a_strict_header_mismatch_read_steady_is_raised_at_once(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#k\tv\n' + b''.join(b'r%d\t%d\n' % (i, i) for i in range(1000)))
+	rows = {}
+	with pytest.raises(ValueError):
+		TSVZ.readTabularFile(p, header='x\ty', strict=True, verbose=False, taskDic=rows)
+	assert len(rows) <= 1, 'raised at the header, not after the read'
+
+
+@pytest.mark.parametrize('damage', ['cut', 'corrupt'])
+def test_spec_appends_to_a_compressed_part_with_old_damage_do_not_make_it_read_again(tmp_path, monkeypatch, capsys, damage):
+	# Damage from an earlier crash stays in the part: appends after it are appends all the same.
+	p = str(tmp_path / 's.tsvz.gz')
+	old = gzip.compress(b'a\t1\n' * 50)
+	old = old[:len(old) // 2] if damage == 'cut' else old[:20] + b'\xff' * 8 + old[28:]
+	_touch(p, old + gzip.compress(b'b\t2\n'))
+
+	def append():
+		with open(p, 'ab') as f:
+			f.write(gzip.compress(b'c\t3\n'))
+	reads = _during_reads(monkeypatch, p, append, afterLines=1)
+	TSVZ.readTabularFile(p, verbose=False)
+	assert len(reads) == 1
+	assert _TORN_LAST not in capsys.readouterr().err
+
+
+def test_spec_the_handler_keeps_stamps_for_the_parts_a_stop_left_unread(tmp_path, monkeypatch):
+	# #_on_corruption_# stop ends the read in part 0: part 1 is not read, but it is no change either.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0\0\0\n')
+	_touch(p + '.1', b'b\t2\n')
+	store = TSVZ._ServeStore(p)
+	loads = []
+	real = TSVZ._specLoad
+
+	def load(*args, **kwargs):
+		loads.append(1)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_specLoad', load)
+	try:
+		for _ in range(3):
+			store.get(['a'], None)
+		assert not loads
+	finally:
+		store.close()
+
+
+def test_spec_a_torn_tsvzed_load_is_read_again_after_a_commit_too(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\nb\t2\n')
+	_touch(p + '.1', b'z\t9\n')
+	flips = [b'c\t3\n', b'a\t1\nb\t2\n'] * 50
+	_during_reads(monkeypatch, p + '.1', _rewrites(p, flips))
+	t = TSVZ.TSVZed(p)
+	t.stopAppendThread()  # while the store still changes: whatever the worker read again was torn too
+	del flips[:]
+	t['q'] = ['q', '7']
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	try:
+		assert t.deSynced, 'the torn view is still read again'
+	finally:
+		t.close()
 
 
 def test_spec_tsvzed_reads_a_torn_store_again(tmp_path, monkeypatch, capsys):

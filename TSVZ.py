@@ -659,27 +659,33 @@ _LOCKF_FDS = {}
 
 #: A lockf lock belongs to the process, and closing any descriptor of the file in the process drops it
 #: (spec §18.6). So that a read in another thread cannot drop a write's lock, this process's lockf locks
-#: held are counted per file (``_fileKey``) and per thread in ``_CLASSIC_HELD``; and the closes in flight
-#: per file in ``_CLASSIC_CLOSING``. A close (``_closeAfterLocks``) waits until no other thread holds a
-#: lockf lock on the file; a lockf lock is taken (without waiting, retried) only while no close of the
-#: file is in flight, and counted at once, both under ``_CLASSIC``.
+#: are counted per file (``_fileKey``) and per thread in ``_CLASSIC_HELD``, from before the lock is
+#: waited for until it is released; the closes in flight per file in ``_CLASSIC_CLOSING``; and in
+#: ``_CLASSIC_PARKED`` the reads' files whose close was put off until the release. A lockf lock is
+#: counted only while no close of its file is in flight; a read's close while one is counted is put off
+#: (reads take no lock, and wait for none); a write's close (it may still flush) waits for the other
+#: threads' locks. All of it under ``_CLASSIC``.
 _CLASSIC = threading.Condition()
 _CLASSIC_HELD = {}
 _CLASSIC_CLOSING = {}
+_CLASSIC_PARKED = {}
 
 
-def _classicAfterFork():
-	"""In a forked child: the parent's lockf locks are not inherited, and a thread that held
-	``_CLASSIC`` at the fork is not there to release it."""
-	global _CLASSIC
+def _locksAfterFork():
+	"""In a forked child: the parent's lockf locks are not inherited, and the threads that held
+	``_CLASSIC`` or a path's in-process lock (``_pathLock``) at the fork are not there to release them."""
+	global _CLASSIC, _PATH_LOCKS_GUARD
 	_CLASSIC = threading.Condition()
 	_CLASSIC_HELD.clear()
 	_CLASSIC_CLOSING.clear()
+	_CLASSIC_PARKED.clear()  # the child holds no lock: its copies close as they are dropped
 	_LOCKF_FDS.clear()
+	_PATH_LOCKS_GUARD = threading.Lock()
+	_PATH_LOCKS.clear()
 
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
-	os.register_at_fork(after_in_child=_classicAfterFork)
+	os.register_at_fork(after_in_child=_locksAfterFork)
 
 
 def _fileKey(f):
@@ -689,34 +695,26 @@ def _fileKey(f):
 
 
 def _lockClassic(f, key):
-	"""Take a lockf lock on ``f`` (the file ``key``) and count it; returns the thread's ident.
-
-	The lock is tried without waiting, while no close of the file is in flight,
-	and counted at once, both under ``_CLASSIC``; while another process holds it,
-	it is tried again (1 ms, doubling to 50 ms). A lock still being waited for is
-	not counted: closes in other threads (reads, which take no lock) go on.
-	"""
+	"""Take a lockf lock on ``f`` (the file ``key``), counted from before it is waited for; returns the
+	thread's ident. The lock is waited for in the kernel, as other lockf users wait for it."""
 	me = threading.get_ident()
-	delay = 0.001
-	while True:
-		with _CLASSIC:
-			while _CLASSIC_CLOSING.get(key):
-				_CLASSIC.wait()
-			try:
-				fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-			except OSError as e:
-				if e.errno not in (errno.EACCES, errno.EAGAIN):
-					raise
-			else:
-				held = _CLASSIC_HELD.setdefault(key, {})
-				held[me] = held.get(me, 0) + 1
-				return me
-		time.sleep(delay)
-		delay = min(delay * 2, 0.05)
+	with _CLASSIC:
+		while _CLASSIC_CLOSING.get(key):
+			_CLASSIC.wait()
+		held = _CLASSIC_HELD.setdefault(key, {})
+		held[me] = held.get(me, 0) + 1
+	try:
+		fcntl.lockf(f, fcntl.LOCK_EX)
+	except BaseException:
+		_leaveClassic(key, me)
+		raise
+	return me
 
 
 def _leaveClassic(key, me):
-	"""Uncount a lockf lock ``_lockClassic`` counted, once released."""
+	"""Uncount a lockf lock ``_lockClassic`` counted, released or never taken; once the file has none,
+	close the reads' files whose close was put off."""
+	parked = None
 	with _CLASSIC:
 		held = _CLASSIC_HELD[key]
 		held[me] -= 1
@@ -724,24 +722,45 @@ def _leaveClassic(key, me):
 			del held[me]
 			if not held:
 				del _CLASSIC_HELD[key]
+				parked = _CLASSIC_PARKED.pop(key, None)
+				if parked:
+					_CLASSIC_CLOSING[key] = _CLASSIC_CLOSING.get(key, 0) + 1
 		_CLASSIC.notify_all()
+	if parked:
+		try:
+			for f in parked:
+				try:
+					f.close()
+				except Exception:
+					pass
+		finally:
+			with _CLASSIC:
+				_CLASSIC_CLOSING[key] -= 1
+				if not _CLASSIC_CLOSING[key]:
+					del _CLASSIC_CLOSING[key]
+				_CLASSIC.notify_all()
 
 
 def _closeAfterLocks(f):
-	"""Close ``f``, a file this process may also lock through another descriptor, once no other thread
-	holds a lockf lock on it: the close would drop that lock (spec §18.6). Open file
+	"""Close ``f``, a file this process may also lock through another descriptor, without dropping a
+	lockf lock (spec §18.6): while a thread holds or waits for one on the file, a read's close is put
+	off until its release, and a write's close waits for the other threads' locks. Open file
 	description locks (Linux) are not counted, so nothing waits for them."""
 	key = None
 	if os.name == 'posix':
 		try:
 			key = _fileKey(f)
+			reading = not f.writable()
 		except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
-			pass  # closed already, or no descriptor of its own
+			key = None  # closed already, or no descriptor of its own
 	if key is None:
 		f.close()
 		return
 	me = threading.get_ident()
 	with _CLASSIC:
+		if reading and _CLASSIC_HELD.get(key):
+			_CLASSIC_PARKED.setdefault(key, []).append(f)
+			return
 		while any(thread != me for thread in _CLASSIC_HELD.get(key, ())):
 			_CLASSIC.wait()
 		_CLASSIC_CLOSING[key] = _CLASSIC_CLOSING.get(key, 0) + 1
@@ -1234,10 +1253,14 @@ def _formatHeader(header,verbose = False,teeLogger = None,delimiter = ...):
 			header = []
 	return [s.rstrip() for s in header]
 
+def _headerCellsMatch(header, cells):
+	"""Whether the formatted line ``cells`` holds ``header`` (the rule of ``_lineContainHeader``)."""
+	return len(header) == len(cells) and all(header[i] in cells[i] for i in range(len(header)))
+
+
 def _headerMatches(header, line, delimiter):
 	"""Whether ``line`` holds ``header``, as ``_lineContainHeader`` judges it, saying nothing."""
-	line = _formatHeader(line, delimiter=get_delimiter(delimiter))
-	return len(header) == len(line) and all(header[i] in line[i] for i in range(len(header)))
+	return _headerCellsMatch(header, _formatHeader(line, delimiter=get_delimiter(delimiter)))
 
 
 def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = ...):
@@ -1259,7 +1282,7 @@ def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fal
 	if verbose:
 		__teePrintOrNot(f"Header: \n{header}",teeLogger=teeLogger)
 		__teePrintOrNot(f"First line: \n{line}",teeLogger=teeLogger)
-	if len(header) != len(line) or any([header[i] not in line[i] for i in range(len(header))]):
+	if not _headerCellsMatch(header, line):
 		__teePrintOrNot(f"Header mismatch: \n{line} \n!= \n{header}",teeLogger=teeLogger)
 		if strict:
 			raise ValueError("Data format error! Header mismatch")
@@ -2091,6 +2114,11 @@ class _PartInfo(object):
 		# The last bytes (_SERVE_CHECK_BYTES at most) of a plain part's committed lines as read, ending at
 		# ``committed`` unless a stop policy ended the read.
 		self.check = b''
+		# For a compressed part: its first bytes and the last ones before where the read ended
+		# (_SERVE_CHECK_BYTES at most each), as they were read, and that raw offset.
+		self.rawHead = b''
+		self.rawEnd = 0
+		self.rawCheck = b''
 		self.skipped = False  # not read: a later snapshot part holds the store's state (spec §19.10.3)
 
 
@@ -2111,6 +2139,8 @@ class _PartBytes(object):
 		self.block = b''
 		self.at = 0  # offset of the next unread byte in ``block``
 		self.base = 0  # raw offset of ``block[0]``
+		self.before = b''  # the last _SERVE_CHECK_BYTES bytes read before ``block``, since the last seek
+		self.head = None  # the first _SERVE_CHECK_BYTES bytes of the part, as read
 
 	def offset(self):
 		return self.base + self.at
@@ -2118,12 +2148,16 @@ class _PartBytes(object):
 	def seek(self, offset):
 		self.f.seek(offset)
 		self.block, self.at, self.base = b'', 0, offset
+		self.before = b''
 
 	def take(self, size):
 		"""Up to ``size`` unread bytes (a memoryview), or an empty one at the end of the part."""
 		if self.at >= len(self.block):
+			self.before = (self.before + self.block[-_SERVE_CHECK_BYTES:])[-_SERVE_CHECK_BYTES:]
 			self.base += len(self.block)
 			self.block, self.at = self.f.read(self.size), 0
+			if self.head is None and self.base == 0:
+				self.head = self.block[:_SERVE_CHECK_BYTES]
 		piece = memoryview(self.block)[self.at:self.at + size]
 		self.at += len(piece)
 		return piece
@@ -2131,6 +2165,18 @@ class _PartBytes(object):
 	def giveBack(self, size):
 		"""Return the last ``size`` bytes of the piece just taken."""
 		self.at -= size
+
+	def tail(self, offset=None):
+		"""The last ``_SERVE_CHECK_BYTES`` bytes before ``offset`` (default: the current offset), as read,
+		of what this still holds (since the last seek)."""
+		cut = (self.at if offset is None else offset - self.base)
+		if cut >= 0:
+			piece = self.block[max(0, cut - _SERVE_CHECK_BYTES):cut]
+			if len(piece) < _SERVE_CHECK_BYTES and cut <= len(self.block):
+				piece = self.before + piece
+			return piece[-_SERVE_CHECK_BYTES:]
+		held = len(self.before) + cut  # the offset falls in ``before``
+		return self.before[max(0, held - _SERVE_CHECK_BYTES):max(0, held)]
 
 
 def _gzipPadding(piece, codec):
@@ -2290,6 +2336,10 @@ def _decodeAlone(raw, codec):
 	return False, b''.join(out), error
 
 
+#: Yielded by ``_decompressMembers`` when it reads on from the next member.
+_MEMBER_SEEKED = object()
+
+
 def _decompressChunks(f, info):
 	"""Yield what a compressed part contributes (spec §16.6), member by member.
 
@@ -2302,6 +2352,24 @@ def _decompressChunks(f, info):
 	unfinished at the damage. Damage is recorded on ``info``.
 	"""
 	src = _PartBytes(f)
+	damagedEnd = None  # (end, check) of damaged bytes read last, past ``src``
+	try:
+		for piece in _decompressMembers(f, info, src):
+			if isinstance(piece, tuple):
+				damagedEnd = piece  # where the read now ends: past the damaged bytes it read
+				continue
+			if piece is _MEMBER_SEEKED:
+				damagedEnd = None
+				continue
+			yield piece
+	finally:
+		info.rawHead = src.head or b''
+		info.rawEnd, info.rawCheck = damagedEnd if damagedEnd is not None else (src.offset(), src.tail())
+
+
+def _decompressMembers(f, info, src):
+	"""The loop of ``_decompressChunks``, which also yields ``(end, check)`` after damaged bytes it read
+	past ``src``, and ``_MEMBER_SEEKED`` when ``src`` reads on from the next member."""
 	while True:
 		status, out, start, end, error = _readMember(src, info.codec)
 		if status == 'none':
@@ -2318,6 +2386,8 @@ def _decompressChunks(f, info):
 			stop = following
 		f.seek(start)
 		raw = f.read(stop - start)
+		# Where the read ends now, and the bytes before it: those read up to the damage, then these.
+		yield start + len(raw), (src.tail(start) + raw)[-_SERVE_CHECK_BYTES:]
 		if _CODEC_NAMES[info.codec] == 'gzip':
 			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
 		cutShort, out, error = _decodeAlone(raw, info.codec)
@@ -2342,6 +2412,7 @@ def _decompressChunks(f, info):
 			break
 		yield None
 		src.seek(following)  # the next member, damaged or not; the search moved the file
+		yield _MEMBER_SEEKED
 
 
 def _iterPartLines(info, reporter, label=''):
@@ -2533,24 +2604,32 @@ def _specIsSnapshotPart(path, delimiter):
 	"""True when the part ``path`` begins with a value-less ``#_snapshot_#`` (spec §19.10.1).
 
 	It counts as the first committed line, or the second after a comment. A part
-	whose first lines cannot be read is not a snapshot part (spec §19.10.3). Only
-	the start of the part is read and decoded (``_specFirstLines``).
+	whose first lines cannot be read is not a snapshot part (spec §19.10.3): a
+	compressed part is read as a read reads it, which uses a member only once it
+	passed its checks; of a plain part only the start is read (``_specFirstLines``).
 	"""
 	quiet = _Reporter(path)  # never flushed: nothing found here is reported
-	lines = _specFirstLines(path)
+	info = None
+	if _parsePartName(path).codec:
+		info = _PartInfo(path)
+		parts = _iterPartLines(info, quiet)
+		lines = (raw for raw, _ in parts)
+	else:
+		parts = lines = _specFirstLines(path)
 	try:
 		for lineNo, raw in enumerate(lines, 1):
 			if lineNo == 1 and raw.startswith(b'\xef\xbb\xbf'):
 				raw = raw[3:]  # spec §4.7
 			fields = _decodeLine(raw, quiet, None).split(delimiter)
 			if fields[0].lower() == SNAPSHOT_KEY:
-				return all(f == '' for f in fields[1:])
+				return not (info is not None and info.lost) and all(f == '' for f in fields[1:])
 			if lineNo == 2 or not fields[0].startswith('#') or _MARKER_RE.match(fields[0]):
 				return False  # a first line that is not a comment, or a second line
 	except _StartUnreadable:
 		return False
 	finally:
 		lines.close()
+		parts.close()
 	return False
 
 
@@ -2650,9 +2729,11 @@ def _specUnsteady(parts, infos):
 	A part before the last must be as it was just before it was opened. The
 	last part may also have grown by appends, as the handler's follower accepts
 	them: the same file, longer, and for a plain part still holding the bytes
-	read just before its committed offset; for a compressed part, read without
-	damage (a rewrite in place shows as damage where the old bytes give way to the
-	new). A part that was not there to open is not checked.
+	read just before its committed offset; for a compressed part, still beginning
+	with the raw bytes it began with when read, and holding those read just before
+	where the read ended (appends add members after them, and change neither; damage
+	the part held before is no change; a rewrite in place changes its first bytes). A
+	part that was not there to open is not checked.
 	"""
 	last = len(parts) - 1
 	for i, info in enumerate(infos):
@@ -2668,7 +2749,13 @@ def _specUnsteady(parts, infos):
 			return 'the parts before the last kept changing while they were read'
 		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
 		if appended and info.codec:
-			appended = not info.lost and not info.damaged
+			try:
+				with _ClosedAfterLocks(open(info.path, 'rb')) as f:
+					appended = stamp[1] >= info.rawEnd and f.read(len(info.rawHead)) == info.rawHead
+					f.seek(info.rawEnd - len(info.rawCheck))
+					appended = appended and f.read(len(info.rawCheck)) == info.rawCheck
+			except OSError:
+				appended = False
 		elif appended:  # committed counts raw bytes only in a plain part
 			try:
 				with _ClosedAfterLocks(open(info.path, 'rb')) as f:
@@ -2679,6 +2766,19 @@ def _specUnsteady(parts, infos):
 		if not appended:
 			return 'the last part kept changing other than by appends while it was read'
 	return None
+
+
+def _specUnchanged(infos):
+	"""True when every part ``infos`` describe is as it was just before it was opened."""
+	for info in infos:
+		if info.stamp is None:
+			continue
+		try:
+			if _specStamp(os.stat(info.path)) != info.stamp:
+				return False
+		except OSError:
+			return False
+	return True
 
 
 def _specSteadyRead(read, reporter):
@@ -2808,6 +2908,10 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 						reporter.note('header-as-data', 'line 1', 'first line matches the header but is not a # comment; read as data key {!r} (prefix it with #)'.format(record[0] if record else text))
 					if width == -1:
 						width = len(header)
+				elif strict and _specUnchanged(result.infos):
+					# Read while nothing changed: a mismatch for sure, raised now rather than after the read.
+					_lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=True,
+									   delimiter=delimiter)
 		if record is None:
 			if verbose and text.startswith('#_'):
 				f0 = text.split(delimiter, 1)[0]
@@ -2828,8 +2932,9 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 		else:
 			data[key] = row
 	if headerPending and not (len(result.infos) > start and (result.infos[start].unreadable or result.infos[start].lost)):
-		# part 0 could not be read, or was damaged before any line: there is no header to compare
-		_lineContainHeader(header, '', verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter)
+		# No line to compare (part 0 could not be read, or was damaged before any line is no mismatch):
+		# said, or raised on, for the read kept only (_specLoad).
+		result.headerChecked = ''
 	result.correctColumnNum = width
 	return result
 
@@ -3831,10 +3936,9 @@ class TSVZed(OrderedDict):
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 		self.lastUpdateTime = self.externalFileUpdateTime
-		if torn:
-			# The store kept changing under every read: no part watched need change again for the
-			# next check to read it again (spec §19.8).
-			self.externalFileUpdateTime = -1
+		# The store kept changing under every read: no part watched need change again for the next
+		# check to read it again (spec §19.8).
+		self._specTorn = torn
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
 				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
@@ -3887,7 +3991,9 @@ class TSVZed(OrderedDict):
 		return True
 
 	def _specExternalChanged(self):
-		"""True when another writer changed the active part or the set of parts."""
+		"""True when another writer changed the active part or the set of parts, or the last load was torn."""
+		if getattr(self, '_specTorn', False):
+			return True
 		if getFileUpdateTimeNs(self._activePath) > self.externalFileUpdateTime:
 			return True
 		dirMtime = _dirMtimeNs(self._fileName)
@@ -5698,9 +5804,10 @@ class _ServeStore(object):
 			self.stamps = {}
 		else:
 			# As the read kept saw each part when it opened it (a read done again saw them as they are
-			# now); a part it skipped (spec §19.10.3) keeps the stamp taken before the read.
-			self.stamps = {info.path: info.stamp if info.stamp is not None else before.get(info.path)
-						   for info in load.infos}
+			# now); a part it did not open (skipped, spec §19.10.3, or after a stop, §4.10) keeps the
+			# stamp taken before the read.
+			self.stamps = dict(before)
+			self.stamps.update((info.path, info.stamp) for info in load.infos if info.stamp is not None)
 		info = load.infos[-1] if load.infos else None
 		self.offset = info.committed if info is not None else 0
 		self.lineNo = info.lines if info is not None else 0

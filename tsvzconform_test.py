@@ -321,7 +321,7 @@ def test_byte_rule_header_kept(tmp_path):
 	('#_version_#\t1\na\tx\n#c\n', 'not a marker'),
 	('#_version_#\t1\na\tx\n\tz\n', 'data rows for'),
 	('#hdr\n#_snapshot_#\n#_version_#\t1\na\tx\n', None),  # §19.2.3e
-	('#_snapshot_#\n#_version_#\t1\na\tx\n', None),
+	('#_snapshot_#\n#_version_#\t1\na\tx\n', 'header comment'),  # §19.10.2b: the store has one
 	('#_snapshot_#\tx\n#_version_#\t1\na\tx\n', '#_version_#'),  # with a value: not the marker
 ])
 def test_snapshot_layout(tmp_path, content, problem):
