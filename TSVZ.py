@@ -659,14 +659,15 @@ _LOCKF_FDS = {}
 
 #: A lockf lock belongs to the process, and closing any descriptor of the file in the process drops it
 #: (spec §18.6). So that a read in another thread cannot drop a write's lock, under ``_CLASSIC`` and per
-#: file (``_fileKey``): ``_CLASSIC_HELD`` counts the lockf locks held, per thread; ``_CLASSIC_TAKING`` the
-#: tries in flight to take one without waiting; ``_CLASSIC_CLOSING`` the closes in flight; and
-#: ``_CLASSIC_PARKED`` holds the reads' files whose close is put off while a lock is held or tried
-#: (reads take no lock, and wait for none); they are closed once none is. A write's close (it may still
-#: flush) waits for the other threads' locks instead. A lock is tried only while no close is in flight.
+#: file (``_fileKey``): ``_CLASSIC_HELD`` counts, per thread, the lockf locks held and the tries in
+#: flight to take one without waiting (a try that succeeds stays counted, as the lock held);
+#: ``_CLASSIC_CLOSING`` the closes in flight; and ``_CLASSIC_PARKED`` holds the reads' files whose close
+#: is put off while any thread holds or tries a lock (reads take no lock, and wait for none); they are
+#: closed once none does. A write's close (it may still flush) waits for the other threads' locks and
+#: tries instead, never for its own thread's (a finalizer or signal handler there would wait forever).
+#: A try waits for the closes in flight. Every count is undone in a ``finally``.
 _CLASSIC = threading.Condition()
 _CLASSIC_HELD = {}
-_CLASSIC_TAKING = {}
 _CLASSIC_CLOSING = {}
 _CLASSIC_PARKED = {}
 
@@ -676,7 +677,7 @@ def _locksAfterFork():
 	``_CLASSIC`` or a path's in-process lock (``_pathLock``) at the fork are not there to release them."""
 	global _CLASSIC, _PATH_LOCKS_GUARD
 	_CLASSIC = threading.Condition()
-	for table in (_CLASSIC_HELD, _CLASSIC_TAKING, _CLASSIC_CLOSING, _CLASSIC_PARKED, _LOCKF_FDS, _PATH_LOCKS):
+	for table in (_CLASSIC_HELD, _CLASSIC_CLOSING, _CLASSIC_PARKED, _LOCKF_FDS, _PATH_LOCKS):
 		table.clear()  # the child holds no lock: its copies of parked files close as they are dropped
 	_PATH_LOCKS_GUARD = threading.Lock()
 
@@ -700,15 +701,6 @@ def _count(table, key, by):
 		table.pop(key, None)
 
 
-def _unparkIfIdle(key):
-	"""Under ``_CLASSIC``: once no lockf lock on the file is held or tried, its parked files, now counted
-	as a close in flight for ``_closeCounted``; else None."""
-	if _CLASSIC_HELD.get(key) or _CLASSIC_TAKING.get(key) or key not in _CLASSIC_PARKED:
-		return None
-	_count(_CLASSIC_CLOSING, key, 1)
-	return _CLASSIC_PARKED.pop(key)
-
-
 def _closeCounted(key, files, quiet=False):
 	"""Close ``files`` of the file ``key``, one close in flight counted for them all, which ends here.
 	Every file is closed even when one fails; the first error is raised after (``quiet``: only one that is
@@ -729,25 +721,50 @@ def _closeCounted(key, files, quiet=False):
 		raise error
 
 
-def _lockClassic(f, key):
-	"""Take a lockf lock on ``f`` (the file ``key``) and count it; returns the thread's ident.
+def _enterClassic(key, me):
+	"""Count a lockf lock that thread ``me`` tries (and then holds) on the file ``key``."""
+	with _CLASSIC:
+		held = _CLASSIC_HELD.setdefault(key, {})
+		held[me] = held.get(me, 0) + 1
 
-	It is tried without waiting, once no close of the file is in flight (a read's close meanwhile is
-	put off), and counted as soon as it is taken. When another process holds it, it is waited for in
-	the kernel, as other lockf users wait for it, uncounted (reads close meanwhile, which may drop it
-	once taken), then tried again: still held (a no-op) or free, it is counted; taken by another process
-	meanwhile, it is waited for again.
+
+def _leaveClassic(key, me):
+	"""Uncount a lockf lock ``_enterClassic`` counted: released, or never taken. Once no thread holds or
+	tries one on the file, its parked files are closed."""
+	parked = None
+	with _CLASSIC:
+		held = _CLASSIC_HELD.get(key, {})
+		if held.get(me, 0) > 1:
+			held[me] -= 1
+		else:
+			held.pop(me, None)
+			if not held:
+				_CLASSIC_HELD.pop(key, None)
+				parked = _CLASSIC_PARKED.pop(key, None)
+				if parked:
+					_count(_CLASSIC_CLOSING, key, 1)
+		_CLASSIC.notify_all()
+	if parked:
+		_closeCounted(key, parked, quiet=True)
+
+
+def _lockClassic(f, key):
+	"""Take a lockf lock on ``f`` (the file ``key``), counted; returns the thread's ident.
+
+	It is counted, then tried without waiting once no close of the file is in flight (reads closing
+	meanwhile are put off); taken, it stays counted. When another process holds it, it is uncounted and
+	waited for in the kernel, as other lockf users wait for it (reads close meanwhile, which may drop
+	it once granted), then counted and tried again: still held (a no-op) or free, it is kept; taken by
+	another process meanwhile, it is waited for again.
 	"""
 	me = threading.get_ident()
 	while True:
-		with _CLASSIC:
-			# Counted first: reads closing from now on are put off (after a grant from the kernel, the
-			# lock may be ours already); then the closes in flight end.
-			_count(_CLASSIC_TAKING, key, 1)
-			while _CLASSIC_CLOSING.get(key):
-				_CLASSIC.wait()
+		_enterClassic(key, me)
 		taken = False
 		try:
+			with _CLASSIC:
+				while _CLASSIC_CLOSING.get(key):
+					_CLASSIC.wait()
 			try:
 				fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
 				taken = True
@@ -755,41 +772,18 @@ def _lockClassic(f, key):
 				if e.errno not in (errno.EACCES, errno.EAGAIN):
 					raise
 		finally:
-			with _CLASSIC:
-				if taken:  # counted before the try's count goes: the file never looks idle in between
-					held = _CLASSIC_HELD.setdefault(key, {})
-					held[me] = held.get(me, 0) + 1
-				_count(_CLASSIC_TAKING, key, -1)
-				parked = _unparkIfIdle(key)
-				_CLASSIC.notify_all()
-			if parked:
-				_closeCounted(key, parked, quiet=True)
+			if not taken:
+				_leaveClassic(key, me)
 		if taken:
 			return me
 		fcntl.lockf(f, fcntl.LOCK_EX)
 
 
-def _leaveClassic(key, me):
-	"""Uncount a lockf lock ``_lockClassic`` counted, once released; close the parked files once the
-	file has none."""
-	with _CLASSIC:
-		held = _CLASSIC_HELD[key]
-		held[me] -= 1
-		if not held[me]:
-			del held[me]
-			if not held:
-				del _CLASSIC_HELD[key]
-		parked = _unparkIfIdle(key)
-		_CLASSIC.notify_all()
-	if parked:
-		_closeCounted(key, parked, quiet=True)
-
-
 def _closeAfterLocks(f):
 	"""Close ``f``, a file this process may also lock through another descriptor, without dropping a
-	lockf lock (spec §18.6): while one is held or tried on the file, a read's close is put off until
-	none is, and a write's close waits for the other threads' locks. Open file description locks
-	(Linux) are not counted, so nothing waits for them."""
+	lockf lock (spec §18.6): while a thread holds or tries one on the file, a read's close is put off
+	until none does, and a write's close waits for the other threads' locks. Open file description
+	locks (Linux) are not counted, so nothing waits for them."""
 	key = None
 	if os.name == 'posix':
 		try:
@@ -805,10 +799,10 @@ def _closeAfterLocks(f):
 		reading = False  # as a write: waited for, never put off
 	me = threading.get_ident()
 	with _CLASSIC:
-		if reading and (_CLASSIC_HELD.get(key) or _CLASSIC_TAKING.get(key)):
+		if reading and _CLASSIC_HELD.get(key):
 			_CLASSIC_PARKED.setdefault(key, []).append(f)
 			return
-		while _CLASSIC_TAKING.get(key) or any(thread != me for thread in _CLASSIC_HELD.get(key, ())):
+		while any(thread != me for thread in _CLASSIC_HELD.get(key, ())):
 			_CLASSIC.wait()
 		_count(_CLASSIC_CLOSING, key, 1)
 	_closeCounted(key, [f])
@@ -3981,8 +3975,7 @@ class TSVZed(OrderedDict):
 		# check to read it again (spec §19.8).
 		self._specTorn = torn
 		self._specTornAt = 0.0
-		if not torn:
-			self._specTornWait = 0.0
+		self._specTornWait = 0.0  # a load that worked starts the waits over
 		self._dirMtimeNs = _dirMtimeNs(self._fileName)
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
 				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
@@ -4024,8 +4017,9 @@ class TSVZed(OrderedDict):
 				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
 				# Mark the change as seen so the failure is reported once, not every tick. A torn view is
 				# read again after a while (1 s, doubling to a minute), not at every tick.
-				self._specTornWait = min(max(1.0, getattr(self, '_specTornWait', 0.0) * 2), 60.0)
-				self._specTornAt = _specClock() + self._specTornWait
+				if getattr(self, '_specTorn', False):
+					self._specTornWait = min(max(1.0, getattr(self, '_specTornWait', 0.0) * 2), 60.0)
+					self._specTornAt = _specClock() + self._specTornWait
 				try:
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 					self._dirMtimeNs = _dirMtimeNs(self._fileName)

@@ -1718,6 +1718,53 @@ def test_a_close_re_entered_while_a_lock_is_counted_does_not_drop_it(tmp_path, m
 	assert code == 3, 'the re-entered close dropped the lock'
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_an_interrupt_while_a_lock_waits_for_closes_leaves_nothing_counted(tmp_path, monkeypatch):
+	# Ctrl-C, or tsvz serve's SIGTERM, in the wait: a count left behind would hold every later close.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+
+	class Interrupted(type(TSVZ._CLASSIC)):
+		def wait(self, timeout=None):
+			raise KeyboardInterrupt
+	monkeypatch.setattr(TSVZ, '_CLASSIC', Interrupted())
+	with open(p, 'r+b') as f:
+		key = TSVZ._fileKey(f)
+		monkeypatch.setitem(TSVZ._CLASSIC_CLOSING, key, 1)  # a close in flight elsewhere
+		with pytest.raises(KeyboardInterrupt):
+			TSVZ._lockFile(f)
+	assert not TSVZ._CLASSIC_HELD.get(key)
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
+def test_a_write_close_re_entered_on_the_locking_thread_does_not_wait_for_itself(tmp_path, monkeypatch):
+	# A finalizer or signal handler on the thread trying the lock, while that thread is counted:
+	# waiting for its own count would wait forever.
+	import fcntl
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'l.tsvz')
+	_touch(p, b'a\t1\n')
+	pending = [lambda: TSVZ._closeAfterLocks(open(p, 'r+b'))]
+	real = fcntl.lockf
+
+	def lockf(f, cmd, *args):
+		while pending and cmd & fcntl.LOCK_NB:
+			pending.pop()()
+		return real(f, cmd, *args)
+	monkeypatch.setattr(fcntl, 'lockf', lockf)
+
+	def lock_and_release():
+		with open(p, 'r+b') as f:
+			TSVZ._lockFile(f)
+			TSVZ._unlockFile(f)
+	thread = threading.Thread(target=lock_and_release)
+	thread.daemon = True
+	thread.start()
+	thread.join(10)
+	assert not thread.is_alive() and not pending
+
+
 def _counting_reads(monkeypatch):
 	read = []
 	real_open = open
@@ -3725,6 +3772,7 @@ def test_spec_a_torn_tsvzed_load_whose_reload_fails_is_not_read_again_at_every_c
 		assert t.deSynced
 		t.rewrite()
 		assert dict(t) == dict(TSVZ.readTabularFile(p, verbose=False))
+		assert not t._specTornWait, 'a load that worked starts the waits over'
 	finally:
 		t.close()
 
