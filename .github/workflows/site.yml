@@ -1,0 +1,24 @@
+name: site
+# tsvz.org's tests read tsvz-spec-v1.md, README.md and TSVZ.py from this
+# repository: run them on every change here, not only when the site changes.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: TSVZ
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tsvz-org/tsvz.org
+          path: tsvz.org
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest==8.3.5
+      - run: python -m pytest tsvz.org/tsvz_site_test.py -q

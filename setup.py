@@ -8,7 +8,7 @@ setup(
     description='Key-value store kept in a TSV / CSV / NSV / PSV file, with tsvz-spec-v1 support',
     author='Yufei Pan',
     author_email='pan@zopyr.us',
-    url='https://github.com/yufei-pan/TSVZ',  # URL to the project’s homepage
+    url='https://github.com/tsvz-org/TSVZ',  # URL to the project’s homepage
     entry_points={
         'console_scripts': [
             'TSVZ = TSVZ:__main__',

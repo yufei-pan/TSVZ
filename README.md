@@ -267,16 +267,12 @@ Conformance testing).
 
 ## Website
 
-`website/` holds the tsvz.org site. `website/tsvz_site.py` (standard library
-only, Python 3.8+) renders `website/index.md`, `website/spec-glance.md` and
-`tsvz-spec-v1.md`, and serves HTML to browsers and markdown to agents.
-
-```bash
-python3 website/tsvz_site.py serve -p 8765     # http://127.0.0.1:8765/
-python3 website/tsvz_site.py build /tmp/site   # static files for any host
-```
-
-`deploy/tsvz-site.service` runs it under systemd; restart it to publish an edit.
+The tsvz.org site lives in [tsvz-org/tsvz.org](https://github.com/tsvz-org/tsvz.org).
+It renders `tsvz-spec-v1.md` from a checkout of this repository next to its own,
+and its tests also check the spec: every § reference names a real section, and
+the spec uses only markdown the site renders. Run them after editing the spec
+(see Tests); CI runs them on every push here, and the site publishes `main`'s
+spec each morning.
 
 ## Conformance testing
 
@@ -336,7 +332,7 @@ runs, because a single run can land in a slower mode as a whole.
 
 ```bash
 python3 -m pytest TSVZ_test.py -q                         # everything, incl. 3.39 differential tests
-python3 -m pytest website/tsvz_site_test.py -q            # the tsvz.org site
+python3 -m pytest ../tsvz.org/tsvz_site_test.py -q        # the spec as tsvz.org renders it (needs the tsvz.org checkout next to this one)
 python3 -m pytest tsvzbench_test.py -q                    # the benchmark harness
 python3 -m pytest tsvzconform_test.py -q                  # the conformance runner and cases, against the reference
 python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a test)
