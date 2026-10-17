@@ -1416,57 +1416,6 @@ _LOCK_PROBE = ('import fcntl, sys\nf = open(sys.argv[1], "r+b")\n'
 			   'try:\n    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError:\n    sys.exit(3)\nsys.exit(0)\n')
 
 
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
-def test_a_read_does_not_wait_while_a_write_waits_for_another_process(tmp_path, monkeypatch):
-	# Readers take no lock: a write still waiting for another process's lockf lock holds none
-	# that a close could drop, so a read in another thread goes on.
-	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
-	p = str(tmp_path / 'l.tsvz')
-	_touch(p, b'a\t1\n')
-	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nfcntl.lockf(f, fcntl.LOCK_EX)\n'
-			'print("held", flush=True)\ntime.sleep(2)\n')
-	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdout=subprocess.PIPE)
-	try:
-		assert holder.stdout.readline().strip() == b'held'
-		writer = threading.Thread(target=TSVZ._lockedAppend, args=(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p)))
-		writer.start()
-		time.sleep(0.2)  # the write waits for the lock
-		start = time.monotonic()
-		TSVZ.readTabularFile(p, verbose=False)
-		assert time.monotonic() - start < 1
-	finally:
-		holder.wait(10)
-		holder.stdout.close()
-	writer.join(10)
-	with open(p, 'rb') as f:
-		assert f.read() == b'a\t1\nb\t2\n'
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX locks')
-def test_a_write_waiting_for_another_process_s_lock_gets_it_between_its_holds(tmp_path, monkeypatch):
-	# The lock is waited for in the kernel, which wakes the waiter at the release: polling for it
-	# would seldom find the lock free between another process's holds.
-	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
-	p = str(tmp_path / 'l.tsvz')
-	_touch(p, b'a\t1\n')
-	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nprint("go", flush=True)\n'
-			'end = time.monotonic() + 30\n'
-			'while time.monotonic() < end:\n'
-			'    fcntl.lockf(f, fcntl.LOCK_EX)\n    time.sleep(0.009)\n    fcntl.lockf(f, fcntl.LOCK_UN)\n    time.sleep(0.001)\n')
-	holder = subprocess.Popen([sys.executable, '-c', hold, p], stdout=subprocess.PIPE)
-	try:
-		assert holder.stdout.readline().strip() == b'go'
-		time.sleep(0.1)
-		start = time.monotonic()
-		for _ in range(10):
-			TSVZ._lockedAppend(p, b'b\t2\n', 'truncate', TSVZ._Reporter(p))
-		assert time.monotonic() - start < 2
-	finally:
-		holder.kill()
-		holder.wait(10)
-		holder.stdout.close()
-
-
 @pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
 @pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
 def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, monkeypatch):

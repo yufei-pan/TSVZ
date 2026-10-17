@@ -4634,25 +4634,20 @@ memoryOnly:{self.memoryOnly}
 		if file is None:
 			return
 		try:
-			try:
-				file.flush()  # Ensure the file is flushed before unlocking
-				os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
-			finally:
-				# Unlocked and closed even when the flush or the sync failed.
-				if not file.closed:
+			file.flush()  # Ensure the file is flushed before unlocking
+			os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
+			if not file.closed:
+				if os.name == 'posix':
+					_unlockFile(file)
+				elif os.name == 'nt':
+					# Unlocking the entire file; for Windows, ensure not unlocking an empty file
+					#unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
+					unlock_length = 2147483647
 					try:
-						if os.name == 'posix':
-							_unlockFile(file)
-						elif os.name == 'nt':
-							# Unlocking the entire file; for Windows, ensure not unlocking an empty file
-							#unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
-							unlock_length = 2147483647
-							try:
-								msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
-							except Exception:
-								pass
-					finally:
-						file.close()  # Ensure file is closed after unlocking
+						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
+					except Exception:
+						pass
+				file.close()  # Ensure file is closed after unlocking
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
